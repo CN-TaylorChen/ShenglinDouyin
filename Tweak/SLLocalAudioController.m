@@ -209,6 +209,8 @@ static BOOL SLLocalPathIsAudio(NSString *p) {
 #pragma mark - 导入
 
 - (void)sl_import {
+    // iOS 14 的 initWithDocumentTypes:inMode: 已弃用，项目开 -Werror 会直接炸；
+    // 本插件最低 iOS 15，只用新初始化器。
     if (@available(iOS 14.0, *)) {
         NSMutableArray *types = [NSMutableArray array];
         UTType *audio = [UTType typeWithIdentifier:@"public.audio"];
@@ -221,12 +223,7 @@ static BOOL SLLocalPathIsAudio(NSString *p) {
         p.allowsMultipleSelection = YES;
         [self presentViewController:p animated:YES completion:nil];
     } else {
-        UIDocumentPickerViewController *p = [[UIDocumentPickerViewController alloc]
-                                             initWithDocumentTypes:@[@"public.audio", @"public.zip-archive"]
-                                             inMode:UIDocumentPickerModeImport];
-        p.delegate = self;
-        p.allowsMultipleSelection = YES;
-        [self presentViewController:p animated:YES completion:nil];
+        [AWECAUtils showToast:@"系统版本过低，无法导入音频"];
     }
 }
 
