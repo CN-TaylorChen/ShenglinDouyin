@@ -66,7 +66,8 @@ static UIImage *SLThinSliderThumb(void) {
 @end
 
 #define kSLEnabledKey @"SLEnhanceEnabled"
-#define SLVersion @"1.0.0"
+// 与 control 的 Version 保持一致（0.5.0）。原来写死 1.0.0，设置页标题栏一直显示旧号。
+#define SLVersion @"0.5.0"
 
 // v0.4.52：单元格玻璃色搬到 SLGlass（全站二级页共用同一个数），这里不再重复定义。
 
@@ -234,21 +235,21 @@ static UIView *SLMakeHeader(NSString *text, CGFloat x, CGFloat width) {
 
 - (NSInteger)numberOfSectionsInTableView:(UITableView *)tv {
     (void)tv;
-    // 抖音版：音色与合成 / 音频来源 / 其它。口令整组与本地音频入口已删。
-    return 3;
+    // 抖音版：音色与合成（含音频来源两项）/ 其它。口令整组与本地音频入口已删。
+    return 2;
 }
 
 - (NSInteger)tableView:(UITableView *)tv numberOfRowsInSection:(NSInteger)section {
     (void)tv;
-    if (section == 0) return 8;   // 音色与合成：私聊开关 + 评论开关 + 引擎 + 音色 + 情绪 + 语速 + 音量 + 音调
-    if (section == 1) return 2;   // 音频来源：生成语音 + 语音包
-    if (section == 2) return 3;   // 其它：悬浮球图标 + API 凭证 + 运行日志
+    // 音色与合成：评论开关 + 私聊开关 + 引擎 + 音色 + 情绪 + 语速 + 音量 + 音调 + 文本转语音 + 语音包
+    if (section == 0) return 10;
+    if (section == 1) return 3;   // 其它：悬浮球图标 + API 凭证 + 运行日志
     return 0;
 }
 
 - (NSString *)sl_headerForSection:(NSInteger)section {
-    if (section < 0 || section > 2) return @"";
-    return @[@"音色与合成", @"音频来源", @"其它"][section];
+    if (section < 0 || section > 1) return @"";
+    return @[@"音色与合成", @"其它"][section];
 }
 
 - (UIView *)tableView:(UITableView *)tv viewForHeaderInSection:(NSInteger)section {
@@ -317,6 +318,15 @@ static UIView *SLMakeHeader(NSString *text, CGFloat x, CGFloat width) {
 
     if (ip.section == 0) {                     // 音色与合成
         if (ip.row == 0) {
+            // 评论区：关掉就发原声
+            cell.textLabel.text = @"评论录音转音色";
+            UISwitch *sw = [[UISwitch alloc] initWithFrame:CGRectZero];
+            NSUserDefaults *d = [NSUserDefaults standardUserDefaults];
+            sw.on = [d objectForKey:kSLEnabledKey] ? [d boolForKey:kSLEnabledKey] : YES;
+            [sw addTarget:self action:@selector(sl_powerChanged:) forControlEvents:UIControlEventValueChanged];
+            cell.accessoryView = sw;
+            cell.selectionStyle = UITableViewCellSelectionStyleNone;
+        } else if (ip.row == 1) {
             // 私聊：关掉就发自己的原声（gate 直接放行，不跑识别合成）
             cell.textLabel.text = @"私聊录音转音色";
             UISwitch *sw = [[UISwitch alloc] initWithFrame:CGRectZero];
@@ -326,15 +336,6 @@ static UIView *SLMakeHeader(NSString *text, CGFloat x, CGFloat width) {
                 : ([d objectForKey:kSLEnabledKey] ? [d boolForKey:kSLEnabledKey] : YES);
             sw.on = def;
             [sw addTarget:self action:@selector(sl_privatePowerChanged:) forControlEvents:UIControlEventValueChanged];
-            cell.accessoryView = sw;
-            cell.selectionStyle = UITableViewCellSelectionStyleNone;
-        } else if (ip.row == 1) {
-            // 评论区：关掉就发原声
-            cell.textLabel.text = @"评论录音转音色";
-            UISwitch *sw = [[UISwitch alloc] initWithFrame:CGRectZero];
-            NSUserDefaults *d = [NSUserDefaults standardUserDefaults];
-            sw.on = [d objectForKey:kSLEnabledKey] ? [d boolForKey:kSLEnabledKey] : YES;
-            [sw addTarget:self action:@selector(sl_powerChanged:) forControlEvents:UIControlEventValueChanged];
             cell.accessoryView = sw;
             cell.selectionStyle = UITableViewCellSelectionStyleNone;
         } else if (ip.row == 2) {
@@ -358,7 +359,7 @@ static UIView *SLMakeHeader(NSString *text, CGFloat x, CGFloat width) {
                 ? [NSString stringWithFormat:@"已选 %lu 个", (unsigned long)mgr.fishEmotionSel.count]
                 : @"未启用";
             cell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
-        } else if (ip.row >= 5) {
+        } else if (ip.row >= 5 && ip.row <= 7) {
             NSInteger kind = ip.row - 5;                 // 5 语速 · 6 音量 · 7 音调
             cell.textLabel.text = SLRatioTitle(kind);
             if (kind == SLRatioKindPitch && mgr.fishEngine) {
@@ -370,18 +371,12 @@ static UIView *SLMakeHeader(NSString *text, CGFloat x, CGFloat width) {
             } else {
                 cell.accessoryView = [self sl_ratioAccessory:kind];
             }
-        }
-        return cell;
-    }
-
-    if (ip.section == 1) {                     // 音频来源
-        if (ip.row == 0) {
-            cell.textLabel.text = @"生成语音";
-            cell.textLabel.textColor = [UIColor systemBlueColor];
-            cell.detailTextLabel.text = @"输入文字 ›";
-            cell.detailTextLabel.textColor = [UIColor systemBlueColor];
+        } else if (ip.row == 8) {
+            // 音频来源并入本组；文字用系统默认色，不再着蓝。
+            cell.textLabel.text = @"文本转语音";
+            cell.detailTextLabel.text = @"输入文字";
             cell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
-        } else {
+        } else if (ip.row == 9) {
             cell.textLabel.text = @"语音包";
             if (![SLVoicePack isOneShotPending]) {
                 cell.detailTextLabel.text = @"原声";
@@ -396,7 +391,7 @@ static UIView *SLMakeHeader(NSString *text, CGFloat x, CGFloat width) {
         return cell;
     }
 
-    if (ip.section == 2) {                     // 其它
+    if (ip.section == 1) {                     // 其它
         if (ip.row == 0) {
             cell.textLabel.text = @"悬浮球图标";
             cell.detailTextLabel.text = SLFloatIconSummary();
@@ -422,7 +417,7 @@ static UIView *SLMakeHeader(NSString *text, CGFloat x, CGFloat width) {
 - (void)tableView:(UITableView *)tv didSelectRowAtIndexPath:(NSIndexPath *)ip {
     [tv deselectRowAtIndexPath:ip animated:YES];
 
-    // 3 段结构 —— 音色与合成 / 音频来源 / 其它
+    // 2 段结构 —— 音色与合成（含音频来源）/ 其它
     if (ip.section == 0) {                                  // 音色与合成
         if (ip.row == 3) {                                  // 音色
             AWECATTSVoiceListController *vc = [[AWECATTSVoiceListController alloc] init];
@@ -436,7 +431,7 @@ static UIView *SLMakeHeader(NSString *text, CGFloat x, CGFloat width) {
             [self.navigationController pushViewController:vc animated:YES];
             return;
         }
-        if (ip.row >= 5) {                                       // 语速 / 音量 / 音调
+        if (ip.row >= 5 && ip.row <= 7) {                        // 语速 / 音量 / 音调
             NSInteger kind = ip.row - 5;
             if (kind == SLRatioKindPitch && [AWECATTSManager shared].fishEngine) {
                 [AWECAUtils showToast:@"FishAudio 没有音调参数，切回火山引擎可用" duration:2.0];
@@ -445,19 +440,18 @@ static UIView *SLMakeHeader(NSString *text, CGFloat x, CGFloat width) {
             [self sl_editRatio:kind];
             return;
         }
-        return;                                                  // 0/1 是两个开关，2 是分段控件
-    }
-
-    if (ip.section == 1) {                                  // 音频来源
-        if (ip.row == 0) {                                  // 生成语音
+        if (ip.row == 8) {                                  // 文本转语音
             [self.navigationController pushViewController:[[SLTTSComposeController alloc] init] animated:YES];
             return;
         }
-        [self.navigationController pushViewController:[[SLVoicePackController alloc] init] animated:YES];  // 语音包
-        return;
+        if (ip.row == 9) {                                  // 语音包
+            [self.navigationController pushViewController:[[SLVoicePackController alloc] init] animated:YES];
+            return;
+        }
+        return;                                                  // 0/1 是两个开关，2 是分段控件
     }
 
-    if (ip.section == 2) {                                  // 其它
+    if (ip.section == 1) {                                  // 其它
         if (ip.row == 0) {                                  // 悬浮球图标
             [self.navigationController pushViewController:[[SLFloatIconController alloc] init] animated:YES];
             return;

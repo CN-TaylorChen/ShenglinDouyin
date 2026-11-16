@@ -53,15 +53,8 @@ void SLFloatTTSEnd(BOOL success, NSString *failText, void (^retryBlock)(void));
 // 停在失败态再收会让球挂在合成蓝上。hint 非空时弹一次短 toast。
 void SLFloatTTSAbort(NSString *hint);
 
-// v0.5.x：评论区「合成后试听」删除 —— 评论松手即上传，替换后再听改不了已发出的那条。
-// v0.4.0（抖音版）：私聊单独恢复试听。私聊松手后先停在「发送 / 取消 / 转文字」确认面板，
-// 点发送才真正上传 —— 这段窗口里用户能先听一遍即将发出的音频，确认要不要发。
-// 评论链路完全不碰这个函数。
-// ok=YES：胶囊「已替换 · 点这里试听」；ok=NO：胶囊「将发原声 · 点这里试听」（都能点播）。
-// path 是即将发出的那条文件（成功=合成音，失败=原声副本）；不自动收起，直到发送/取消或超时。
-void SLFloatPrivateAudition(BOOL ok, NSString *path, NSString *msg);
-// 用户点了私聊原生确认面板的「发送 / 取消 / 转文字」：收起试听胶囊，别让它挂在确认面板上。
-void SLFloatPrivateAuditionDismiss(void);
+// v0.5.x：「合成后先试听」整段删除。抖音语音松手即发送，替换后再听只是
+// "事后回放"，改不了已经发出去的那条 —— 留着是假入口。
 
 // v0.4.34：设置 / 语音包都装在浮窗里，内部是子控制器，
 // 点「完成」要先向上找到真正的呈现者，否则 dismiss 自己什么也不会发生。

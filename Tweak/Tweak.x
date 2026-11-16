@@ -153,6 +153,8 @@ NSString *SLRuntimeStateSummary(void) {
 
 - (void)clear {
     [[AWECARecordEnhance shared] markCommentTakeCancelled];
+    // 上滑取消也是「原声」：录音红要落回灰，否则球会一直挂在红上。
+    SLFloatPush(SLFloatStateIdle);
     %orig;
 }
 
@@ -200,6 +202,7 @@ NSString *SLRuntimeStateSummary(void) {
         && !armedLocal && ![enhance shouldRunForCommentRecording]) {
         SLLog(@"CMT 跳过合成：凭证缺失");
         [AWECAUtils showToast:@"请先填写火山 API Key"];
+        SLFloatPush(SLFloatStateIdle);   // 发原声：录音红必须落回灰
         %orig;
         return;
     }
@@ -212,6 +215,9 @@ NSString *SLRuntimeStateSummary(void) {
     }
 
     if (success && [enhance shouldSkipStickyReplaceForPath:path]) {
+        // busy 时 SLFloatSetState 的合成闸会挡下这个 Idle（球仍由在飞流水线收尾）；
+        // 其余情况都是发原声，红必须落灰。
+        SLFloatPush(SLFloatStateIdle);
         %orig;
         return;
     }
@@ -230,6 +236,8 @@ NSString *SLRuntimeStateSummary(void) {
         if (done) [AWECAUtils showToast:@"语音已替换"];
     } else {
         %orig;
+        // 纯原声录制（替换关 / 增强关 / 合成未命中）：录音红落回灰。
+        SLFloatPush(SLFloatStateIdle);
     }
 }
 
@@ -259,7 +267,7 @@ NSString *SLRuntimeStateSummary(void) {
 //   录音器：AWEIMAudioMessageRecorder.url
 //
 // 策略：每个流程只在「终局发送点」拦截一次（避免双击重复发），全程打 AWECA-IM 日志自证；
-//       松手后有「发送 / 取消 / 转文字」确认面板，点发送才真正发消息，足够异步流水线跑完。
+//       拦截后跑完流水线再重放发送，松手即发/面板确认都走同一条终局路径。
 
 #pragma mark - 私聊工具函数
 
@@ -330,8 +338,10 @@ static void AWECACall2(id target, SEL sel, id a, id b) {
 }
 
 // 发送闸门：返回 YES = 已接管（调用方不要再 %orig，由 fire 负责重放），NO = 直接放行。
-// fire 在流水线结束后于主线程回调，调用方在其中执行真正的发送（可带上替换后的音频）。
-static BOOL AWECAPrivateGate(const char *tag, NSString *path, void (^fire)(BOOL ok, NSString *message)) {
+// fire 在流水线结束后于主线程回调，调用方在其中执行真正的发送。
+// replayPath 是「拦截当下」就定好的音频文件；此后即便新录音清掉快照映射，重放仍用这一条。
+static BOOL AWECAPrivateGate(const char *tag, NSString *path,
+                             void (^fire)(BOOL ok, NSString *message, NSString *replayPath)) {
     AWECARecordEnhance *enhance = [AWECARecordEnhance shared];
     NSLog(@"AWECA-IM: [%s] send path=%@ armed=%d skip=%d",
           tag, path, enhance.privateArmed, enhance.privateSkipOnce);
@@ -350,6 +360,20 @@ static BOOL AWECAPrivateGate(const char *tag, NSString *path, void (^fire)(BOOL 
     NSString *p = [path copy];
     NSLog(@"AWECA-IM: [%s] INTERCEPT, enhancing %@", tag, p);
     [AWECAUtils showToast:@"识别合成中..." duration:2.0];
+
+    // 关键：在拦截这一刻就把「重放要发的文件」钉死。
+    // 旧做法在 fire 里才 snapshotPathForSourcePath:path 回查——连续录制时新的一遍会把
+    // snapMap 清掉，回查拿到 nil 就退回抖音复用的活路径（此时是空/下一条的文件），
+    // 表现为「0 秒」「录不进去」。提前捕获可彻底避开这个竞态。
+    NSString *snapAtIntercept = [enhance snapshotPathForSourcePath:p];
+    if (!snapAtIntercept.length) {
+        // 极少数直达发送的分支还没建快照：让 privateWait 建好再取。
+        [enhance privateBeginForSourcePath:p];
+        snapAtIntercept = [enhance snapshotPathForSourcePath:p];
+    }
+    NSString *replayAtIntercept = (snapAtIntercept.length &&
+        [[NSFileManager defaultManager] fileExistsAtPath:snapAtIntercept]) ? snapAtIntercept : p;
+
     // v1.4.6 快照隔离：流水线只对插件私有副本转换，抖音复用的活路径全程不被触碰；
     // 已取消（message 含"已取消"）绝不补发——取消过程中同步发消息会弄乱抖音录音 UI
     [enhance privateWaitForSourcePath:p completion:^(BOOL ok, NSString *message) {
@@ -357,55 +381,24 @@ static BOOL AWECAPrivateGate(const char *tag, NSString *path, void (^fire)(BOOL 
               tag, ok, message, enhance.privateAborted);
         if (message.length) [AWECAUtils showToast:message duration:2.5];
         if (!ok && [message containsString:@"已取消"]) {
-            SLFloatPrivateAuditionDismiss();
             [enhance resetPrivateTake];
             return;
         }
         if (enhance.privateAborted) {
-            SLFloatPrivateAuditionDismiss();
             [enhance resetPrivateTake];
             return;
         }
         enhance.privateSkipOnce = YES;
         void (^safeFire)(void) = ^{
             @try {
-                if (fire) fire(ok, message);
+                if (fire) fire(ok, message, replayAtIntercept);
             } @catch (NSException *e) {
                 NSLog(@"AWECA-IM: [%s] fire exception: %@", tag, e);
             }
             [enhance resetPrivateTake];
         };
-        void (^settle)(void) = ^{
-            // 试听胶囊此刻必须收 —— 用户已经点了「发送」，再挂着就是残留。
-            SLFloatPrivateAuditionDismiss();
-            if (ok) { safeFire(); return; }
-
-            // 替换失败 + 用户选了「强制拦下确认」：不能直接把原声发出去，先问一次。
-            // 原声副本已经在 snap 里，取消 = 什么都不发（resetPrivateTake 兜底），
-            // 确认 = 才 fire(ok=NO)，重放时发原声（fire 内部按 ok 选副本 / 原 data）。
-            UIViewController *host = [AWECAUtils topViewController];
-            if (!host) { safeFire(); return; }   // 找不到呈现者就别把用户卡住：按老逻辑发原声
-            NSString *why = message.length ? message : @"没能转换成所选音色";
-            UIAlertController *ac = [UIAlertController
-                alertControllerWithTitle:@"替换失败"
-                message:[NSString stringWithFormat:@"%@。\n即将发送你的原声，确定要发吗？", why]
-                preferredStyle:UIAlertControllerStyleAlert];
-            [ac addAction:[UIAlertAction actionWithTitle:@"取消发送"
-                                                  style:UIAlertActionStyleCancel
-                                                handler:^(UIAlertAction *a) {
-                NSLog(@"AWECA-IM: [%s] user cancelled original after failure", tag);
-                [enhance resetPrivateTake];
-            }]];
-            [ac addAction:[UIAlertAction actionWithTitle:@"仍发原声"
-                                                  style:UIAlertActionStyleDefault
-                                                handler:^(UIAlertAction *a) {
-                NSLog(@"AWECA-IM: [%s] user confirmed original after failure", tag);
-                safeFire();
-            }]];
-            [host presentViewController:ac animated:YES completion:nil];
-        };
-        if ([NSThread isMainThread]) settle();
-        else dispatch_async(dispatch_get_main_queue(), settle);
+        if ([NSThread isMainThread]) safeFire();
+        else dispatch_async(dispatch_get_main_queue(), safeFire);
     }];
     return YES;
 }
@@ -522,12 +515,10 @@ static BOOL AWECAPrivateGate(const char *tag, NSString *path, void (^fire)(BOOL 
     AWECARecordEnhance *enhance = [AWECARecordEnhance shared];
     NSLog(@"AWECA-IM: CtrlSend(file) raw=%@ path=%@ armed=%d", filePath, path, enhance.privateArmed);
     @try { AWECAPrivateNotePath(path); } @catch (NSException *e) {}
-    if (AWECAPrivateGate("ctrl-file", path, ^(BOOL ok, NSString *m) {
-        // v1.4.6 快照重放：发的始终是副本路径（成功=合成音频，失败=原声副本）。
-        // 旧做法成功时发原路径——若期间用户已录下一条（抖音复用同一路径），
-        // 发出去的会是下一条的声音；失败时发原路径也可能拿到被改动的内容
-        NSString *snap = [enhance snapshotPathForSourcePath:path];
-        NSString *replayPath = (snap.length && [[NSFileManager defaultManager] fileExistsAtPath:snap]) ? snap : path;
+    if (AWECAPrivateGate("ctrl-file", path, ^(BOOL ok, NSString *m, NSString *replayPath) {
+        // v1.4.6 快照重放：发的是拦截当下钉死的副本路径（成功=合成音频，失败=原声副本）。
+        // 旧做法在 fire 时才回查 snapMap，连续录制下一条会清掉映射、退回抖音复用的活路径，
+        // 发出去的就是空/下一条的声音（0 秒、录不进去）。replayPath 由 gate 提前定好。
         void (^go)(void) = ^{
             __strong id sctrl = wctrl;
             if (!sctrl) { NSLog(@"AWECA-IM: ctrl-file replay skipped (controller gone)"); return; }
@@ -597,8 +588,9 @@ static BOOL AWECAPrivateGate(const char *tag, NSString *path, void (^fire)(BOOL 
           (unsigned long)([data isKindOfClass:[NSData class]] ? ((NSData *)data).length : 0),
           path, enhance.privateArmed);
     @try { AWECAPrivateNotePath(path); } @catch (NSException *e) {}
-    if (AWECAPrivateGate("format-data", path, ^(BOOL ok, NSString *m) {
-        NSData *outData = ok ? [NSData dataWithContentsOfFile:path] : nil;
+    if (AWECAPrivateGate("format-data", path, ^(BOOL ok, NSString *m, NSString *replayPath) {
+        // 读拦截当下钉死的快照，而不是 fire 时可能已被下一条改写的 path。
+        NSData *outData = ok ? [NSData dataWithContentsOfFile:replayPath] : nil;
         NSData *final = (outData.length ? outData
                          : ([data isKindOfClass:[NSData class]] ? (NSData *)data : nil));
         void (^go)(void) = ^{

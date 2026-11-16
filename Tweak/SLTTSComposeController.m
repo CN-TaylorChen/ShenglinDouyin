@@ -235,7 +235,7 @@ static NSArray<NSNumber *> *SLComposeWaveHeights(NSData *pcm, NSInteger bars) {
 - (void)viewDidLoad {
     [super viewDidLoad];
     self.state = SLComposeStateEditing;
-    self.navigationItem.titleView = SLPillTitleView(@"生成语音");
+    self.navigationItem.titleView = SLPillTitleView(@"文本转语音");
     SLInstallPillBack(self);
     // v0.5.49：这里原来调的是 SLInstallGlassBackdrop(self.view)。本页是 UITableViewController，
     // self.view 就是 tableView，那块毛玻璃被 insertSubview:atIndex:0 塞进了表格自己的滚动内容里，
@@ -385,7 +385,8 @@ static NSArray<NSNumber *> *SLComposeWaveHeights(NSData *pcm, NSInteger bars) {
 
     if (busy) {
         self.stateDot.backgroundColor = [UIColor systemBlueColor];
-        self.stateText.textColor = [UIColor systemBlueColor];
+        // 状态文字用主标签色，不再整行着蓝（用户：「文字颜色不要蓝色」）。
+        self.stateText.textColor = [UIColor labelColor];
         NSString *v = [self sl_currentVoiceName];
         self.stateText.text = [NSString stringWithFormat:@"正在用「%@」合成 · 完成后自动装填", v];
     } else if (done) {
