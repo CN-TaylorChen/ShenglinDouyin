@@ -357,10 +357,12 @@ static BOOL AWECAPrivateGate(const char *tag, NSString *path, void (^fire)(BOOL 
               tag, ok, message, enhance.privateAborted);
         if (message.length) [AWECAUtils showToast:message duration:2.5];
         if (!ok && [message containsString:@"已取消"]) {
+            SLFloatPrivateAuditionDismiss();
             [enhance resetPrivateTake];
             return;
         }
         if (enhance.privateAborted) {
+            SLFloatPrivateAuditionDismiss();
             [enhance resetPrivateTake];
             return;
         }
@@ -373,8 +375,37 @@ static BOOL AWECAPrivateGate(const char *tag, NSString *path, void (^fire)(BOOL 
             }
             [enhance resetPrivateTake];
         };
-        if ([NSThread isMainThread]) safeFire();
-        else dispatch_async(dispatch_get_main_queue(), safeFire);
+        void (^settle)(void) = ^{
+            // 试听胶囊此刻必须收 —— 用户已经点了「发送」，再挂着就是残留。
+            SLFloatPrivateAuditionDismiss();
+            if (ok) { safeFire(); return; }
+
+            // 替换失败 + 用户选了「强制拦下确认」：不能直接把原声发出去，先问一次。
+            // 原声副本已经在 snap 里，取消 = 什么都不发（resetPrivateTake 兜底），
+            // 确认 = 才 fire(ok=NO)，重放时发原声（fire 内部按 ok 选副本 / 原 data）。
+            UIViewController *host = [AWECAUtils topViewController];
+            if (!host) { safeFire(); return; }   // 找不到呈现者就别把用户卡住：按老逻辑发原声
+            NSString *why = message.length ? message : @"没能转换成所选音色";
+            UIAlertController *ac = [UIAlertController
+                alertControllerWithTitle:@"替换失败"
+                message:[NSString stringWithFormat:@"%@。\n即将发送你的原声，确定要发吗？", why]
+                preferredStyle:UIAlertControllerStyleAlert];
+            [ac addAction:[UIAlertAction actionWithTitle:@"取消发送"
+                                                  style:UIAlertActionStyleCancel
+                                                handler:^(UIAlertAction *a) {
+                NSLog(@"AWECA-IM: [%s] user cancelled original after failure", tag);
+                [enhance resetPrivateTake];
+            }]];
+            [ac addAction:[UIAlertAction actionWithTitle:@"仍发原声"
+                                                  style:UIAlertActionStyleDefault
+                                                handler:^(UIAlertAction *a) {
+                NSLog(@"AWECA-IM: [%s] user confirmed original after failure", tag);
+                safeFire();
+            }]];
+            [host presentViewController:ac animated:YES completion:nil];
+        };
+        if ([NSThread isMainThread]) settle();
+        else dispatch_async(dispatch_get_main_queue(), settle);
     }];
     return YES;
 }

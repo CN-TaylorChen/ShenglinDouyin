@@ -428,10 +428,27 @@ static SLArmedSource sSLArmedSource = SLArmedSourceNone;
 
 #pragma mark - 抖音：装进替换槽
 
-// 转好的 m4a 放在 voicepacks/_m4a 下，键 = 相对路径 + 修改时间。
-// 同一个包重复点不会反复转码；包被裁掉/替换后 mtime 变了，自然换一份新的。
+// v0.4.0：转码缓存放在 ShenglinDouyin/_m4a_cache —— 与 voicepacks 平级，不在其内。
+// 原来放在 voicepacks/_m4a，会被 allPacks 的目录扫描当成一个语音包文件夹显示出来
+// （用户：「选了语音包怎么自动多个文件夹」）。挪出去后对用户完全不可见。
+// 键 = 相对路径 + 修改时间；同一个包重复点不反复转码，包被裁掉/替换后 mtime 变了自然换新的。
++ (NSString *)sl_m4aCacheDir {
+    NSString *dir = [[AWECAUtils documentsPath] stringByAppendingPathComponent:@"ShenglinDouyin/_m4a_cache"];
+    NSFileManager *fm = [NSFileManager defaultManager];
+    if (![fm fileExistsAtPath:dir]) {
+        [fm createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:nil];
+    }
+    // 一次性清掉老版本遗留在 voicepacks 里的 _m4a 文件夹（就是用户看到的那个多出来的文件夹）。
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        NSString *old = [[self rootDir] stringByAppendingPathComponent:@"_m4a"];
+        if ([fm fileExistsAtPath:old]) [fm removeItemAtPath:old error:nil];
+    });
+    return dir;
+}
+
 + (NSString *)sl_m4aCachePathForPack:(NSDictionary *)pack source:(NSString *)src {
-    NSString *dir = [[self rootDir] stringByAppendingPathComponent:@"_m4a"];
+    NSString *dir = [self sl_m4aCacheDir];
     NSFileManager *fm = [NSFileManager defaultManager];
     if (![fm fileExistsAtPath:dir]) {
         [fm createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:nil];

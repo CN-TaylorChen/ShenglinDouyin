@@ -329,10 +329,14 @@ static UIImage *SLTransparentImage(void) {
 - (void)sl_ttsBegin:(NSString *)title limit:(NSTimeInterval)limit cancel:(void (^)(void))cancelBlock;
 - (void)sl_ttsPhase:(NSString *)title;
 /// 结论落定：成功 → 直接收球；失败 → 原地转红停一会儿，右端给「重试」。
-/// v0.5.x：试听态整段删掉 —— 抖音评论语音松手就上传，替换后再听只是"事后的录音"，
-/// 点开也改变不了已经发出去的那条，留着只会让人以为还能改。
+/// v0.5.x：评论区试听态删掉 —— 评论松手就上传，替换后再听改不了已发出的那条。
+/// 私聊的试听走下面单独的 sl_privateAudition，两个场景互不干扰。
 - (void)sl_ttsEnd:(BOOL)success failText:(NSString *)failText retry:(void (^)(void))retryBlock;
 - (void)sl_ttsTapAreaTapped;
+/// 私聊专用：合成结束停在试听态（phase 3），点胶囊播即将发出的那条。
+- (void)sl_privateAudition:(BOOL)ok path:(NSString *)path msg:(NSString *)msg;
+- (void)sl_ttsAuditionPlay;
+- (void)sl_ttsAuditionReset;
 /// 取消（对勾右边那个叉）：立刻收球，球按「槽位里还有没有装填」落定成绿 / 灰。
 /// 原来取消走的是「失败态红胶囊」，收完之后没人把蓝刷回来 —— 球就一直挂在合成蓝上。
 - (void)sl_ttsAbort;
@@ -340,6 +344,8 @@ static UIImage *SLTransparentImage(void) {
 - (void)sl_settleState;
 /// v0.4.85：合成还没出结论。SLFloatSetState 拿它当闸门，合成中不接受「回灰」。
 - (BOOL)sl_ttsBusy;
+/// 当前是否停在私聊试听相位（phase 3）。Dismiss 只在这个相位收，别误伤别的状态。
+- (BOOL)sl_isPrivateAudition;
 - (void)sl_ttsReveal;
 // 下面几个只在内部互相调用。全部提前声明，省得 clang 因「定义在调用点之后」
 // 报 instance method not found（-Werror 下会直接炸 CI）。
@@ -592,7 +598,9 @@ static UIImage *SLTransparentImage(void) {
     NSTimer *_ttsTimer;
     CFTimeInterval _ttsStart;
     NSTimeInterval _ttsLimit;
-    NSInteger _ttsPhase;         // 0 = 关闭 / 1 = 合成中 / 2 = 失败提示中
+    NSInteger _ttsPhase;         // 0 = 关闭 / 1 = 合成中 / 2 = 失败提示中 / 3 = 私聊试听
+    // 私聊试听态：即将发出的那条文件（成功=合成音，失败=原声副本）。点胶囊播它。
+    NSString *_ttsAuditionPath;
     // v0.4.85：胶囊是否已经铺开。v0.5.x 起合成一开始就铺开（用户要的是「合成的时候就看到它在做事」），
     // 所以这个标记现在只表示「当前铺开的形变是为了合成态」，不再是延迟展开的开关。
     BOOL _ttsShown;
@@ -1718,6 +1726,10 @@ static UIImage *SLTransparentImage(void) {
     return _ttsPhase == 1;
 }
 
+- (BOOL)sl_isPrivateAudition {
+    return _ttsPhase == 3;
+}
+
 /// 阶段切换只改主行文字（识别中 → 合成中），不重开一轮胶囊：
 /// 重开会把计时清零、胶囊缩回球再展开，用户会以为任务重来了。
 - (void)sl_ttsPhase:(NSString *)title {
@@ -1846,9 +1858,69 @@ static UIImage *SLTransparentImage(void) {
     }
 
     // 成功：直接收球，颜色由 sl_settleState 按「槽位里还有没有东西」定（绿 / 灰）。
-    // v0.5.x：原来这里还会停在「已替换 · 点这里试听」4 秒 —— 抖音松手就上传了，
-    // 听完也改不了已经发出去的那条，纯属给人一个假入口，删掉。
+    // 评论区没有试听（松手即传），私聊走下面单独的 sl_privateAudition。
     [self sl_ttsAutoCollapse];
+}
+
+#pragma mark - 私聊试听（v0.4.0）
+
+/// 私聊合成结束：停在 phase 3，点胶囊试听「即将发出的那条」。
+/// 成功=合成音，失败=原声副本 —— 无论哪种，播的就是接下来会发出的文件，
+/// 用户听完再决定点「发送」还是「取消」。不自动收：确认面板还开着，急什么。
+- (void)sl_privateAudition:(BOOL)ok path:(NSString *)path msg:(NSString *)msg {
+    [_ttsTimer invalidate];
+    _ttsTimer = nil;
+    [NSObject cancelPreviousPerformRequestsWithTarget:self selector:@selector(sl_ttsAutoCollapse) object:nil];
+
+    _ttsPhase = 3;
+    _ttsShown = YES;
+    _ttsAuditionPath = [path copy];
+    _ttsRetryBlock = nil;              // 私聊不提供「重来一次合成」——重录走原生的取消
+
+    [self sl_ttsHideContent];
+    _ttsTitle.hidden = NO;
+    _ttsTitle.text = ok ? @"已替换" : @"将发原声";
+    _ttsTitle.textColor = ok ? [UIColor labelColor] : [UIColor systemRedColor];
+    _ttsSub.hidden = NO;
+    _ttsSub.text = @"点这里试听";
+    _ttsSub.textColor = [UIColor secondaryLabelColor];
+    _ttsTrack.hidden = NO;
+    _ttsFill.backgroundColor = ok ? [UIColor systemGreenColor] : [UIColor systemRedColor];
+    [_ttsCancel setTitle:@"换一发" forState:UIControlStateNormal];
+    _ttsCancel.hidden = NO;
+    _ttsStroke.hidden = YES;
+    _ttsTapArea.hidden = NO;           // 整条胶囊可点 = 试听
+    if (!self.slExpanded) [self sl_expand:YES animated:YES];
+    [self setNeedsLayout];
+
+    SLLog(@"private audition phase=%@ path=%@ msg=%@", ok ? @"ok" : @"fail",
+          path.lastPathComponent, msg ?: @"-");
+}
+
+- (void)sl_ttsAuditionPlay {
+    if (!_ttsAuditionPath.length) return;
+    if (![[NSFileManager defaultManager] fileExistsAtPath:_ttsAuditionPath]) {
+        _ttsSub.text = @"文件已不在";
+        _ttsTitle.text = @"试听失败";
+        _ttsTitle.textColor = [UIColor systemRedColor];
+        SLLog(@"private audition file missing %@", _ttsAuditionPath.lastPathComponent);
+        return;
+    }
+    [[AWECATTSManager shared] playAudioAtPath:_ttsAuditionPath];
+    _ttsSub.text = @"播放中…";
+    SLLog(@"private audition play %@", _ttsAuditionPath.lastPathComponent);
+
+    NSTimeInterval dur = [AWECAUtils audioDurationAtPath:_ttsAuditionPath];
+    if (dur < 0.4) dur = 1.2;   // 时长读不出来时给个兜底，别让「播放中」一直挂着
+
+    [NSObject cancelPreviousPerformRequestsWithTarget:self selector:@selector(sl_ttsAuditionReset) object:nil];
+    [self performSelector:@selector(sl_ttsAuditionReset) withObject:nil afterDelay:dur + 0.15];
+}
+
+- (void)sl_ttsAuditionReset {
+    if (_ttsPhase != 3) return;
+    _ttsSub.text = @"点这里试听";
+    [self setNeedsLayout];
 }
 
 - (void)sl_ttsAutoCollapse {
@@ -1862,6 +1934,8 @@ static UIImage *SLTransparentImage(void) {
     // 叠成一团（用户第二张截图里三个词组同时可见）。挪到 sl_ttsCollapseShape，和收缩同帧清。
     _ttsCancelBlock = nil;
     _ttsRetryBlock = nil;
+    _ttsAuditionPath = nil;
+    [NSObject cancelPreviousPerformRequestsWithTarget:self selector:@selector(sl_ttsAuditionReset) object:nil];
     // v0.4.89：先让内容跟着一起收（0.08s 淡出），再走 0.18s 的收缩形变。
     // 原来内容是一帧消失、胶囊一帧缩回，两件事同时硬切。现在至少有个「收」的过程。
     for (UIView *v in @[_ttsTitle, _ttsSub, _ttsTrack, _ttsCancel]) {
@@ -1906,10 +1980,12 @@ static UIImage *SLTransparentImage(void) {
 - (void)sl_ttsBtnTapped {
     if (_ttsPhase == 1) [self sl_ttsCancelTapped];
     else if (_ttsPhase == 2) [self sl_ttsRetryTapped];
+    else if (_ttsPhase == 3) [self sl_ttsRetryTapped];   // 私聊试听态右端是「换一发」，走同一条路
 }
 
-/// 整条胶囊的点击：只在失败态有意义（点一下重试）。
+/// 整条胶囊的点击：私聊试听态 = 播一遍即将发出的音频；失败态 = 重试。
 - (void)sl_ttsTapAreaTapped {
+    if (_ttsPhase == 3) { [self sl_ttsAuditionPlay]; return; }
     [self sl_ttsRetryTapped];
 }
 
@@ -3301,6 +3377,37 @@ void SLFloatTTSAbort(NSString *hint) {
         }
         if (btn) [btn sl_ttsAbort];
         if (hint.length) [AWECAUtils showToast:hint duration:1.6];
+    };
+    if ([NSThread isMainThread]) work();
+    else dispatch_async(dispatch_get_main_queue(), work);
+}
+
+// 私聊试听：主线程直接落态，避免和随后 Tweak.x 里的状态推送抢时序。
+void SLFloatPrivateAudition(BOOL ok, NSString *path, NSString *msg) {
+    void (^work)(void) = ^{
+        SLFloatButton *btn = sSLFloatBtn;
+        if (!btn) {
+            UIWindow *w = SLKeyWindow();
+            btn = (SLFloatButton *)[w viewWithTag:SLBtnTag];
+        }
+        if (btn) [btn sl_privateAudition:ok path:path msg:msg];
+    };
+    if ([NSThread isMainThread]) work();
+    else dispatch_async(dispatch_get_main_queue(), work);
+}
+
+void SLFloatPrivateAuditionDismiss(void) {
+    void (^work)(void) = ^{
+        SLFloatButton *btn = sSLFloatBtn;
+        if (!btn) {
+            UIWindow *w = SLKeyWindow();
+            btn = (SLFloatButton *)[w viewWithTag:SLBtnTag];
+        }
+        // 只在试听相位收，别误伤评论区正在跑的合成态
+        if (!btn || ![btn isKindOfClass:[SLFloatButton class]]) return;
+        if (![btn sl_isPrivateAudition]) return;
+        [NSObject cancelPreviousPerformRequestsWithTarget:btn selector:@selector(sl_ttsAutoCollapse) object:nil];
+        [btn sl_ttsAutoCollapse];
     };
     if ([NSThread isMainThread]) work();
     else dispatch_async(dispatch_get_main_queue(), work);

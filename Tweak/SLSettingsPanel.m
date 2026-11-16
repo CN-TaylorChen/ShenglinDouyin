@@ -11,6 +11,7 @@
 
 #import "SLSettingsPanel.h"
 #import "AWECATTSManager.h"
+#import "AWECARecordEnhance.h"
 #import "AWECAUtils.h"
 #import "AWECATOSUploader.h"
 #import "AWECAAPISettingsController.h"
@@ -239,7 +240,7 @@ static UIView *SLMakeHeader(NSString *text, CGFloat x, CGFloat width) {
 
 - (NSInteger)tableView:(UITableView *)tv numberOfRowsInSection:(NSInteger)section {
     (void)tv;
-    if (section == 0) return 7;   // 音色与合成：开关 + 引擎 + 音色 + 情绪 + 语速 + 音量 + 音调
+    if (section == 0) return 8;   // 音色与合成：私聊开关 + 评论开关 + 引擎 + 音色 + 情绪 + 语速 + 音量 + 音调
     if (section == 1) return 2;   // 音频来源：生成语音 + 语音包
     if (section == 2) return 3;   // 其它：悬浮球图标 + API 凭证 + 运行日志
     return 0;
@@ -316,15 +317,27 @@ static UIView *SLMakeHeader(NSString *text, CGFloat x, CGFloat width) {
 
     if (ip.section == 0) {                     // 音色与合成
         if (ip.row == 0) {
-            // 抖音语境的主路径：正常点麦克风说话，发出去就是当前 AI 音色
-            cell.textLabel.text = @"录音转音色";
+            // 私聊：关掉就发自己的原声（gate 直接放行，不跑识别合成）
+            cell.textLabel.text = @"私聊录音转音色";
+            UISwitch *sw = [[UISwitch alloc] initWithFrame:CGRectZero];
+            NSUserDefaults *d = [NSUserDefaults standardUserDefaults];
+            BOOL def = [d objectForKey:kAWECAPrivateEnhanceEnabled]
+                ? [d boolForKey:kAWECAPrivateEnhanceEnabled]
+                : ([d objectForKey:kSLEnabledKey] ? [d boolForKey:kSLEnabledKey] : YES);
+            sw.on = def;
+            [sw addTarget:self action:@selector(sl_privatePowerChanged:) forControlEvents:UIControlEventValueChanged];
+            cell.accessoryView = sw;
+            cell.selectionStyle = UITableViewCellSelectionStyleNone;
+        } else if (ip.row == 1) {
+            // 评论区：关掉就发原声
+            cell.textLabel.text = @"评论录音转音色";
             UISwitch *sw = [[UISwitch alloc] initWithFrame:CGRectZero];
             NSUserDefaults *d = [NSUserDefaults standardUserDefaults];
             sw.on = [d objectForKey:kSLEnabledKey] ? [d boolForKey:kSLEnabledKey] : YES;
             [sw addTarget:self action:@selector(sl_powerChanged:) forControlEvents:UIControlEventValueChanged];
             cell.accessoryView = sw;
             cell.selectionStyle = UITableViewCellSelectionStyleNone;
-        } else if (ip.row == 1) {
+        } else if (ip.row == 2) {
             cell.textLabel.text = @"合成引擎";
             UISegmentedControl *seg = [[UISegmentedControl alloc] initWithItems:@[@"火山引擎", @"Fish Audio"]];
             seg.frame = CGRectMake(0, 0, 186, 30);
@@ -332,21 +345,21 @@ static UIView *SLMakeHeader(NSString *text, CGFloat x, CGFloat width) {
             [seg addTarget:self action:@selector(sl_engineChanged:) forControlEvents:UIControlEventValueChanged];
             cell.accessoryView = seg;
             cell.selectionStyle = UITableViewCellSelectionStyleNone;
-        } else if (ip.row == 2) {
+        } else if (ip.row == 3) {
             NSString *voice = mgr.fishEngine
                 ? (mgr.fishVoiceName.length ? mgr.fishVoiceName : @"未选择，点这里添加")
                 : (mgr.voiceName.length ? mgr.voiceName : @"未选择");
             cell.textLabel.text = @"音色";
             cell.detailTextLabel.text = voice;
             cell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
-        } else if (ip.row == 3) {
+        } else if (ip.row == 4) {
             cell.textLabel.text = @"情绪";
             cell.detailTextLabel.text = mgr.fishEmotionSel.count
                 ? [NSString stringWithFormat:@"已选 %lu 个", (unsigned long)mgr.fishEmotionSel.count]
                 : @"未启用";
             cell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
-        } else if (ip.row >= 4) {
-            NSInteger kind = ip.row - 4;                 // 4 语速 · 5 音量 · 6 音调
+        } else if (ip.row >= 5) {
+            NSInteger kind = ip.row - 5;                 // 5 语速 · 6 音量 · 7 音调
             cell.textLabel.text = SLRatioTitle(kind);
             if (kind == SLRatioKindPitch && mgr.fishEngine) {
                 // FishAudio 的 prosody 只有 speed/volume，没有音高；置灰而不是给个滑不动的假滑块
@@ -411,20 +424,20 @@ static UIView *SLMakeHeader(NSString *text, CGFloat x, CGFloat width) {
 
     // 3 段结构 —— 音色与合成 / 音频来源 / 其它
     if (ip.section == 0) {                                  // 音色与合成
-        if (ip.row == 2) {                                  // 音色
+        if (ip.row == 3) {                                  // 音色
             AWECATTSVoiceListController *vc = [[AWECATTSVoiceListController alloc] init];
             vc.fishMode = [AWECATTSManager shared].fishEngine;   // 跟着引擎走，否则只能看到火山音色
             [self.navigationController pushViewController:vc animated:YES];
             return;
         }
-        if (ip.row == 3) {                                  // 情绪
+        if (ip.row == 4) {                                  // 情绪
             AWECATTSVoiceListController *vc = [[AWECATTSVoiceListController alloc] init];
             vc.emotionMode = YES;
             [self.navigationController pushViewController:vc animated:YES];
             return;
         }
-        if (ip.row >= 4) {                                       // 语速 / 音量 / 音调
-            NSInteger kind = ip.row - 4;
+        if (ip.row >= 5) {                                       // 语速 / 音量 / 音调
+            NSInteger kind = ip.row - 5;
             if (kind == SLRatioKindPitch && [AWECATTSManager shared].fishEngine) {
                 [AWECAUtils showToast:@"FishAudio 没有音调参数，切回火山引擎可用" duration:2.0];
                 return;
@@ -432,7 +445,7 @@ static UIView *SLMakeHeader(NSString *text, CGFloat x, CGFloat width) {
             [self sl_editRatio:kind];
             return;
         }
-        return;                                                  // 0/1 是开关与分段控件
+        return;                                                  // 0/1 是两个开关，2 是分段控件
     }
 
     if (ip.section == 1) {                                  // 音频来源
@@ -600,7 +613,17 @@ static UIView *SLMakeHeader(NSString *text, CGFloat x, CGFloat width) {
 - (void)sl_powerChanged:(UISwitch *)sw {
     [[NSUserDefaults standardUserDefaults] setBool:sw.on forKey:kSLEnabledKey];
     [[NSUserDefaults standardUserDefaults] synchronize];
-    [AWECAUtils showToast:sw.on ? @"已启用文字转语音" : @"已关闭，只发文本" duration:1.5];
+    [AWECARecordEnhance shared].enhanceEnabled = sw.on;   // 立刻生效，不用重启抖音
+    [AWECAUtils showToast:sw.on ? @"评论语音已转成音色" : @"评论发自己的原声" duration:1.5];
+}
+
+// 私聊开关：写 UserDefaults + 同步到单例，关掉后 gate 直接放行原声。
+// 单例是 dispatch_once 缓存的，只写 plist 不会更新内存里的值 —— 必须显式 set。
+- (void)sl_privatePowerChanged:(UISwitch *)sw {
+    [[NSUserDefaults standardUserDefaults] setBool:sw.on forKey:kAWECAPrivateEnhanceEnabled];
+    [[NSUserDefaults standardUserDefaults] synchronize];
+    [AWECARecordEnhance shared].privateEnhanceEnabled = sw.on;
+    [AWECAUtils showToast:sw.on ? @"私聊语音已转成音色" : @"私聊发自己的原声" duration:1.5];
 }
 
 - (void)sl_engineChanged:(UISegmentedControl *)seg {

@@ -157,6 +157,8 @@ static void AWECAWalkHideStatusDots(UIView *v, BOOL hide) {
 
 - (void)markPrivateTakeCancelled {
     self.privateArmed = NO;
+    // 用户点了原生确认面板的「取消 / 转文字」：试听胶囊没用了，收掉，别挂在聊天界面上。
+    SLFloatPrivateAuditionDismiss();
     NSString *cancelledPath = self.privateRecordPath;
     self.privateRecordPath = nil;
     // 先置取消标记再作废流水线：作废会同步 flush waiter（gate 回调），回调里凭此标记拒绝补发消息，
@@ -413,6 +415,16 @@ static void AWECAWalkHideStatusDots(UIView *v, BOOL hide) {
 - (void)finishPipelineOk:(BOOL)ok path:(NSString *)path message:(NSString *)msg {
     if (self.finishedOnce) return;
     self.finishedOnce = YES;
+    // v0.4.0：私聊流水线只认「本次由私聊源触发」的这一发。inFlightSourcePath 只有私聊
+    // 的 privateBegin/privateWait 会设，评论区 beginIfNeededAtPath 不设 —— 用它区分两条链路，
+    // 评论区仍走原来的一次性收球，绝不弹试听（评论松手即上传，试听是假入口）。
+    BOOL isPrivatePipeline = self.inFlightSourcePath.length > 0;
+    // 用户已经点了「发送」并在等结果时（waiter 命中本路径），不要再弹试听胶囊 ——
+    // 他既然已经决定发，试听就是多余的；而且这一发结束后胶囊才冒出来会变成残留。
+    BOOL hasWaitingSend = NO;
+    for (NSDictionary *entry in self.waiters) {
+        if ([entry[@"path"] isEqualToString:path]) { hasWaitingSend = YES; break; }
+    }
     self.pipelineEpoch += 1;
     self.busy = NO;
     self.inFlightPath = nil;
@@ -441,8 +453,22 @@ static void AWECAWalkHideStatusDots(UIView *v, BOOL hide) {
     void (^retryBlock)(void) = ^{
         if (retryPath.length) [weakRetry startPipelineAtPath:retryPath];
     };
-    SLLog(@"pipeline end ok=%d path=%@ msg=%@", ok, path.lastPathComponent, msg);
-    SLFloatTTSEnd(ok, msg, retryBlock);
+    SLLog(@"pipeline end ok=%d private=%d waiting=%d path=%@ msg=%@",
+          ok, isPrivatePipeline, hasWaitingSend, path.lastPathComponent, msg);
+    if (isPrivatePipeline && !hasWaitingSend) {
+        // 私聊：停在试听态，播的就是马上要发出去的 path（成功=合成音，失败=原声副本）。
+        // 用户听完再在原生确认面板决定发不发；失败时 Tweak.x 的 gate 还会强制弹确认。
+        // 注意：如果录音文件已被抖音删掉/覆盖，path 已不存在，就别摆一个点了没反应的试听。
+        BOOL playable = path.length && [[NSFileManager defaultManager] fileExistsAtPath:path];
+        if (playable) {
+            SLFloatPrivateAudition(ok, path, msg);
+        } else {
+            SLFloatTTSAbort(nil);
+        }
+    } else {
+        // 评论区，或私聊但用户已经点了发送（gate 已接管，胶囊交给它收）——都走普通收尾。
+        SLFloatTTSEnd(ok, msg, retryBlock);
+    }
 }
 
 - (void)startPipelineAtPath:(NSString *)path {
