@@ -22,7 +22,8 @@
 #import "SLAlignBox.h"
 #import "SLTTSAuditionPanel.h"
 #import "SLGlass.h"
-#import "AWECAAudioPickerController.h"
+#import "SLLocalAudioController.h"
+#import "AWECAAudioReplacer.h"
 #import "AWECADownloadManager.h"
 #import "SLTTSComposeController.h"
 
@@ -73,6 +74,41 @@ static UIImage *SLThinSliderThumb(void) {
 #define SLVersion @"1.0.0"
 
 // v0.4.52：单元格玻璃色搬到 SLGlass（全站二级页共用同一个数），这里不再重复定义。
+
+#pragma mark - 语速 / 音量 / 音调
+
+typedef NS_ENUM(NSInteger, SLRatioKind) {
+    SLRatioKindSpeed = 0,
+    SLRatioKindVolume = 1,
+    SLRatioKindPitch = 2,
+};
+
+static NSString *SLRatioTitle(NSInteger kind) {
+    switch (kind) {
+        case SLRatioKindVolume: return @"音量";
+        case SLRatioKindPitch:  return @"音调";
+        default:                return @"语速";
+    }
+}
+
+// 音调单位是「倍率」，火山侧映射成 ±12 半音（aweca_mapPitchToV3），1.00x = 原调
+static float SLRatioGet(SLRatioKind kind) {
+    AWECATTSManager *m = [AWECATTSManager shared];
+    switch (kind) {
+        case SLRatioKindVolume: return m.volumeRatio;
+        case SLRatioKindPitch:  return m.pitchRatio;
+        default:                return m.speedRatio;
+    }
+}
+
+static void SLRatioSet(SLRatioKind kind, float v) {
+    AWECATTSManager *m = [AWECATTSManager shared];
+    switch (kind) {
+        case SLRatioKindVolume: m.volumeRatio = v; break;
+        case SLRatioKindPitch:  m.pitchRatio  = v; break;
+        default:                m.speedRatio  = v; break;
+    }
+}
 
 #pragma mark - 分组标题 / 多行 footer：统一左基线
 
@@ -214,7 +250,7 @@ static UIView *SLMakeHeader(NSString *text, CGFloat x, CGFloat width) {
 
 - (NSInteger)tableView:(UITableView *)tv numberOfRowsInSection:(NSInteger)section {
     (void)tv;
-    if (section == 0) return 7;   // 语音：开关 + 引擎 + 音色 + 文字合成 + 情绪 + 语速 + 音量
+    if (section == 0) return 8;   // 语音：开关 + 引擎 + 音色 + 文字合成 + 情绪 + 语速 + 音量 + 音调
     if (section == 1) return 2;   // 本地：本地音频 + 语音包
     if (section == 2) return 4;   // 发送：合成口令 + 短录音补全 + 合成后先试听 + 失败时放回输入框
     if (section == 3) return 3;   // 其它：悬浮球图标 + API 凭证 + 运行日志
@@ -328,22 +364,27 @@ static UIView *SLMakeHeader(NSString *text, CGFloat x, CGFloat width) {
                 ? [NSString stringWithFormat:@"已选 %lu 个", (unsigned long)mgr.fishEmotionSel.count]
                 : @"未启用";
             cell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
-        } else if (ip.row == 5) {
-            cell.textLabel.text = @"语速";
-            cell.accessoryView = [self sl_ratioAccessory:YES];
-        } else {
-            cell.textLabel.text = @"音量";
-            cell.accessoryView = [self sl_ratioAccessory:NO];
+        } else if (ip.row >= 5) {
+            NSInteger kind = ip.row - 5;                 // 5 语速 · 6 音量 · 7 音调
+            cell.textLabel.text = SLRatioTitle(kind);
+            if (kind == SLRatioKindPitch && mgr.fishEngine) {
+                // FishAudio 的 prosody 只有 speed/volume，没有音高；置灰而不是给个滑不动的假滑块
+                cell.textLabel.textColor = [UIColor tertiaryLabelColor];
+                cell.detailTextLabel.text = @"仅火山";
+                cell.detailTextLabel.textColor = [UIColor tertiaryLabelColor];
+                cell.selectionStyle = UITableViewCellSelectionStyleNone;
+            } else {
+                cell.accessoryView = [self sl_ratioAccessory:kind];
+            }
         }
         return cell;
     }
 
     if (ip.section == 1) {                     // 本地
         if (ip.row == 0) {
-            NSUInteger n = [[AWECADownloadManager shared] downloadedAudioFiles].count;
             cell.textLabel.text = @"本地音频";
-            cell.detailTextLabel.text = n ? [NSString stringWithFormat:@"已下载 %lu 个", (unsigned long)n]
-                                          : @"收藏 · 导入 · 目录";
+            NSString *now = [AWECAAudioReplacer shared].replacementAudioPath;
+            cell.detailTextLabel.text = now.length ? now.lastPathComponent : @"未装填 · 点这里选";
             cell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
         } else {
             cell.textLabel.text = @"语音包";
@@ -436,14 +477,21 @@ static UIView *SLMakeHeader(NSString *text, CGFloat x, CGFloat width) {
             [self.navigationController pushViewController:vc animated:YES];
             return;
         }
-        if (ip.row == 5) { [self sl_editRatio:YES]; return; }    // 语速
-        if (ip.row == 6) { [self sl_editRatio:NO];  return; }    // 音量
+        if (ip.row >= 5) {                                       // 语速 / 音量 / 音调
+            NSInteger kind = ip.row - 5;
+            if (kind == SLRatioKindPitch && [AWECATTSManager shared].fishEngine) {
+                [AWECAUtils showToast:@"FishAudio 没有音调参数，切回火山引擎可用" duration:2.0];
+                return;
+            }
+            [self sl_editRatio:kind];
+            return;
+        }
         return;                                                  // 0/1 是开关与分段控件
     }
 
     if (ip.section == 1) {                                  // 本地
-        if (ip.row == 0) {                                  // 本地音频：收藏 / 导入 / 目录
-            [[AWECAAudioPickerController shared] showPickerFromViewController:self];
+        if (ip.row == 0) {                                  // 本地音频库
+            [self.navigationController pushViewController:[[SLLocalAudioController alloc] init] animated:YES];
             return;
         }
         [self.navigationController pushViewController:[[SLVoicePackController alloc] init] animated:YES];
@@ -491,7 +539,7 @@ static UIView *SLMakeHeader(NSString *text, CGFloat x, CGFloat width) {
 - (void)sl_editCommand {
     [self sl_editCommandForKey:kSLCommandKey
                          title:@"合成口令"
-                       message:@"以这个口令开头时，文字会被转成语音消息发送"
+                       message:@"先打这个前缀再打要说的话，然后点麦克风录一句，松手发出去的就是这段文字"
                       fallback:@"#tts"];
 }
 
@@ -526,10 +574,11 @@ static UIView *SLMakeHeader(NSString *text, CGFloat x, CGFloat width) {
 
 // 语速/音量：0.5~2.0 倍，1.0 = 原声。
 // 火山走 speech_rate/loudness_rate（已在 AWECATTSManager 映射），Fish 走 prosody.speed/volume
-- (void)sl_editRatio:(BOOL)speed {
-    NSString *title = speed ? @"语速" : @"音量";
+- (void)sl_editRatio:(NSInteger)kindRaw {
+    SLRatioKind kind = (SLRatioKind)kindRaw;
+    NSString *title = SLRatioTitle(kind);
     AWECATTSManager *mgr = [AWECATTSManager shared];
-    float cur = speed ? mgr.speedRatio : mgr.volumeRatio;
+    float cur = SLRatioGet(kind);
     UIAlertController *ac = [UIAlertController alertControllerWithTitle:title
                                                                message:@"范围 0.5 ~ 2.0，填 1.0 恢复原声"
                                                         preferredStyle:UIAlertControllerStyleAlert];
@@ -545,7 +594,7 @@ static UIView *SLMakeHeader(NSString *text, CGFloat x, CGFloat width) {
         if (v < 0.01f) v = 1.0f;   // 空输入 / 0 回默认
         if (v < 0.5f) v = 0.5f;
         if (v > 2.0f) v = 2.0f;
-        if (speed) mgr.speedRatio = v; else mgr.volumeRatio = v;
+        SLRatioSet(kind, v);
         [mgr saveConfig];
         [weakSelf.tableView reloadData];
         [AWECAUtils showToast:[NSString stringWithFormat:@"%@已改为 %.2fx", title, v] duration:1.5];
@@ -554,7 +603,8 @@ static UIView *SLMakeHeader(NSString *text, CGFloat x, CGFloat width) {
 }
 
 // v0.4.71：语速/音量 → 右侧「数值 + 细轨滑块」；点整行仍走 sl_editRatio 精修（要填 1.37 这种值时用）
-- (UIView *)sl_ratioAccessory:(BOOL)speed {
+- (UIView *)sl_ratioAccessory:(NSInteger)kindRaw {
+    SLRatioKind kind = (SLRatioKind)kindRaw;
     // v0.4.72：宽度 188→192，是为了让轨道右端离卡片右缘多留 4pt（对齐其它行的右缘 16pt）。
     UIView *box = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 192, 32)];
 
@@ -562,7 +612,7 @@ static UIView *SLMakeHeader(NSString *text, CGFloat x, CGFloat width) {
     val.font = [UIFont monospacedDigitSystemFontOfSize:12 weight:UIFontWeightRegular];
     val.textColor = [UIColor secondaryLabelColor];
     val.textAlignment = NSTextAlignmentRight;
-    val.tag = speed ? 99201 : 99202;
+    val.tag = 99201 + kind;
     val.userInteractionEnabled = YES;
     [val addGestureRecognizer:[[UITapGestureRecognizer alloc] initWithTarget:self action:@selector(sl_ratioReset:)]];
     [box addSubview:val];
@@ -571,7 +621,7 @@ static UIView *SLMakeHeader(NSString *text, CGFloat x, CGFloat width) {
     SLThinSlider *sl = [[SLThinSlider alloc] initWithFrame:CGRectMake(62, 0, 126, 32)];
     sl.minimumValue = 0.0f;
     sl.maximumValue = 1.0f;
-    sl.tag = speed ? 99211 : 99212;
+    sl.tag = 99211 + kind;
     sl.minimumTrackTintColor = [UIColor labelColor];
     sl.maximumTrackTintColor = [UIColor tertiaryLabelColor];
     [sl addTarget:self action:@selector(sl_ratioSliding:) forControlEvents:UIControlEventValueChanged];
@@ -580,8 +630,7 @@ static UIView *SLMakeHeader(NSString *text, CGFloat x, CGFloat width) {
                                                                   UIControlEventTouchCancel];
     [box addSubview:sl];
 
-    AWECATTSManager *mgr = [AWECATTSManager shared];
-    float cur = speed ? mgr.speedRatio : mgr.volumeRatio;
+    float cur = SLRatioGet(kind);
     if (cur < 0.5f) cur = 0.5f;
     if (cur > 2.0f) cur = 2.0f;
     sl.value = [self sl_ratioPosForValue:cur];   // 1.00x → 位置 0.5，正好落在轨道正中
@@ -597,7 +646,7 @@ static UIView *SLMakeHeader(NSString *text, CGFloat x, CGFloat width) {
 }
 
 - (void)sl_ratioShowValue:(UISlider *)sl value:(float)v {
-    UILabel *val = [sl.superview viewWithTag:(sl.tag == 99211 ? 99201 : 99202)];
+    UILabel *val = [sl.superview viewWithTag:(sl.tag - 99211 + 99201)];
     val.text = [NSString stringWithFormat:@"%.2fx", v];
 }
 
@@ -617,21 +666,20 @@ static UIView *SLMakeHeader(NSString *text, CGFloat x, CGFloat width) {
 }
 
 - (void)sl_ratioSliding:(UISlider *)sl {
-    BOOL speed = (sl.tag == 99211);
+    SLRatioKind kind = (SLRatioKind)(sl.tag - 99211);
     float v = [self sl_ratioValueForPos:sl.value];   // 拖动中不吸附档位，保证跟手顺滑
-    AWECATTSManager *mgr = [AWECATTSManager shared];
-    if (speed) mgr.speedRatio = v; else mgr.volumeRatio = v;   // 只改内存，不写盘
+    SLRatioSet(kind, v);                             // 只改内存，不写盘
     [self sl_ratioShowValue:sl value:v];
 }
 
 - (void)sl_ratioSettled:(UISlider *)sl {
-    BOOL speed = (sl.tag == 99211);
+    SLRatioKind kind = (SLRatioKind)(sl.tag - 99211);
     float raw = [self sl_ratioValueForPos:sl.value];
     BOOL hitCenter = (fabsf(raw - 1.0f) < 0.06f);   // 靠近原声就吸回 1.00x
     float v = hitCenter ? 1.0f : [self sl_ratioSnap:raw];
     sl.value = [self sl_ratioPosForValue:v];        // 手柄落到吸附后的档位上
     AWECATTSManager *mgr = [AWECATTSManager shared];
-    if (speed) mgr.speedRatio = v; else mgr.volumeRatio = v;
+    SLRatioSet(kind, v);
     [mgr saveConfig];
     [self sl_ratioShowValue:sl value:v];
     if (hitCenter) {   // 只有吸附回 1.00x 才轻震一次，普通松手不震
@@ -641,12 +689,12 @@ static UIView *SLMakeHeader(NSString *text, CGFloat x, CGFloat width) {
 }
 
 - (void)sl_ratioReset:(UITapGestureRecognizer *)g {
-    BOOL speed = (g.view.tag == 99201);
+    SLRatioKind kind = (SLRatioKind)(g.view.tag - 99201);
     AWECATTSManager *mgr = [AWECATTSManager shared];
-    if (speed) mgr.speedRatio = 1.0f; else mgr.volumeRatio = 1.0f;
+    SLRatioSet(kind, 1.0f);
     [mgr saveConfig];
     [self.tableView reloadData];
-    [AWECAUtils showToast:(speed ? @"语速已回到 1.00x" : @"音量已回到 1.00x") duration:1.4];
+    [AWECAUtils showToast:[NSString stringWithFormat:@"%@已回到 1.00x", SLRatioTitle(kind)] duration:1.4];
 }
 
 - (void)sl_powerChanged:(UISwitch *)sw {

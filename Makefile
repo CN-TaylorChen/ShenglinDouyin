@@ -31,7 +31,7 @@ ShenglinDouyin_FILES = Tweak/Tweak.x \
 	Tweak/AWECATTSVoiceListController.m \
 	Tweak/AWECAAPISettingsController.m \
 	Tweak/AWECAAudioReplacer.m \
-	Tweak/AWECAAudioPickerController.m \
+	Tweak/SLLocalAudioController.m \
 	Tweak/AWECARecordEnhance.m \
 	Tweak/AWECACommentHeaderButton.m \
 	Tweak/AWECADownloadManager.m \

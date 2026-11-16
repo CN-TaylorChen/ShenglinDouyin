@@ -39,14 +39,28 @@ void SLFloatSetStateQuiet(SLFloatState state);
 // 取消块由调用方提供；约定「取消后把口令写回输入框、球回落灰、不发送」。
 void SLFloatTTSBegin(NSTimeInterval limitSec, void (^cancelBlock)(void));
 
+// 同上，但主行文字自己给（「识别中」/「合成中」）。抖音的链路是识别 → 合成两段，
+// 两段共用同一条胶囊，靠 SLFloatTTSPhase 换字，不重开计时。
+void SLFloatTTSBeginWithTitle(NSString *title, NSTimeInterval limitSec, void (^cancelBlock)(void));
+void SLFloatTTSPhase(NSString *title);
+
 // success=YES：0.2s 收起回绿球，不弹任何提示。
 // success=NO ：胶囊原地转红，主行 failText、副行「口令已放回输入框」，停 2.2s 收球；
 //              期间点胶囊会执行 retryBlock（重来一次合成），用户不用重打口令。
 void SLFloatTTSEnd(BOOL success, NSString *failText, void (^retryBlock)(void));
 
+// success=YES 且给了 auditionPath（刚写回的那条音频）时，胶囊不停留成一句话就走，
+// 而是转成「已替换 · 点这里试听」并停 4 秒：点胶囊播一遍，点右端「重来」重新合成。
+// 抖音评论语音是松手即上传，用户没有发之前听一次的机会，这是唯一的回听入口。
+void SLFloatTTSEndWithAudition(BOOL success, NSString *failText, NSString *auditionPath, void (^retryBlock)(void));
+
 // v0.4.34：设置 / 语音包都装在浮窗里，内部是子控制器，
 // 点「完成」要先向上找到真正的呈现者，否则 dismiss 自己什么也不会发生。
 void SLCloseHostingPanel(UIViewController *vc);
+
+// 顶栏波形按钮的入口：直接开唯一的那套设置页。
+// 实现在 SLEntry.m（SLFloatPanelController 是私有类，外面拿不到）。
+void SLPresentSettings(UIViewController *host);
 
 // v0.4.41：清掉当前装填的那一发（语音包 / #tts 合成音都算）。
 // 语音包和「#tts 即时合成」共用同一个槽位，后写覆盖先写 —— 选包时调它把合成音赶走，

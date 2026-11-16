@@ -20,6 +20,11 @@
                        completion:(void(^)(BOOL success))completion;
 
 - (void)clearReplacement;
+
+// 用掉这一发：清空槽位但**不弹提示**、不打扰用户。
+// clearReplacement 会 toast「已关闭语音替换」，那是给用户手动关开关用的，
+// 装填后成功替换完再弹这句等于每发都报一次错。
+- (void)consumeReplacement;
 - (BOOL)replaceAudioAtPath:(NSString *)targetPath;
 - (void)saveState;
 - (void)loadState;

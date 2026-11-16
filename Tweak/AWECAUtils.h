@@ -6,7 +6,7 @@
 #define kAWECATweakID @"com.taylorchen.shenglindouyin"
 
 #define kAWECAAudioDir @"ShenglinDouyin"
-#define kAWECAImportDir @"AWECommentAudio/导入音频"
+#define kAWECAImportDir @"ShenglinDouyin/导入音频"
 #define kAWECAReplacementEnabled @"AWECAReplacementEnabled"
 #define kAWECAReplacementAudioPath @"AWECAReplacementAudioPath"
 

@@ -72,7 +72,7 @@ static BOOL loadArchiveLibrary(void) {
 }
 
 + (NSString *)ttsPath {
-    return [[self documentsPath] stringByAppendingPathComponent:@"AWECommentAudio/Ai合成"];
+    return [[self documentsPath] stringByAppendingPathComponent:@"ShenglinDouyin/Ai合成"];
 }
 
 + (NSString *)ttsVolcanoPath {

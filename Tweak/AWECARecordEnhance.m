@@ -6,6 +6,9 @@
 #import "AWECAAudioReplacer.h"
 #import "AWECAUtils.h"
 #import "AWECATOSUploader.h"
+#import "SLVoicePack.h"
+#import "SLTTSAuditionPanel.h"
+#import "SLEntry.h"
 #import <UIKit/UIKit.h>
 
 // 录音文件识别标准版：submit 提交 + query 轮询（两段式异步）
@@ -212,11 +215,25 @@ static void AWECAWalkHideStatusDots(UIView *v, BOOL hide) {
     return mgr.accessToken.length > 0 || mgr.appID.length > 0;
 }
 
+- (BOOL)hasArmedLocalAudio {
+    AWECAAudioReplacer *r = [AWECAAudioReplacer shared];
+    NSString *p = r.replacementAudioPath;
+    if (!r.enabled || !p.length) return NO;
+    return [[NSFileManager defaultManager] fileExistsAtPath:p];
+}
+
+- (void)consumeArmedLocalAudio {
+    [[AWECAAudioReplacer shared] consumeReplacement];
+    [SLVoicePack setOneShotPending:NO];
+}
+
 - (BOOL)shouldRunForCommentRecording {
+    if ([self hasArmedLocalAudio]) return NO;   // 本地直替换优先于识别合成
     return self.enhanceEnabled && self.armed && [self hasVolcanoCredentials];
 }
 
 - (BOOL)shouldRunForPrivateRecording {
+    if ([self hasArmedLocalAudio]) return NO;   // 同上：装了本地音频就不合成
     BOOL ok = self.privateEnhanceEnabled && self.privateArmed && self.privateRecordPath.length && [self hasVolcanoCredentials];
     NSLog(@"AWECA-IM: shouldRun enabled=%d armed=%d pathLen=%lu cred=%d -> %d",
           self.privateEnhanceEnabled, self.privateArmed,
@@ -243,6 +260,9 @@ static void AWECAWalkHideStatusDots(UIView *v, BOOL hide) {
 
 - (BOOL)shouldSkipStickyReplaceForPath:(NSString *)path {
     if (self.busy) return YES;
+    // 装了本地音频就必须放行直替换：下面那条「enhanceEnabled && armed」是给
+    // 「正在合成，别再拿原声覆盖」用的，会把语音包拦在门外
+    if ([self hasArmedLocalAudio]) return NO;
     if (self.enhanceEnabled && self.armed) return YES;
     if (path.length && [self.lastEnhancedPath isEqualToString:path]) return YES;
     if (path.length && [self.lastFailedPath isEqualToString:path]) return YES;
@@ -414,6 +434,16 @@ static void AWECAWalkHideStatusDots(UIView *v, BOOL hide) {
         }
     }
     [self flushWaitersOk:ok path:path message:msg];
+
+    // 结论落在胶囊上：成功 0.2s 收成绿球；成功且开了「合成后先试听」则停在
+    // 「已替换 · 点这里试听」，点一下播、点右端重来。失败原地转红并给一次重试。
+    __weak typeof(self) weakRetry = self;
+    NSString *retryPath = path;
+    void (^retryBlock)(void) = ^{
+        if (retryPath.length) [weakRetry startPipelineAtPath:retryPath];
+    };
+    BOOL audition = (ok && path.length && [SLTTSAuditionPanel isEnabled]);
+    SLFloatTTSEndWithAudition(ok, msg, audition ? path : nil, retryBlock);
 }
 
 - (void)startPipelineAtPath:(NSString *)path {
@@ -425,7 +455,13 @@ static void AWECAWalkHideStatusDots(UIView *v, BOOL hide) {
     self.lastFailedStamp = nil;
     NSUInteger epoch = ++self.pipelineEpoch;
 
-    [AWECAUtils showToast:@"识别合成中..." duration:2.0];
+    // 进度不再弹 toast：全部长在悬浮胶囊里（识别中 → 合成中 → 绿球/红球）。
+    // toast 是全局黑框，和球的颜色各说各话，用户得先看两处才知道在干嘛。
+    __weak typeof(self) weakSelfCancel = self;
+    SLFloatTTSBeginWithTitle(@"识别中", kEnhanceTimeout, ^{
+        [weakSelfCancel invalidatePipeline:@"已取消"];
+        SLFloatTTSEnd(NO, @"已取消，原声保留", nil);
+    });
 
     __weak typeof(self) weakSelf = self;
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(kEnhanceTimeout * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
@@ -439,7 +475,7 @@ static void AWECAWalkHideStatusDots(UIView *v, BOOL hide) {
             [weakSelf finishPipelineOk:NO path:path message:error.length ? error : @"识别失败，已保留原声"];
             return;
         }
-        [AWECAUtils showToast:@"正在合成..." duration:2.0];
+        SLFloatTTSPhase(@"合成中");
         [[AWECATTSManager shared] synthesizeVolcanoPreviewText:text completion:^(BOOL success, NSString *audioPath, NSString *ttsError) {
             if (weakSelf.finishedOnce || weakSelf.pipelineEpoch != epoch) return;
             if (!success || !audioPath.length) {
@@ -524,7 +560,7 @@ static void AWECAWalkHideStatusDots(UIView *v, BOOL hide) {
     if (!ext.length) ext = @"wav";
     NSString *objectKey = [NSString stringWithFormat:@"aweca-asr/%@.%@", [[NSUUID UUID] UUIDString], ext];
 
-    [AWECAUtils showToast:@"上传识别中..." duration:2.0];
+    // 上传阶段的提示也归胶囊管（仍是「识别中」），这里不再弹 toast
     [AWECATOSUploader uploadFileAtPath:path objectKey:objectKey completion:^(NSString *url, NSError *error) {
         if (!url.length) {
             NSString *msg = error.localizedDescription ?: @"上传失败";

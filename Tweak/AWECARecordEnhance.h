@@ -61,6 +61,12 @@
 + (BOOL)isPluginOwnedPath:(NSString *)path;
 
 - (BOOL)shouldRunForCommentRecording;
+// 替换槽里是否已经装了一发本地音频（语音包 / 本地文件 / 文字合成）。
+// 装了就走「直接换文件」，绝不再跑 ASR+TTS —— 否则用户选的语音包会被合成结果覆盖，
+// 而且白花一次识别和合成的额度。
+- (BOOL)hasArmedLocalAudio;
+// 这一发用掉了：清空槽位，不弹提示
+- (void)consumeArmedLocalAudio;
 // 私聊录音是否走增强（开关 + armed + 凭证齐备）
 - (BOOL)shouldRunForPrivateRecording;
 // 在发送时机同步等待流水线（私聊场景专用：发送前完成替换）

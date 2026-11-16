@@ -8,7 +8,7 @@
 #import "AWECACommentHeaderButton.h"
 #import "AWECARecordEnhance.h"
 #import "AWECATTSManager.h"
-#import "AWECAAudioPickerController.h"
+#import "SLLocalAudioController.h"
 #import "SLEntry.h"
 #import "SLLog.h"
 #import "SLVoicePack.h"
@@ -80,12 +80,84 @@ BOOL SLTTSPageArm(NSString *audioPath, double duration, NSData *pcm16k, NSString
     return YES;
 }
 
-void SLClearArmedAudio(void) {
-    AWECAAudioReplacer *replacer = [AWECAAudioReplacer shared];
+void SLClearArmedAudio(void) {    AWECAAudioReplacer *replacer = [AWECAAudioReplacer shared];
     [replacer clearReplacement];
     [replacer saveState];
     [[SLVoicePack class] setOneShotPending:NO];
     SLLog(@"armed audio cleared by UI");
+}
+
+#pragma mark - 合成口令（「#tts 你好」）
+
+// 陌陌版是在「发文本」那一层拦口令，抖音的文字评论发送方法名属于未公开类，
+// 硬猜类名写 %hook 会编译通过但永远不触发。所以改成在**录音开始**那一刻读输入框：
+// 用户先打「#tts 你好」再点麦克风，说话的这几秒里把音频合成好、装填进替换槽，
+// 松手时就命中「本地直替换」分支 —— 走的是已经验证过的链路，不依赖任何未知类名。
+
+NSString *SLCommandToken(void) {
+    NSString *v = [[NSUserDefaults standardUserDefaults] stringForKey:@"SLCommand"];
+    return v.length ? v : @"#tts";
+}
+
+static UIView *SLFindTextInput(UIView *root, BOOL needText) {
+    BOOL isInput = [root isKindOfClass:[UITextView class]] || [root isKindOfClass:[UITextField class]];
+    if (isInput && !root.isHidden && root.alpha > 0.01) {
+        if (root.isFirstResponder) return root;
+    }
+    for (UIView *v in root.subviews) {
+        UIView *r = SLFindTextInput(v, needText);
+        if (r) return r;
+    }
+    if (needText && isInput && !root.isHidden) {
+        NSString *t = [root isKindOfClass:[UITextView class]] ? ((UITextView *)root).text
+                                                             : ((UITextField *)root).text;
+        if (t.length) return root;
+    }
+    return nil;
+}
+
+// first responder 优先；点麦克风时键盘常常已经收起，退化成「窗口里第一个有文字的输入框」
+static NSString *SLCurrentInputText(void) {
+    UIWindow *key = nil;
+    for (UIWindow *w in [UIApplication sharedApplication].windows) {
+        if (w.isKeyWindow) { key = w; break; }
+    }
+    if (!key) return nil;
+
+    UIView *v = SLFindTextInput(key, NO);
+    if (!v) v = SLFindTextInput(key, YES);
+    if (!v) return nil;
+    if ([v isKindOfClass:[UITextView class]]) return ((UITextView *)v).text;
+    if ([v isKindOfClass:[UITextField class]]) return ((UITextField *)v).text;
+    return nil;
+}
+
+void SLPrepareCommandAudio(void) {
+    NSString *cmd = SLCommandToken();
+    NSString *raw = SLCurrentInputText();
+    if (!raw.length) return;
+
+    NSCharacterSet *ws = [NSCharacterSet whitespaceAndNewlineCharacterSet];
+    NSString *trimmed = [raw stringByTrimmingCharactersInSet:ws];
+    if (![trimmed hasPrefix:cmd]) return;
+
+    NSString *body = [[trimmed substringFromIndex:cmd.length] stringByTrimmingCharactersInSet:ws];
+    if (!body.length) {
+        [AWECAUtils showToast:[NSString stringWithFormat:@"用法：%@ 要转成语音的话", cmd] duration:2.2];
+        return;
+    }
+
+    SLLog(@"COMMAND hit len=%lu", (unsigned long)body.length);
+    SLFloatPush(SLFloatStateSynthesizing);
+    [[AWECATTSManager shared] synthesizeText:body completion:^(BOOL ok, NSString *path, NSString *err) {
+        if (!ok || !path.length) {
+            [AWECAUtils showToast:(err.length ? err : @"口令合成失败") duration:2.2];
+            SLFloatPush(SLFloatStateIdle);
+            return;
+        }
+        SLTTSPageArm(path, 0, nil, body);
+        [AWECAUtils showToast:@"口令已合成，这条语音会换成它" duration:1.8];
+    }];
 }
 
 // 语音包预热：陌陌那边要把包解成 PCM 喂 bus，抖音是文件替换，只需确认包可用，
@@ -122,6 +194,7 @@ NSString *SLHookStatusSummary(void) {
     if (!error) {
         [[AWECARecordEnhance shared] markCommentTakeStarted];
         SLFloatPush(SLFloatStateRecording);   // 球转红，用户一眼知道正在录
+        SLPrepareCommandAudio();              // 输入框里带 #tts 就先合成好，松手直接换
     }
 }
 
@@ -139,7 +212,24 @@ NSString *SLHookStatusSummary(void) {
     // 因此无论取消的完成回调迟到多久都能识别；且取消的 DidFinishRecording 必先于用户下一次录音操作，
     // 不存在"误挡正常录音"的窗口（早期用 0.5s 时间窗，主线程忙时必漏）
     BOOL cancelResidue = enhance.cancelledTake;
-    if (success && enhance.enhanceEnabled && enhance.armed && ![enhance shouldRunForCommentRecording]) {
+
+    // ① 语音包 / 本地音频 / 文字合成已经装填：直接换文件。
+    // 必须排在最前面 —— 之前装了语音包，录音结束照样被 ASR+TTS 的合成结果覆盖，
+    // 用户看到的就是「选了包却还是 AI 音色」，而且白花一次识别和合成额度。
+    if (success && !cancelResidue && path.length && [enhance hasArmedLocalAudio]) {
+        %orig;
+        NSString *target = self.audioFilePath.length ? self.audioFilePath : self.recorder.url.path;
+        if (!target.length) target = path;
+        if (![[NSFileManager defaultManager] fileExistsAtPath:target]) target = path;
+        BOOL done = target.length ? [[AWECAAudioReplacer shared] replaceAudioAtPath:target] : NO;
+        SLFloatPushResult(done);
+        [enhance consumeArmedLocalAudio];   // 一发即用，别让下一条普通录音又被换掉
+        if (!done) [AWECAUtils showToast:@"替换失败，保留原声"];
+        return;
+    }
+
+    if (success && enhance.enhanceEnabled && enhance.armed
+        && ![enhance hasArmedLocalAudio] && ![enhance shouldRunForCommentRecording]) {
         [AWECAUtils showToast:@"请先填写火山 API Key"];
         %orig;
         return;

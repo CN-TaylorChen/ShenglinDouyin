@@ -3,6 +3,7 @@
 #import "SLVoicePackController.h"
 #import "SLVoicePack.h"
 #import "AWECAUtils.h"
+#import "AWECATTSManager.h"
 #import "SLLog.h"
 #import "SLGlass.h"
 #import <PhotosUI/PhotosUI.h>
@@ -324,8 +325,13 @@ static UIImage *SLTransparentImage(void) {
 - (void)sl_updateMirrorDuringDrag;
 - (void)sl_settlePillToEdge;
 /// v0.4.82：合成状态直接长在胶囊里（取代 v0.4.81 的独立进度卡片）
-- (void)sl_ttsBegin:(NSTimeInterval)limit cancel:(void (^)(void))cancelBlock;
-- (void)sl_ttsEnd:(BOOL)success failText:(NSString *)failText retry:(void (^)(void))retryBlock;
+- (void)sl_ttsBegin:(NSString *)title limit:(NSTimeInterval)limit cancel:(void (^)(void))cancelBlock;
+- (void)sl_ttsPhase:(NSString *)title;
+/// v0.5.x：替换完成后的「已替换 · 试听」态。点了播音频，右端按钮是「重来」。
+- (void)sl_ttsEnd:(BOOL)success failText:(NSString *)failText audition:(NSString *)auditionPath retry:(void (^)(void))retryBlock;
+- (void)sl_ttsTapAreaTapped;
+- (void)sl_ttsAuditionPlay;
+- (void)sl_ttsAuditionReset;
 /// v0.4.85：合成还没出结论。SLFloatSetState 拿它当闸门，合成中不接受「回灰」。
 - (BOOL)sl_ttsBusy;
 - (void)sl_ttsReveal;
@@ -580,7 +586,10 @@ static UIImage *SLTransparentImage(void) {
     NSTimer *_ttsTimer;
     CFTimeInterval _ttsStart;
     NSTimeInterval _ttsLimit;
-    NSInteger _ttsPhase;         // 0 = 关闭 / 1 = 合成中 / 2 = 失败提示中
+    NSInteger _ttsPhase;         // 0 = 关闭 / 1 = 合成中 / 2 = 失败提示中 / 3 = 已替换（可试听）
+    // v0.5.x：替换完成后停在胶囊上的那一发音频，点胶囊即播。
+    // 抖音评论语音是「松手就上传」，用户根本听不到换成了什么，这个入口是唯一的回听机会。
+    NSString *_ttsAuditionPath;
     // v0.4.85：胶囊是否已经铺开。合成开始后的前 3 秒不铺 —— 火山 1.2 秒就完了，
     // 立刻铺开等于「刚展开就收起」，那一下蓝球根本看不见，球形状态白设计。
     BOOL _ttsShown;
@@ -832,7 +841,7 @@ static UIImage *SLTransparentImage(void) {
         _ttsTapArea = [[UIControl alloc] initWithFrame:CGRectZero];
         _ttsTapArea.backgroundColor = [UIColor clearColor];
         _ttsTapArea.hidden = YES;
-        [_ttsTapArea addTarget:self action:@selector(sl_ttsRetryTapped) forControlEvents:UIControlEventTouchUpInside];
+        [_ttsTapArea addTarget:self action:@selector(sl_ttsTapAreaTapped) forControlEvents:UIControlEventTouchUpInside];
         [self addSubview:_ttsTapArea];
 
         [self addTarget:self action:@selector(sl_tap) forControlEvents:UIControlEventTouchUpInside];
@@ -1670,7 +1679,7 @@ static UIImage *SLTransparentImage(void) {
 // 定 3.0：快的全程只有球，慢的才等到胶囊。
 static const NSTimeInterval kSLTTSRevealDelay = 3.0;
 
-- (void)sl_ttsBegin:(NSTimeInterval)limit cancel:(void (^)(void))cancelBlock {
+- (void)sl_ttsBegin:(NSString *)title limit:(NSTimeInterval)limit cancel:(void (^)(void))cancelBlock {
     // v0.4.88：正在开着胶囊时（从失败态点「重试」）不能再走 `_ttsShown = NO` 那条路。
     // 那一刻 sl_pillSize 会按 phase 回到 146，形变 + 再展开 = 胶囊先缩一下又长回来，
     // 宽度其实一直是 196，肉眼看到的却是闪。直接沿用「已铺开」状态，一次形变都不做。
@@ -1682,8 +1691,9 @@ static const NSTimeInterval kSLTTSRevealDelay = 3.0;
     _ttsStart = CACurrentMediaTime();
     _ttsCancelBlock = [cancelBlock copy];
     _ttsRetryBlock = nil;
+    _ttsAuditionPath = nil;   // 新一发开始，上一发的试听文件立刻作废
 
-    _ttsTitle.text = @"合成中";
+    _ttsTitle.text = title.length ? title : @"合成中";
     _ttsTitle.textColor = [UIColor labelColor];
     _ttsSub.textColor = [UIColor secondaryLabelColor];
     _ttsSub.text = [self sl_ttsSubTextForElapsed:0];
@@ -1730,6 +1740,16 @@ static const NSTimeInterval kSLTTSRevealDelay = 3.0;
 /// v0.4.85：合成还没出结论。SLFloatSetState 拿它当闸门，合成中不接受「回灰」。
 - (BOOL)sl_ttsBusy {
     return _ttsPhase == 1;
+}
+
+/// 阶段切换只改主行文字（识别中 → 合成中），不重开一轮胶囊：
+/// 重开会把计时清零、胶囊缩回球再展开，用户会以为任务重来了。
+- (void)sl_ttsPhase:(NSString *)title {
+    if (_ttsPhase != 1 || !title.length) return;
+    if ([_ttsTitle.text isEqualToString:title]) return;
+    _ttsTitle.text = title;
+    [self sl_resizePillForName];
+    [self setNeedsLayout];
 }
 
 /// v0.4.85：把合成态铺开成 196pt 胶囊。延迟到点、用户主动点球、或直接失败时调用。
@@ -1805,7 +1825,7 @@ static const NSTimeInterval kSLTTSRevealDelay = 3.0;
     _ttsFill.frame = CGRectMake(0, 0, tw * p, 2.0);
 }
 
-- (void)sl_ttsEnd:(BOOL)success failText:(NSString *)failText retry:(void (^)(void))retryBlock {
+- (void)sl_ttsEnd:(BOOL)success failText:(NSString *)failText audition:(NSString *)auditionPath retry:(void (^)(void))retryBlock {
     [_ttsTimer invalidate];
     _ttsTimer = nil;
 
@@ -1848,6 +1868,37 @@ static const NSTimeInterval kSLTTSRevealDelay = 3.0;
         [self performSelector:@selector(sl_ttsAutoCollapse) withObject:nil afterDelay:2.6];
         return;
     }
+
+    // 成功且手里有可播的文件 → 停在「已替换」态 4 秒：
+    // 点胶囊播一遍，点右端「重来」再合成一次。抖音评论语音松手即上传，
+    // 用户没有「发之前听一下」的机会，这里是唯一的回听入口。
+    if (success && auditionPath.length &&
+        [[NSFileManager defaultManager] fileExistsAtPath:auditionPath]) {
+        _ttsPhase = 3;
+        _ttsAuditionPath = [auditionPath copy];
+        _ttsRetryBlock = [retryBlock copy];
+        _ttsShown = YES;
+        [self sl_ttsHideContent];
+        _ttsTitle.hidden = NO;
+        _ttsTitle.text = @"已替换";
+        _ttsTitle.textColor = [UIColor labelColor];
+        _ttsSub.hidden = NO;
+        _ttsSub.text = @"点这里试听";
+        _ttsSub.textColor = [UIColor secondaryLabelColor];
+        _ttsTrack.hidden = NO;
+        _ttsFill.backgroundColor = [UIColor systemGreenColor];
+        [_ttsCancel setTitle:@"重来" forState:UIControlStateNormal];
+        _ttsCancel.hidden = NO;
+        _ttsStroke.hidden = YES;
+        _ttsTapArea.hidden = NO;      // 整条胶囊可点 = 试听
+        if (!self.slExpanded) [self sl_expand:YES animated:YES];
+        [self setNeedsLayout];
+
+        [NSObject cancelPreviousPerformRequestsWithTarget:self selector:@selector(sl_ttsAutoCollapse) object:nil];
+        [self performSelector:@selector(sl_ttsAutoCollapse) withObject:nil afterDelay:4.0];
+        return;
+    }
+
     [self sl_ttsAutoCollapse];
 }
 
@@ -1862,6 +1913,8 @@ static const NSTimeInterval kSLTTSRevealDelay = 3.0;
     // 叠成一团（用户第二张截图里三个词组同时可见）。挪到 sl_ttsCollapseShape，和收缩同帧清。
     _ttsCancelBlock = nil;
     _ttsRetryBlock = nil;
+    _ttsAuditionPath = nil;
+    [NSObject cancelPreviousPerformRequestsWithTarget:self selector:@selector(sl_ttsAuditionReset) object:nil];
     // v0.4.89：先让内容跟着一起收（0.08s 淡出），再走 0.18s 的收缩形变。
     // 原来内容是一帧消失、胶囊一帧缩回，两件事同时硬切。现在至少有个「收」的过程。
     for (UIView *v in @[_ttsTitle, _ttsSub, _ttsTrack, _ttsCancel]) {
@@ -1900,6 +1953,39 @@ static const NSTimeInterval kSLTTSRevealDelay = 3.0;
 - (void)sl_ttsBtnTapped {
     if (_ttsPhase == 1) [self sl_ttsCancelTapped];
     else if (_ttsPhase == 2) [self sl_ttsRetryTapped];
+    else if (_ttsPhase == 3) [self sl_ttsRetryTapped];   // 「重来」和失败态的重试同一条路
+}
+
+/// 整条胶囊的点击：合成失败时=重试，替换完成后=试听。
+- (void)sl_ttsTapAreaTapped {
+    if (_ttsPhase == 3) { [self sl_ttsAuditionPlay]; return; }
+    [self sl_ttsRetryTapped];
+}
+
+- (void)sl_ttsAuditionPlay {
+    if (!_ttsAuditionPath.length) return;
+    if (![[NSFileManager defaultManager] fileExistsAtPath:_ttsAuditionPath]) {
+        _ttsSub.text = @"文件已不在";
+        return;
+    }
+    [[AWECATTSManager shared] playAudioAtPath:_ttsAuditionPath];
+    _ttsSub.text = @"播放中…";
+
+    NSTimeInterval dur = [AWECAUtils audioDurationAtPath:_ttsAuditionPath];
+    if (dur < 0.4) dur = 1.2;   // 时长读不出来时给个兜底，别让「播放中」一直挂着
+
+    [NSObject cancelPreviousPerformRequestsWithTarget:self selector:@selector(sl_ttsAuditionReset) object:nil];
+    [self performSelector:@selector(sl_ttsAuditionReset) withObject:nil afterDelay:dur + 0.15];
+
+    // 播放期间别被 4 秒的自动收起打断
+    [NSObject cancelPreviousPerformRequestsWithTarget:self selector:@selector(sl_ttsAutoCollapse) object:nil];
+    [self performSelector:@selector(sl_ttsAutoCollapse) withObject:nil afterDelay:dur + 2.0];
+}
+
+- (void)sl_ttsAuditionReset {
+    if (_ttsPhase != 3) return;
+    _ttsSub.text = @"点这里试听";
+    [self setNeedsLayout];
 }
 
 - (void)sl_ttsCancelTapped {
@@ -1911,7 +1997,7 @@ static const NSTimeInterval kSLTTSRevealDelay = 3.0;
 }
 
 - (void)sl_ttsRetryTapped {
-    if (_ttsPhase != 2) return;
+    if (_ttsPhase != 2 && _ttsPhase != 3) return;
     void (^rb)(void) = _ttsRetryBlock;
     _ttsRetryBlock = nil;
     // 不先收球：原地退回「合成中」再由 sl_ttsBegin 重铺。收球再展开会缩一下又长回来，
@@ -3080,6 +3166,12 @@ void SLCloseHostingPanel(UIViewController *vc) {
     sSLFloatPanel = nil;
 }
 
+void SLPresentSettings(UIViewController *host) {
+    if (!host) return;
+    if ([SLFloatPanelController isSettingsOpen]) return;   // 已开着就不叠第二层
+    [SLFloatPanelController presentSettingsFrom:host];
+}
+
 // 键盘 / 状态栏 / 文本特效这些私有窗口不能挂球：挂上去要么看不见，要么跟着窗口一起消失
 static BOOL SLIsSystemOverlayWindow(UIWindow *w) {
     NSString *cn = NSStringFromClass([w class]);
@@ -3195,7 +3287,7 @@ void SLRefreshFloatButton(void) {
 
 #pragma mark - v0.4.82：合成态桥接（进度条直接长在胶囊里）
 
-void SLFloatTTSBegin(NSTimeInterval limitSec, void (^cancelBlock)(void)) {
+void SLFloatTTSBeginWithTitle(NSString *title, NSTimeInterval limitSec, void (^cancelBlock)(void)) {
     // v0.4.87：已在主线程就直接执行 —— 见 SLFloatTTSEnd 里的说明，异步排队会让
     // 调用方紧跟着写的那句同步状态设置抢在前面。
     void (^work)(void) = ^{
@@ -3205,7 +3297,7 @@ void SLFloatTTSBegin(NSTimeInterval limitSec, void (^cancelBlock)(void)) {
             btn = (SLFloatButton *)[w viewWithTag:SLBtnTag];
         }
         if (!btn) return;
-        [btn sl_ttsBegin:limitSec cancel:cancelBlock];
+        [btn sl_ttsBegin:title limit:limitSec cancel:cancelBlock];
         // 胶囊可能刚从球展开，铺到顶层免得被面板压住
         [btn.superview bringSubviewToFront:btn];
     };
@@ -3213,7 +3305,26 @@ void SLFloatTTSBegin(NSTimeInterval limitSec, void (^cancelBlock)(void)) {
     else dispatch_async(dispatch_get_main_queue(), work);
 }
 
-void SLFloatTTSEnd(BOOL success, NSString *failText, void (^retryBlock)(void)) {
+void SLFloatTTSBegin(NSTimeInterval limitSec, void (^cancelBlock)(void)) {
+    SLFloatTTSBeginWithTitle(nil, limitSec, cancelBlock);
+}
+
+void SLFloatTTSPhase(NSString *title) {
+    if (!title.length) return;
+    void (^work)(void) = ^{
+        SLFloatButton *btn = sSLFloatBtn;
+        if (!btn) {
+            UIWindow *w = SLKeyWindow();
+            btn = (SLFloatButton *)[w viewWithTag:SLBtnTag];
+        }
+        if (!btn) return;
+        [btn sl_ttsPhase:title];
+    };
+    if ([NSThread isMainThread]) work();
+    else dispatch_async(dispatch_get_main_queue(), work);
+}
+
+void SLFloatTTSEndWithAudition(BOOL success, NSString *failText, NSString *auditionPath, void (^retryBlock)(void)) {
     // v0.4.87：同样改成「主线程就直接跑」。
     // 原来无条件 dispatch_async，而 Tweak.x 里「先 SLFloatTTSEnd 再 SLFloatSetState(Idle)」
     // 是同步连着写的 —— Idle 抢在 TTSEnd 前面执行，那一刻相位还是 1，被闸门拦掉，
@@ -3226,10 +3337,14 @@ void SLFloatTTSEnd(BOOL success, NSString *failText, void (^retryBlock)(void)) {
             btn = (SLFloatButton *)[w viewWithTag:SLBtnTag];
         }
         if (!btn) return;
-        [btn sl_ttsEnd:success failText:failText retry:retryBlock];
+        [btn sl_ttsEnd:success failText:failText audition:auditionPath retry:retryBlock];
     };
     if ([NSThread isMainThread]) work();
     else dispatch_async(dispatch_get_main_queue(), work);
+}
+
+void SLFloatTTSEnd(BOOL success, NSString *failText, void (^retryBlock)(void)) {
+    SLFloatTTSEndWithAudition(success, failText, nil, retryBlock);
 }
 
 // 把中心点夹在「不会被屏幕边缘切掉」的范围内。

@@ -2,7 +2,7 @@
 // CN-TaylorChen | github.com/CN-TaylorChen
 
 #import "AWECACommentHeaderButton.h"
-#import "AWECAAudioPickerController.h"
+#import "SLEntry.h"
 #import <UIKit/UIKit.h>
 #import <objc/runtime.h>
 #import <objc/message.h>
@@ -177,23 +177,10 @@ static UIViewController *AWECAVCFromView(UIView *view) {
 }
 
 - (void)aweca_tapped {
+    // 短按只开设置页（唯一那套），不做长按录音 —— 录音还是走抖音自己的麦克风。
     UIViewController *hostVC = AWECAVCFromView(self);
     if (!hostVC) return;
-    AWECAAudioPickerController *picker = [[AWECAAudioPickerController alloc] init];
-    picker.embeddedInCommentTab = YES;
-    UINavigationController *nav = [[UINavigationController alloc] initWithRootViewController:picker];
-    nav.modalPresentationStyle = UIModalPresentationPageSheet;
-    if (@available(iOS 15.0, *)) {
-        UISheetPresentationController *sheet = nav.sheetPresentationController;
-        if (sheet) {
-            sheet.detents = @[
-                UISheetPresentationControllerDetent.mediumDetent,
-                UISheetPresentationControllerDetent.largeDetent
-            ];
-            sheet.prefersGrabberVisible = YES;
-        }
-    }
-    [hostVC presentViewController:nav animated:YES completion:nil];
+    SLPresentSettings(hostVC);
 }
 
 @end

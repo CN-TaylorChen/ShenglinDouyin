@@ -121,6 +121,13 @@
     [AWECAUtils showToast:@"已关闭语音替换"];
 }
 
+- (void)consumeReplacement {
+    self.enabled = NO;
+    self.replacementAudioPath = nil;
+    self.ttsAudioPath = nil;
+    [self saveState];
+}
+
 #pragma mark - 执行替换
 
 - (BOOL)replaceAudioAtPath:(NSString *)targetPath {
