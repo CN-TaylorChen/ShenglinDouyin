@@ -21,7 +21,6 @@
 #import "SLVoicePackController.h"
 #import "SLAlignBox.h"
 #import "SLGlass.h"
-#import "SLLocalAudioController.h"
 #import "AWECAAudioReplacer.h"
 #import "AWECADownloadManager.h"
 #import "SLTTSComposeController.h"
@@ -66,10 +65,6 @@ static UIImage *SLThinSliderThumb(void) {
 @end
 
 #define kSLEnabledKey @"SLEnhanceEnabled"
-#define kSLCommandKey @"SLCommand"
-#define kSLFillShortKey @"SLFillShort"
-// v0.4.85：合成失败 / 取消时把口令写回输入框（跟 Tweak.x 里的 kSLKeepTextKey 同一个键）
-#define kSLKeepTextKey @"SLKeepTextOnFail"
 #define SLVersion @"1.0.0"
 
 // v0.4.52：单元格玻璃色搬到 SLGlass（全站二级页共用同一个数），这里不再重复定义。
@@ -217,11 +212,6 @@ static UIView *SLMakeHeader(NSString *text, CGFloat x, CGFloat width) {
     // v0.4.52.2：删掉顶部说明（tableHeaderView），首个分组直接跟标题栏
 }
 
-- (NSString *)sl_command {
-    NSString *v = [[NSUserDefaults standardUserDefaults] stringForKey:kSLCommandKey];
-    return v.length ? v : @"#tts";
-}
-
 - (CGFloat)sl_leadingForTableView:(UITableView *)tv {
     if (self.slLeading <= 0) self.slLeading = SLMeasureLeading(tv);
     return self.slLeading;
@@ -243,22 +233,21 @@ static UIView *SLMakeHeader(NSString *text, CGFloat x, CGFloat width) {
 
 - (NSInteger)numberOfSectionsInTableView:(UITableView *)tv {
     (void)tv;
-    // 抖音版：语音 / 本地 / 发送 / 其它。
-    return 4;
+    // 抖音版：音色与合成 / 音频来源 / 其它。口令整组与本地音频入口已删。
+    return 3;
 }
 
 - (NSInteger)tableView:(UITableView *)tv numberOfRowsInSection:(NSInteger)section {
     (void)tv;
-    if (section == 0) return 8;   // 语音：开关 + 引擎 + 音色 + 文字合成 + 情绪 + 语速 + 音量 + 音调
-    if (section == 1) return 2;   // 本地：本地音频 + 语音包
-    if (section == 2) return 3;   // 发送：合成口令 + 短录音补全 + 失败时放回输入框
-    if (section == 3) return 3;   // 其它：悬浮球图标 + API 凭证 + 运行日志
-    return 1;
+    if (section == 0) return 7;   // 音色与合成：开关 + 引擎 + 音色 + 情绪 + 语速 + 音量 + 音调
+    if (section == 1) return 2;   // 音频来源：生成语音 + 语音包
+    if (section == 2) return 3;   // 其它：悬浮球图标 + API 凭证 + 运行日志
+    return 0;
 }
 
 - (NSString *)sl_headerForSection:(NSInteger)section {
-    if (section < 0 || section > 3) return @"";
-    return @[@"语音", @"本地", @"发送", @"其它"][section];
+    if (section < 0 || section > 2) return @"";
+    return @[@"音色与合成", @"音频来源", @"其它"][section];
 }
 
 - (UIView *)tableView:(UITableView *)tv viewForHeaderInSection:(NSInteger)section {
@@ -325,7 +314,7 @@ static UIView *SLMakeHeader(NSString *text, CGFloat x, CGFloat width) {
 
     AWECATTSManager *mgr = [AWECATTSManager shared];
 
-    if (ip.section == 0) {                     // 语音
+    if (ip.section == 0) {                     // 音色与合成
         if (ip.row == 0) {
             // 抖音语境的主路径：正常点麦克风说话，发出去就是当前 AI 音色
             cell.textLabel.text = @"录音转音色";
@@ -351,20 +340,13 @@ static UIView *SLMakeHeader(NSString *text, CGFloat x, CGFloat width) {
             cell.detailTextLabel.text = voice;
             cell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
         } else if (ip.row == 3) {
-            // 不想开口时用：输入文字 → 合成 → 装填为本次替换音频
-            cell.textLabel.text = @"输入文字合成";
-            cell.textLabel.textColor = [UIColor systemBlueColor];
-            cell.detailTextLabel.text = @"合成并装填";
-            cell.detailTextLabel.textColor = [UIColor systemBlueColor];
-            cell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
-        } else if (ip.row == 4) {
             cell.textLabel.text = @"情绪";
             cell.detailTextLabel.text = mgr.fishEmotionSel.count
                 ? [NSString stringWithFormat:@"已选 %lu 个", (unsigned long)mgr.fishEmotionSel.count]
                 : @"未启用";
             cell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
-        } else if (ip.row >= 5) {
-            NSInteger kind = ip.row - 5;                 // 5 语速 · 6 音量 · 7 音调
+        } else if (ip.row >= 4) {
+            NSInteger kind = ip.row - 4;                 // 4 语速 · 5 音量 · 6 音调
             cell.textLabel.text = SLRatioTitle(kind);
             if (kind == SLRatioKindPitch && mgr.fishEngine) {
                 // FishAudio 的 prosody 只有 speed/volume，没有音高；置灰而不是给个滑不动的假滑块
@@ -379,11 +361,12 @@ static UIView *SLMakeHeader(NSString *text, CGFloat x, CGFloat width) {
         return cell;
     }
 
-    if (ip.section == 1) {                     // 本地
+    if (ip.section == 1) {                     // 音频来源
         if (ip.row == 0) {
-            cell.textLabel.text = @"本地音频";
-            NSString *now = [AWECAAudioReplacer shared].replacementAudioPath;
-            cell.detailTextLabel.text = now.length ? now.lastPathComponent : @"未装填 · 点这里选";
+            cell.textLabel.text = @"生成语音";
+            cell.textLabel.textColor = [UIColor systemBlueColor];
+            cell.detailTextLabel.text = @"输入文字 ›";
+            cell.detailTextLabel.textColor = [UIColor systemBlueColor];
             cell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
         } else {
             cell.textLabel.text = @"语音包";
@@ -400,34 +383,7 @@ static UIView *SLMakeHeader(NSString *text, CGFloat x, CGFloat width) {
         return cell;
     }
 
-    if (ip.section == 2) {                     // 发送
-        if (ip.row == 0) {
-            cell.textLabel.text = @"合成口令";
-            cell.detailTextLabel.text = [self sl_command];
-            cell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
-        } else if (ip.row == 1) {
-            // 点一条包就装好一发，发完自动回原声，不需要口令。
-            cell.textLabel.text = @"短录音补全";
-            UISwitch *sw = [[UISwitch alloc] initWithFrame:CGRectZero];
-            NSUserDefaults *d = [NSUserDefaults standardUserDefaults];
-            sw.on = [d objectForKey:kSLFillShortKey] ? [d boolForKey:kSLFillShortKey] : YES;
-            [sw addTarget:self action:@selector(sl_fillChanged:) forControlEvents:UIControlEventValueChanged];
-            cell.accessoryView = sw;
-            cell.selectionStyle = UITableViewCellSelectionStyleNone;
-        } else if (ip.row == 2) {
-            // 合成失败 / 取消时把口令写回输入框（默认开）；关掉就只复制到剪贴板。
-            cell.textLabel.text = @"失败时放回输入框";
-            UISwitch *sw = [[UISwitch alloc] initWithFrame:CGRectZero];
-            NSUserDefaults *d = [NSUserDefaults standardUserDefaults];
-            sw.on = [d objectForKey:kSLKeepTextKey] ? [d boolForKey:kSLKeepTextKey] : YES;
-            [sw addTarget:self action:@selector(sl_keepTextChanged:) forControlEvents:UIControlEventValueChanged];
-            cell.accessoryView = sw;
-            cell.selectionStyle = UITableViewCellSelectionStyleNone;
-        }
-        return cell;
-    }
-
-    if (ip.section == 3) {                     // 其它
+    if (ip.section == 2) {                     // 其它
         if (ip.row == 0) {
             cell.textLabel.text = @"悬浮球图标";
             cell.detailTextLabel.text = SLFloatIconSummary();
@@ -453,26 +409,22 @@ static UIView *SLMakeHeader(NSString *text, CGFloat x, CGFloat width) {
 - (void)tableView:(UITableView *)tv didSelectRowAtIndexPath:(NSIndexPath *)ip {
     [tv deselectRowAtIndexPath:ip animated:YES];
 
-    // 4 段结构 —— 语音 / 本地 / 发送 / 其它
-    if (ip.section == 0) {                                  // 语音
+    // 3 段结构 —— 音色与合成 / 音频来源 / 其它
+    if (ip.section == 0) {                                  // 音色与合成
         if (ip.row == 2) {                                  // 音色
             AWECATTSVoiceListController *vc = [[AWECATTSVoiceListController alloc] init];
             vc.fishMode = [AWECATTSManager shared].fishEngine;   // 跟着引擎走，否则只能看到火山音色
             [self.navigationController pushViewController:vc animated:YES];
             return;
         }
-        if (ip.row == 3) {                                  // 输入文字合成
-            [self.navigationController pushViewController:[[SLTTSComposeController alloc] init] animated:YES];
-            return;
-        }
-        if (ip.row == 4) {                                  // 情绪
+        if (ip.row == 3) {                                  // 情绪
             AWECATTSVoiceListController *vc = [[AWECATTSVoiceListController alloc] init];
             vc.emotionMode = YES;
             [self.navigationController pushViewController:vc animated:YES];
             return;
         }
-        if (ip.row >= 5) {                                       // 语速 / 音量 / 音调
-            NSInteger kind = ip.row - 5;
+        if (ip.row >= 4) {                                       // 语速 / 音量 / 音调
+            NSInteger kind = ip.row - 4;
             if (kind == SLRatioKindPitch && [AWECATTSManager shared].fishEngine) {
                 [AWECAUtils showToast:@"FishAudio 没有音调参数，切回火山引擎可用" duration:2.0];
                 return;
@@ -483,21 +435,16 @@ static UIView *SLMakeHeader(NSString *text, CGFloat x, CGFloat width) {
         return;                                                  // 0/1 是开关与分段控件
     }
 
-    if (ip.section == 1) {                                  // 本地
-        if (ip.row == 0) {                                  // 本地音频库
-            [self.navigationController pushViewController:[[SLLocalAudioController alloc] init] animated:YES];
+    if (ip.section == 1) {                                  // 音频来源
+        if (ip.row == 0) {                                  // 生成语音
+            [self.navigationController pushViewController:[[SLTTSComposeController alloc] init] animated:YES];
             return;
         }
-        [self.navigationController pushViewController:[[SLVoicePackController alloc] init] animated:YES];
+        [self.navigationController pushViewController:[[SLVoicePackController alloc] init] animated:YES];  // 语音包
         return;
     }
 
-    if (ip.section == 2) {                                  // 发送
-        if (ip.row == 0) [self sl_editCommand];             // 合成口令
-        return;                                             // 其余三行都是开关
-    }
-
-    if (ip.section == 3) {                                  // 其它
+    if (ip.section == 2) {                                  // 其它
         if (ip.row == 0) {                                  // 悬浮球图标
             [self.navigationController pushViewController:[[SLFloatIconController alloc] init] animated:YES];
             return;
@@ -524,42 +471,6 @@ static UIView *SLMakeHeader(NSString *text, CGFloat x, CGFloat width) {
 
 
 #pragma mark - Actions
-
-- (void)sl_editCommand {
-    [self sl_editCommandForKey:kSLCommandKey
-                         title:@"合成口令"
-                       message:@"先打这个前缀再打要说的话，然后点麦克风录一句，松手发出去的就是这段文字"
-                      fallback:@"#tts"];
-}
-
-- (void)sl_editCommandForKey:(NSString *)key
-                       title:(NSString *)title
-                     message:(NSString *)message
-                    fallback:(NSString *)fallback {
-    NSUserDefaults *d = [NSUserDefaults standardUserDefaults];
-    NSString *cur = [d stringForKey:key];
-    if (!cur.length) cur = fallback;
-
-    UIAlertController *ac = [UIAlertController alertControllerWithTitle:title
-                                                               message:message
-                                                        preferredStyle:UIAlertControllerStyleAlert];
-    [ac addTextFieldWithConfigurationHandler:^(UITextField *tf) {
-        tf.text = cur;
-        tf.placeholder = fallback;
-        tf.clearButtonMode = UITextFieldViewModeAlways;
-    }];
-    [ac addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
-    __weak typeof(self) weakSelf = self;
-    [ac addAction:[UIAlertAction actionWithTitle:@"保存" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
-        NSString *v = [ac.textFields.firstObject.text stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
-        if (v.length == 0) v = fallback;
-        [d setObject:v forKey:key];
-        [d synchronize];
-        [weakSelf.tableView reloadData];
-        [AWECAUtils showToast:[NSString stringWithFormat:@"%@已改为 %@", title, v] duration:1.5];
-    }]];
-    [self presentViewController:ac animated:YES completion:nil];
-}
 
 // 语速/音量：0.5~2.0 倍，1.0 = 原声。
 // 火山走 speech_rate/loudness_rate（已在 AWECATTSManager 映射），Fish 走 prosody.speed/volume
@@ -690,19 +601,6 @@ static UIView *SLMakeHeader(NSString *text, CGFloat x, CGFloat width) {
     [[NSUserDefaults standardUserDefaults] setBool:sw.on forKey:kSLEnabledKey];
     [[NSUserDefaults standardUserDefaults] synchronize];
     [AWECAUtils showToast:sw.on ? @"已启用文字转语音" : @"已关闭，只发文本" duration:1.5];
-}
-
-- (void)sl_fillChanged:(UISwitch *)sw {
-    [[NSUserDefaults standardUserDefaults] setBool:sw.on forKey:kSLFillShortKey];
-    [[NSUserDefaults standardUserDefaults] synchronize];
-    [AWECAUtils showToast:sw.on ? @"短录音会补全 AI 语音" : @"只发录到的那一段" duration:1.5];
-}
-
-// v0.4.85：关掉后合成失败只复制到剪贴板，不再动陌陌的输入框。
-- (void)sl_keepTextChanged:(UISwitch *)sw {
-    [[NSUserDefaults standardUserDefaults] setBool:sw.on forKey:kSLKeepTextKey];
-    [[NSUserDefaults standardUserDefaults] synchronize];
-    [AWECAUtils showToast:sw.on ? @"失败时把口令放回输入框" : @"失败时只复制到剪贴板" duration:1.5];
 }
 
 - (void)sl_engineChanged:(UISegmentedControl *)seg {

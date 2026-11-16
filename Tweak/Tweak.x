@@ -8,7 +8,6 @@
 #import "AWECACommentHeaderButton.h"
 #import "AWECARecordEnhance.h"
 #import "AWECATTSManager.h"
-#import "SLLocalAudioController.h"
 #import "SLEntry.h"
 #import "SLLog.h"
 #import "SLVoicePack.h"
@@ -31,9 +30,11 @@ static void SLFloatPush(SLFloatState st) {
     }
 }
 
-// 替换结果统一落定：成功 → 蓝常亮到真正发出去；失败 → 回灰，别把球挂在蓝色上
+// 替换结果落定：无论成功失败，替换都已经发生、这一发已经消费掉 → 一律回灰。
+// 绿色只在「装填待发」时亮（armPack / SLTTSPageArm），发出去后不再常驻。
 static void SLFloatPushResult(BOOL ok) {
-    SLFloatPush(ok ? SLFloatStateReady : SLFloatStateIdle);
+    (void)ok;
+    SLFloatPush(SLFloatStateIdle);
 }
 
 #pragma mark - 设置页 ↔ 替换槽（SLEntry / SLTTSComposeController 的落地桥）
@@ -85,95 +86,6 @@ void SLClearArmedAudio(void) {
     // 单点真相：清槽位这件事只有 SLVoicePack 一处实现（球色、one-shot、replacer 一起落）
     [SLVoicePack disarmArmedAudio];
     SLLog(@"armed audio cleared by UI");
-}
-
-#pragma mark - 合成口令（「#tts 你好」）
-
-// 陌陌版是在「发文本」那一层拦口令，抖音的文字评论发送方法名属于未公开类，
-// 硬猜类名写 %hook 会编译通过但永远不触发。所以改成在**录音开始**那一刻读输入框：
-// 用户先打「#tts 你好」再点麦克风，说话的这几秒里把音频合成好、装填进替换槽，
-// 松手时就命中「本地直替换」分支 —— 走的是已经验证过的链路，不依赖任何未知类名。
-
-NSString *SLCommandToken(void) {
-    NSString *v = [[NSUserDefaults standardUserDefaults] stringForKey:@"SLCommand"];
-    return v.length ? v : @"#tts";
-}
-
-static UIView *SLFindTextInput(UIView *root, BOOL needText) {
-    BOOL isInput = [root isKindOfClass:[UITextView class]] || [root isKindOfClass:[UITextField class]];
-    if (isInput && !root.isHidden && root.alpha > 0.01) {
-        if (root.isFirstResponder) return root;
-    }
-    for (UIView *v in root.subviews) {
-        UIView *r = SLFindTextInput(v, needText);
-        if (r) return r;
-    }
-    if (needText && isInput && !root.isHidden) {
-        NSString *t = [root isKindOfClass:[UITextView class]] ? ((UITextView *)root).text
-                                                             : ((UITextField *)root).text;
-        if (t.length) return root;
-    }
-    return nil;
-}
-
-// iOS 15 起 UIApplication.windows / keyWindow 都弃用，项目开 -Werror，直接引用会炸 CI。
-// 高版本走 UIWindowScene，低版本用 KVC 兜底（不碰已弃用符号）。
-static UIWindow *SLInputKeyWindow(void) {
-    UIWindow *key = nil;
-    if (@available(iOS 15.0, *)) {
-        for (UIScene *sc in [[UIApplication sharedApplication] connectedScenes]) {
-            if (![sc isKindOfClass:[UIWindowScene class]]) continue;
-            for (UIWindow *w in ((UIWindowScene *)sc).windows) {
-                if (w.isKeyWindow) { key = w; break; }
-            }
-            if (key) break;
-        }
-    }
-    if (!key) {
-        key = (UIWindow *)[[UIApplication sharedApplication] valueForKey:@"keyWindow"];
-    }
-    return key;
-}
-
-// first responder 优先；点麦克风时键盘常常已经收起，退化成「窗口里第一个有文字的输入框」
-static NSString *SLCurrentInputText(void) {
-    UIWindow *key = SLInputKeyWindow();
-    if (!key) return nil;
-
-    UIView *v = SLFindTextInput(key, NO);
-    if (!v) v = SLFindTextInput(key, YES);
-    if (!v) return nil;
-    if ([v isKindOfClass:[UITextView class]]) return ((UITextView *)v).text;
-    if ([v isKindOfClass:[UITextField class]]) return ((UITextField *)v).text;
-    return nil;
-}
-
-void SLPrepareCommandAudio(void) {
-    NSString *cmd = SLCommandToken();
-    NSString *raw = SLCurrentInputText();
-    if (!raw.length) return;
-
-    NSCharacterSet *ws = [NSCharacterSet whitespaceAndNewlineCharacterSet];
-    NSString *trimmed = [raw stringByTrimmingCharactersInSet:ws];
-    if (![trimmed hasPrefix:cmd]) return;
-
-    NSString *body = [[trimmed substringFromIndex:cmd.length] stringByTrimmingCharactersInSet:ws];
-    if (!body.length) {
-        [AWECAUtils showToast:[NSString stringWithFormat:@"用法：%@ 要转成语音的话", cmd] duration:2.2];
-        return;
-    }
-
-    SLLog(@"COMMAND hit len=%lu", (unsigned long)body.length);
-    SLFloatPush(SLFloatStateSynthesizing);
-    [[AWECATTSManager shared] synthesizeText:body completion:^(BOOL ok, NSString *path, NSString *err) {
-        if (!ok || !path.length) {
-            [AWECAUtils showToast:(err.length ? err : @"口令合成失败") duration:2.2];
-            SLFloatPush(SLFloatStateIdle);
-            return;
-        }
-        SLTTSPageArm(path, 0, nil, body);
-        [AWECAUtils showToast:@"口令已合成，这条语音会换成它" duration:1.8];
-    }];
 }
 
 // 语音包预热：陌陌那边要把包解成 PCM 喂 bus，抖音是文件替换，只需确认包可用，
@@ -236,7 +148,6 @@ NSString *SLRuntimeStateSummary(void) {
     if (!error) {
         [[AWECARecordEnhance shared] markCommentTakeStarted];
         SLFloatPush(SLFloatStateRecording);   // 球转红，用户一眼知道正在录
-        SLPrepareCommandAudio();              // 输入框里带 #tts 就先合成好，松手直接换
     }
 }
 

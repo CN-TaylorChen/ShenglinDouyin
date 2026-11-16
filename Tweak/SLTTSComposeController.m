@@ -1,6 +1,6 @@
 //
 //  SLTTSComposeController.m
-//  声临 · 抖音版 —— 设置里的「文本转语音」
+//  声临 · 抖音版 —— 设置里的「生成语音」
 //
 //  概念图三态：编辑 → 合成中 → 已装填。
 //  合成走 SLPipeline（与 #tts 口令完全同一条 pipeline），成功后由 SLTTSPageArm
@@ -196,7 +196,7 @@ static NSArray<NSNumber *> *SLComposeWaveHeights(NSData *pcm, NSInteger bars) {
 @property (nonatomic, strong) UIView *dock;
 @property (nonatomic, strong) SLComposeButton *mainBtn;
 @property (nonatomic, strong) SLComposeButton *auditionBtn;
-@property (nonatomic, strong) SLComposeButton *saveBtn;
+@property (nonatomic, strong) SLComposeButton *regenerateBtn;
 
 @property (nonatomic, copy) NSString *sourceText;
 @property (nonatomic, copy) NSString *resultPath;
@@ -218,7 +218,7 @@ static NSArray<NSNumber *> *SLComposeWaveHeights(NSData *pcm, NSInteger bars) {
 - (void)sl_ratioSettled:(UISlider *)sl;
 - (void)sl_mainTapped;
 - (void)sl_auditionTapped;
-- (void)sl_saveTapped;
+- (void)sl_regenerateTapped;
 
 @end
 
@@ -235,7 +235,7 @@ static NSArray<NSNumber *> *SLComposeWaveHeights(NSData *pcm, NSInteger bars) {
 - (void)viewDidLoad {
     [super viewDidLoad];
     self.state = SLComposeStateEditing;
-    self.navigationItem.titleView = SLPillTitleView(@"文本转语音");
+    self.navigationItem.titleView = SLPillTitleView(@"生成语音");
     SLInstallPillBack(self);
     // v0.5.49：这里原来调的是 SLInstallGlassBackdrop(self.view)。本页是 UITableViewController，
     // self.view 就是 tableView，那块毛玻璃被 insertSubview:atIndex:0 塞进了表格自己的滚动内容里，
@@ -244,6 +244,9 @@ static NSArray<NSNumber *> *SLComposeWaveHeights(NSData *pcm, NSInteger bars) {
     SLApplyGlassTable(self.tableView);
     self.tableView.separatorStyle = UITableViewCellSeparatorStyleNone;
     self.tableView.keyboardDismissMode = UIScrollViewKeyboardDismissModeOnDrag;
+    // 紧凑一屏：整页不滚动。行高与分段头都压到最小，两态内容都塞进一屏，
+    // 底部 dock 常驻可见；输入框内部仍可正常编辑、光标滚动不受影响。
+    self.tableView.scrollEnabled = NO;
 
     [self sl_buildStatePill];
     [self sl_buildDock];
@@ -321,16 +324,16 @@ static NSArray<NSNumber *> *SLComposeWaveHeights(NSData *pcm, NSInteger bars) {
     self.mainBtn = main;
 
     SLComposeButton *audition = [[SLComposeButton alloc] initWithFrame:CGRectMake(0, 0, 100, 44)];
-    audition.lab.text = @"试听一次";
+    audition.lab.text = @"试听";
     [audition addTarget:self action:@selector(sl_auditionTapped) forControlEvents:UIControlEventTouchUpInside];
     [d addSubview:audition];
     self.auditionBtn = audition;
 
-    SLComposeButton *save = [[SLComposeButton alloc] initWithFrame:CGRectMake(0, 0, 100, 44)];
-    save.lab.text = @"保存到文件";
-    [save addTarget:self action:@selector(sl_saveTapped) forControlEvents:UIControlEventTouchUpInside];
-    [d addSubview:save];
-    self.saveBtn = save;
+    SLComposeButton *regenerate = [[SLComposeButton alloc] initWithFrame:CGRectMake(0, 0, 100, 44)];
+    regenerate.lab.text = @"重新生成";
+    [regenerate addTarget:self action:@selector(sl_regenerateTapped) forControlEvents:UIControlEventTouchUpInside];
+    [d addSubview:regenerate];
+    self.regenerateBtn = regenerate;
 
     self.dock = d;
     self.tableView.tableFooterView = d;
@@ -346,15 +349,15 @@ static NSArray<NSNumber *> *SLComposeWaveHeights(NSData *pcm, NSInteger bars) {
     if (done) {
         CGFloat half = (inner - 10.0) / 2.0;
         self.auditionBtn.frame = CGRectMake(pad, 8, half, 44);
-        self.saveBtn.frame = CGRectMake(pad + half + 10.0, 8, half, 44);
+        self.regenerateBtn.frame = CGRectMake(pad + half + 10.0, 8, half, 44);
         self.mainBtn.frame = CGRectMake(pad, 62, inner, 46);
         self.auditionBtn.hidden = NO;
-        self.saveBtn.hidden = NO;
+        self.regenerateBtn.hidden = NO;
         self.mainBtn.primary = YES;
         self.mainBtn.lab.text = @"完成 · 去录音";
     } else {
         self.auditionBtn.hidden = YES;
-        self.saveBtn.hidden = YES;
+        self.regenerateBtn.hidden = YES;
         self.mainBtn.frame = CGRectMake(pad, 10, inner, 46);
         self.mainBtn.primary = YES;
         self.mainBtn.lab.text = (self.state == SLComposeStateSynthesizing) ? @"合成中…" : @"合成并装填";
@@ -408,15 +411,16 @@ static NSArray<NSNumber *> *SLComposeWaveHeights(NSData *pcm, NSInteger bars) {
 
 - (NSInteger)numberOfSectionsInTableView:(UITableView *)tv {
     (void)tv;
-    return 3;
+    // 完成态砍掉「基于这段文字」那一段（纯回显、占地方），只留结果 + 状态两节，
+    // 配合整页不滚动，保证底部按钮在小屏上也常驻可见。
+    return (self.state == SLComposeStateDone) ? 2 : 3;
 }
 
 - (NSInteger)tableView:(UITableView *)tv numberOfRowsInSection:(NSInteger)section {
     (void)tv;
     if (self.state == SLComposeStateDone) {
         if (section == 0) return 1;
-        if (section == 1) return 4;
-        return 1;
+        return 4;
     }
     if (section == 0) return 1;
     if (section == 1) return 5;
@@ -425,7 +429,7 @@ static NSArray<NSNumber *> *SLComposeWaveHeights(NSData *pcm, NSInteger bars) {
 
 - (NSString *)sl_titleForSection:(NSInteger)section {
     if (self.state == SLComposeStateDone) {
-        return @[@"合成结果", @"装填状态", @"基于这段文字"][section];
+        return @[@"合成结果", @"装填状态"][section];
     }
     return @[@"输入文字", @"引擎与音色", @""][section];
 }
@@ -447,23 +451,24 @@ static NSArray<NSNumber *> *SLComposeWaveHeights(NSData *pcm, NSInteger bars) {
 - (CGFloat)tableView:(UITableView *)tv heightForHeaderInSection:(NSInteger)section {
     (void)tv;
     NSString *t = [self sl_titleForSection:section];
-    return t.length ? 28.0 : 0.01;
+    return t.length ? 22.0 : 0.01;   // 紧凑：28→22
 }
 
 - (CGFloat)tableView:(UITableView *)tv heightForRowAtIndexPath:(NSIndexPath *)ip {
     (void)tv;
     if (self.state == SLComposeStateDone) {
-        if (ip.section == 0) return 116.0;
-        if (ip.section == 1) return 44.0;
+        if (ip.section == 0) return 96.0;    // 结果波形 116→96
+        if (ip.section == 1) return 36.0;    // 状态行 44→36
+        // 来源文字：整页不滚动，这里封顶 4 行，避免长文本把底部按钮顶出屏幕
         NSString *s = self.sourceText ?: @"";
         CGRect r = [s boundingRectWithSize:CGSizeMake(SLComposeContentW(tv) - 60, CGFLOAT_MAX)
                                    options:NSStringDrawingUsesLineFragmentOrigin
                                 attributes:@{NSFontAttributeName: [UIFont systemFontOfSize:14]}
                                    context:nil];
-        return MAX(56.0, ceil(CGRectGetHeight(r)) + 24.0);
+        return MIN(88.0, MAX(44.0, ceil(CGRectGetHeight(r)) + 20.0));
     }
-    if (ip.section == 0) return 132.0;
-    return (ip.row >= 3) ? 50.0 : 44.0;
+    if (ip.section == 0) return 108.0;       // 输入框 132→108
+    return (ip.row >= 3) ? 44.0 : 38.0;      // 参数行 44/50→38/44
 }
 
 - (NSString *)sl_currentVoiceName {
@@ -511,7 +516,7 @@ static NSArray<NSNumber *> *SLComposeWaveHeights(NSData *pcm, NSInteger bars) {
         cell.selectionStyle = UITableViewCellSelectionStyleNone;
 
         CGFloat cw = SLComposeContentW(tv);
-        UITextView *box = [[UITextView alloc] initWithFrame:CGRectMake(14, 8, cw - 28, 84)];
+        UITextView *box = [[UITextView alloc] initWithFrame:CGRectMake(14, 6, cw - 28, 62)];
         box.tag = kSLComposeTextTag;
         box.font = [UIFont systemFontOfSize:15];
         box.backgroundColor = [UIColor clearColor];
@@ -522,7 +527,7 @@ static NSArray<NSNumber *> *SLComposeWaveHeights(NSData *pcm, NSInteger bars) {
         [cell.contentView addSubview:box];
         self.textBox = box;
 
-        UILabel *holder = [[UILabel alloc] initWithFrame:CGRectMake(19, 14, cw - 38, 20)];
+        UILabel *holder = [[UILabel alloc] initWithFrame:CGRectMake(19, 12, cw - 38, 20)];
         holder.tag = kSLComposeHolderTag;
         holder.text = @"在这里输入要合成的内容…";
         holder.font = [UIFont systemFontOfSize:15];
@@ -531,7 +536,7 @@ static NSArray<NSNumber *> *SLComposeWaveHeights(NSData *pcm, NSInteger bars) {
         [cell.contentView addSubview:holder];
         self.holderLabel = holder;
 
-        SLComposeButton *paste = [[SLComposeButton alloc] initWithFrame:CGRectMake(cw - 14 - 62, 98, 62, 26)];
+        SLComposeButton *paste = [[SLComposeButton alloc] initWithFrame:CGRectMake(cw - 14 - 62, 74, 62, 26)];
         paste.tag = kSLComposePasteTag;
         paste.lab.font = [UIFont systemFontOfSize:12 weight:UIFontWeightMedium];
         paste.lab.text = @"粘贴";
@@ -539,7 +544,7 @@ static NSArray<NSNumber *> *SLComposeWaveHeights(NSData *pcm, NSInteger bars) {
         [paste addTarget:self action:@selector(sl_pasteTapped) forControlEvents:UIControlEventTouchUpInside];
         [cell.contentView addSubview:paste];
 
-        UILabel *cnt = [[UILabel alloc] initWithFrame:CGRectMake(18, 100, 120, 20)];
+        UILabel *cnt = [[UILabel alloc] initWithFrame:CGRectMake(18, 76, 120, 20)];
         cnt.tag = kSLComposeCountTag;
         cnt.font = [UIFont systemFontOfSize:12];
         cnt.textColor = [UIColor tertiaryLabelColor];
@@ -611,16 +616,16 @@ static NSArray<NSNumber *> *SLComposeWaveHeights(NSData *pcm, NSInteger bars) {
             cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleDefault reuseIdentifier:@"sltts_result"];
             cell.backgroundColor = SLGlassCellColor();
             cell.selectionStyle = UITableViewCellSelectionStyleNone;
-            UIView *wave = [[UIView alloc] initWithFrame:CGRectMake(16, 16, SLComposeContentW(tv) - 48, 44)];
+            UIView *wave = [[UIView alloc] initWithFrame:CGRectMake(16, 8, SLComposeContentW(tv) - 48, 40)];
             wave.tag = 77030;
             wave.autoresizingMask = UIViewAutoresizingFlexibleWidth;
             [cell.contentView addSubview:wave];
-            UILabel *voice = [[UILabel alloc] initWithFrame:CGRectMake(16, 70, SLComposeContentW(tv) - 180, 20)];
+            UILabel *voice = [[UILabel alloc] initWithFrame:CGRectMake(16, 58, SLComposeContentW(tv) - 180, 20)];
             voice.tag = 77031;
             voice.font = [UIFont systemFontOfSize:14 weight:UIFontWeightMedium];
             voice.autoresizingMask = UIViewAutoresizingFlexibleWidth;
             [cell.contentView addSubview:voice];
-            UILabel *dur = [[UILabel alloc] initWithFrame:CGRectMake(SLComposeContentW(tv) - 134, 70, 118, 20)];
+            UILabel *dur = [[UILabel alloc] initWithFrame:CGRectMake(SLComposeContentW(tv) - 134, 58, 118, 20)];
             dur.tag = 77032;
             dur.font = [UIFont systemFontOfSize:13];
             dur.textColor = [UIColor secondaryLabelColor];
@@ -636,7 +641,7 @@ static NSArray<NSNumber *> *SLComposeWaveHeights(NSData *pcm, NSInteger bars) {
         CGFloat barW = MAX(2.0, (bw - gap * 27.0) / 28.0);
         for (NSInteger i = 0; i < (NSInteger)hs.count; i++) {
             CGFloat h = MAX(3.0, (CGFloat)hs[i].doubleValue * 40.0);
-            UIView *bar = [[UIView alloc] initWithFrame:CGRectMake(i * (barW + gap), 22 - h / 2.0, barW, h)];
+            UIView *bar = [[UIView alloc] initWithFrame:CGRectMake(i * (barW + gap), 20 - h / 2.0, barW, h)];
             bar.backgroundColor = [UIColor systemGreenColor];
             bar.layer.cornerRadius = barW / 2.0;
             [wave addSubview:bar];
@@ -652,7 +657,7 @@ static NSArray<NSNumber *> *SLComposeWaveHeights(NSData *pcm, NSInteger bars) {
     if (ip.section == 1) {
         UITableViewCell *cell = [self sl_plainCell:tv identifier:@"sltts_status"];
         NSArray *keys = @[@"槽位", @"生效范围", @"有效时间", @"悬浮球"];
-        NSArray *vals = @[@"AI 语音 · 就绪", @"下一条录音", @"60s", @"就绪 · 绿"];
+        NSArray *vals = @[@"AI 语音 · 就绪", @"下一条录音", @"5 分钟", @"装填绿 · 发出后灰"];
         cell.textLabel.text = keys[ip.row];
         cell.detailTextLabel.text = vals[ip.row];
         return cell;
@@ -773,7 +778,7 @@ static NSArray<NSNumber *> *SLComposeWaveHeights(NSData *pcm, NSInteger bars) {
         return;
     }
     if (!SLTTSPageIsEnabled()) {
-        [AWECAUtils showToast:@"请先在设置里打开「文字转语音」" duration:2.0];
+        [AWECAUtils showToast:@"请先在设置里打开「录音转音色」" duration:2.0];
         return;
     }
     self.sourceText = text;
@@ -828,7 +833,7 @@ static NSArray<NSNumber *> *SLComposeWaveHeights(NSData *pcm, NSInteger bars) {
     SLCloseHostingPanel(self);
 }
 
-#pragma mark - 完成态：试听 / 保存
+#pragma mark - 完成态：试听 / 重新生成
 
 - (void)sl_auditionTapped {
     if (self.resultPCM.length < 1600) {
@@ -878,25 +883,21 @@ static NSArray<NSNumber *> *SLComposeWaveHeights(NSData *pcm, NSInteger bars) {
     self.savedCategory = nil;
 }
 
-- (void)sl_saveTapped {
-    if (!self.resultPath.length) return;
-    NSString *docs = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
-    NSString *dir = [docs stringByAppendingPathComponent:@"ShenglinDouyin/文本转语音"];
-    [[NSFileManager defaultManager] createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:nil];
-    NSDateFormatter *fmt = [[NSDateFormatter alloc] init];
-    fmt.dateFormat = @"yyyyMMdd-HHmmss";
-    NSString *name = [NSString stringWithFormat:@"%@.%@", [fmt stringFromDate:[NSDate date]],
-                      self.resultPath.pathExtension.length ? self.resultPath.pathExtension : @"amr"];
-    NSString *dst = [dir stringByAppendingPathComponent:name];
-    NSError *err = nil;
-    [[NSFileManager defaultManager] removeItemAtPath:dst error:nil];
-    BOOL ok = [[NSFileManager defaultManager] copyItemAtPath:self.resultPath toPath:dst error:&err];
-    if (ok) {
-        [AWECAUtils showToast:[NSString stringWithFormat:@"已保存 · %@", name] duration:2.0];
-        SLLog(@"TTS-PAGE saved %@", dst);
-    } else {
-        [AWECAUtils showToast:[NSString stringWithFormat:@"保存失败 · %@", err.localizedDescription ?: @"未知错误"] duration:2.0];
-    }
+- (void)sl_regenerateTapped {
+    // 回到合成前的编辑页：文字原样留着，只清掉这一发的装填与结果。
+    // 槽位必须一起清 —— 否则退回编辑后那发旧音频还挂在替换槽里，下次录音会被它替换掉。
+    [self sl_stopPlayer];
+    self.settled = NO;
+    self.resultPath = nil;
+    self.resultDuration = 0;
+    self.resultPCM = nil;
+    self.resultVoice = nil;
+    self.resultEmotion = nil;
+    SLClearArmedAudio();
+    self.state = SLComposeStateEditing;
+    [self sl_applyState];
+    SLLog(@"TTS-PAGE regenerate: back to editing, text kept len=%lu",
+          (unsigned long)self.textBox.text.length);
 }
 
 @end

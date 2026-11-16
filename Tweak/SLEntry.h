@@ -36,7 +36,7 @@ void SLFloatSetStateQuiet(SLFloatState state);
 // v0.4.82：合成状态并进悬浮胶囊，不再有独立进度卡片（原来那张浮在球上方，遮聊天记录）。
 // 合成开始 → 胶囊自动展开：左端图标保持状态色，中间「合成中 / 已等 12s · 上限 30s」，
 // 右端一个「取消」小胶囊，底部一条 2pt 时间条按「已等待 / 上限」推进。
-// 取消块由调用方提供；约定「取消后把口令写回输入框、球回落灰、不发送」。
+// 取消块由调用方提供；约定「取消后球回落灰、不发送」。
 void SLFloatTTSBegin(NSTimeInterval limitSec, void (^cancelBlock)(void));
 
 // 同上，但主行文字自己给（「识别中」/「合成中」）。抖音的链路是识别 → 合成两段，
@@ -64,14 +64,14 @@ void SLCloseHostingPanel(UIViewController *vc);
 // 实现在 SLEntry.m（SLFloatPanelController 是私有类，外面拿不到）。
 void SLPresentSettings(UIViewController *host);
 
-// v0.4.41：清掉当前装填的那一发（语音包 / #tts 合成音都算）。
-// 语音包和「#tts 即时合成」共用同一个槽位，后写覆盖先写 —— 选包时调它把合成音赶走，
+// v0.4.41：清掉当前装填的那一发（语音包 / 生成语音都算）。
+// 语音包和「生成语音」共用同一个槽位，后写覆盖先写 —— 选包时调它把合成音赶走，
 // 否则会出现「明明选了包，发出去却是刚才那段合成音」。实现放在 Tweak.x。
 void SLClearArmedAudio(void);
 
-// v0.5.48：设置页「文本转语音」的装填桥接。实现在 Tweak.x（那里才有 PCM 流钩子的全局状态）。
-// 合成成功后只写槽位，不碰输入框 / 口令 / 胶囊进度；录音时 PCM 钩子自动替换成这条 AI 音频。
-// pcm16k 传 16kHz / mono / s16le 裸 PCM（从 lastRawAudioPath 解出来的，AMR 解不回来）。
+// 设置页「生成语音」的装填桥接。实现在 Tweak.x（那里才有替换钩子的全局状态）。
+// 合成成功后只写槽位，不碰输入框 / 胶囊进度；录音时钩子自动替换成这条 AI 音频。
+// pcm16k 为兼容旧调用保留，抖音走文件级替换，用不上。
 BOOL SLTTSPageIsEnabled(void);
 BOOL SLTTSPageArm(NSString *audioPath, double duration, NSData *pcm16k, NSString *text);
 
