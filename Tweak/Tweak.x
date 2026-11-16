@@ -116,12 +116,28 @@ static UIView *SLFindTextInput(UIView *root, BOOL needText) {
     return nil;
 }
 
+// iOS 15 起 UIApplication.windows / keyWindow 都弃用，项目开 -Werror，直接引用会炸 CI。
+// 高版本走 UIWindowScene，低版本用 KVC 兜底（不碰已弃用符号）。
+static UIWindow *SLInputKeyWindow(void) {
+    UIWindow *key = nil;
+    if (@available(iOS 15.0, *)) {
+        for (UIScene *sc in [[UIApplication sharedApplication] connectedScenes]) {
+            if (![sc isKindOfClass:[UIWindowScene class]]) continue;
+            for (UIWindow *w in ((UIWindowScene *)sc).windows) {
+                if (w.isKeyWindow) { key = w; break; }
+            }
+            if (key) break;
+        }
+    }
+    if (!key) {
+        key = (UIWindow *)[[UIApplication sharedApplication] valueForKey:@"keyWindow"];
+    }
+    return key;
+}
+
 // first responder 优先；点麦克风时键盘常常已经收起，退化成「窗口里第一个有文字的输入框」
 static NSString *SLCurrentInputText(void) {
-    UIWindow *key = nil;
-    for (UIWindow *w in [UIApplication sharedApplication].windows) {
-        if (w.isKeyWindow) { key = w; break; }
-    }
+    UIWindow *key = SLInputKeyWindow();
     if (!key) return nil;
 
     UIView *v = SLFindTextInput(key, NO);
