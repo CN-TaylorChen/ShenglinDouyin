@@ -1,0 +1,79 @@
+name: Build ShenglinDouyin
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Precheck (lint, fails fast before downloading Theos)
+        run: python3 precheck.py --skip-version
+
+      - name: Cache AMR-NB xcframework
+        uses: actions/cache@v4
+        with:
+          path: vendor/amr_xcf
+          key: amrnb-xcframework-v0.1.6
+
+      - name: Set up Theos
+        uses: Randomblock1/theos-action@v1
+        with:
+          theos-sdks: 'https://github.com/theos/sdks'
+          theos-sdks-branch: 'master'
+
+      - name: Fetch AMR-NB encoder (opencore-amrnb)
+        run: |
+          set -e
+          mkdir -p vendor/amr/lib vendor/amr_xcf
+          if [ ! -f vendor/amr_xcf/amrnb.zip ]; then
+            curl -sSL -o vendor/amr_xcf/amrnb.zip \
+              https://github.com/feuvan/opencore-amr-iOS/releases/download/v0.1.6/opencore-amrnb.xcframework.zip
+          fi
+          unzip -q -o vendor/amr_xcf/amrnb.zip -d vendor/amr_xcf
+          find vendor/amr_xcf -maxdepth 3 \( -type d -o -type f \) | head -n 40
+          # 只取 iOS(真机) 那一份：排除 simulator / macos / catalyst
+          A=$(find vendor/amr_xcf -type f \( -name "*.a" -o -name "libopencore-amrnb" \) \
+              | grep -i "ios" | grep -v -i "simulator" | grep -v -i "macos" | head -n 1)
+          if [ -z "$A" ]; then
+            A=$(find vendor/amr_xcf -type f -name "*.a" | grep -v -i "simulator" | grep -v -i "macos" | head -n 1)
+          fi
+          if [ -n "$A" ]; then
+            cp "$A" vendor/amr/lib/libopencore-amrnb.a
+            echo "AMR lib: $A"
+            lipo -info vendor/amr/lib/libopencore-amrnb.a || true
+          else
+            echo "AMR lib not found (will send raw audio)"
+          fi
+          ls -la vendor/amr/lib || true
+
+      - name: Build dylib
+        env:
+          THEOS: ${{ github.workspace }}/theos
+        run: make
+
+      - name: Package deb
+        run: |
+          VER=$(grep '^Version:' control | awk '{print $2}' | tr -d '\r')
+          python3 make_deb.py --control control \
+            --dylib ShenglinDouyin.dylib --plist ShenglinDouyin.plist \
+            --dylib-name ShenglinDouyin.dylib \
+            --out "ShenglinDouyin-v${VER}.deb"
+
+      - name: Resolve artifact name (声临-v<版本>)
+        id: art
+        run: echo "name=ShenglinDouyin-v$(grep '^Version:' control | awk '{print $2}' | tr -d '\r')" >> "$GITHUB_OUTPUT"
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.art.outputs.name }}
+          path: |
+            ShenglinDouyin.dylib
+            ShenglinDouyin.plist
+            ShenglinDouyin-v*.deb
