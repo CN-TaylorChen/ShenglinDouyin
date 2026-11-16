@@ -55,35 +55,35 @@ BOOL SLTTSPageArm(NSString *audioPath, double duration, NSData *pcm16k, NSString
     if (!SLTTSPageIsEnabled()) return NO;
 
     AWECAAudioReplacer *replacer = [AWECAAudioReplacer shared];
-    [replacer clearReplacement];            // 先把上一条语音包 / 合成音清干净
+    // 这里不能用 clearReplacement：它会弹「已关闭语音替换」——
+    // 用户刚合成完，先被告知"已关闭"，下一秒又装上了，纯属自打脸。
     replacer.replacementAudioPath = audioPath;
+    replacer.ttsAudioPath = nil;
     replacer.enabled = YES;
     [replacer saveState];
 
     [SLVoicePack setOneShotPending:YES];
+    [SLVoicePack setArmedSource:SLArmedSourceAI];   // 胶囊名字显示「AI 语音」而不是包名
     SLFloatPush(SLFloatStateReady);
-    SLLog(@"TTS-PAGE armed path=%@ textLen=%lu", audioPath, (unsigned long)text.length);
+    SLLog(@"TTS-PAGE armed path=%@ textLen=%lu", audioPath.lastPathComponent, (unsigned long)text.length);
 
-    // 60s 内没录音就自动解除，避免误替换下一条普通语音
+    // 5 分钟没录音就自动解除，避免误替换下一条普通语音。
+    // （原来是 60 秒：合成完切出去回条消息就过期了，用户会以为"装填没生效"。）
     NSString *armed = [audioPath copy];
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(60 * NSEC_PER_SEC)),
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(300 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
         AWECAAudioReplacer *r = [AWECAAudioReplacer shared];
         if (r.replacementAudioPath && [r.replacementAudioPath isEqualToString:armed]) {
-            [r clearReplacement];
-            [r saveState];
-            [SLVoicePack setOneShotPending:NO];
-            SLFloatPush(SLFloatStateIdle);
-            SLLog(@"TTS-PAGE armed expired (60s), cleared");
+            [SLVoicePack disarmArmedAudio];
+            SLLog(@"TTS-PAGE armed expired (5min), cleared");
         }
     });
     return YES;
 }
 
-void SLClearArmedAudio(void) {    AWECAAudioReplacer *replacer = [AWECAAudioReplacer shared];
-    [replacer clearReplacement];
-    [replacer saveState];
-    [[SLVoicePack class] setOneShotPending:NO];
+void SLClearArmedAudio(void) {
+    // 单点真相：清槽位这件事只有 SLVoicePack 一处实现（球色、one-shot、replacer 一起落）
+    [SLVoicePack disarmArmedAudio];
     SLLog(@"armed audio cleared by UI");
 }
 
@@ -192,13 +192,39 @@ void SLPackPrewarm(void) {
     SLLog(@"PACK prewarm ok %@ %.2fs", path.lastPathComponent, dur);
 }
 
-// 日志页顶部那行状态摘要
+// 日志页顶部那行状态摘要。
+// 这里必须如实反映「谁挂上了」——按类名动态安装的两个钩子找不到类时是静默跳过的，
+// 而它们恰好就是「录音按钮点了没反应」「预览气泡不显示替换结果」的唯二原因。
+static BOOL sSLHookPreview = NO;    // generateAudioPreviewBubbleWithRecordedModel:
+static BOOL sSLHookIconBtn = NO;    // CommentAudioIconElement 的 viewDidLoad / handleAudioButton
+
 NSString *SLHookStatusSummary(void) {
+    NSMutableArray<NSString *> *list = [NSMutableArray array];
+    [list addObject:@"录音器"];     // %hook AWECommentAudioRecorderController（编译期挂钩，一定在）
+    [list addObject:@"上传管理"];   // %hook AWECommentAudioUploadManager
+    [list addObject:@"私聊录音"];   // AWEIM*
+    if (sSLHookPreview) [list addObject:@"预览气泡"];
+    if (sSLHookIconBtn) [list addObject:@"录音按钮"];
+    return [NSString stringWithFormat:@"已装钩子：%@", [list componentsJoinedByString:@"  "]];
+}
+
+// 第二行：当前运行态。用户反馈问题时，这一行 + 下面几行日志就能定位八成情况。
+NSString *SLRuntimeStateSummary(void) {
     AWECARecordEnhance *enhance = [AWECARecordEnhance shared];
     AWECAAudioReplacer *replacer = [AWECAAudioReplacer shared];
-    return [NSString stringWithFormat:@"抖音版 · 录音增强%d · 替换%d · 已装填%@",
-            enhance.enhanceEnabled, replacer.enabled,
-            replacer.replacementAudioPath.length ? replacer.replacementAudioPath.lastPathComponent : @"无"];
+    NSString *slot = replacer.replacementAudioPath;
+    unsigned long long sz = 0;
+    if (slot.length) {
+        sz = [[[NSFileManager defaultManager] attributesOfItemAtPath:slot error:nil][NSFileSize] unsignedLongLongValue];
+    }
+    NSInteger src = (NSInteger)[SLVoicePack armedSource];
+    NSString *srcName = (src == SLArmedSourcePack) ? @"语音包"
+                      : (src == SLArmedSourceAI) ? @"AI 语音" : @"无";
+    return [NSString stringWithFormat:@"增强 %@ · 替换 %@ · 槽位 %@ · 来源 %@ · %lluKB",
+            enhance.enhanceEnabled ? @"开" : @"关",
+            replacer.enabled ? @"开" : @"关",
+            slot.length ? slot.lastPathComponent : @"空",
+            srcName, sz / 1024];
 }
 
 // 录音结束替换
@@ -222,30 +248,46 @@ NSString *SLHookStatusSummary(void) {
 - (void)audioRecorderDidFinishRecording:(id)recorder success:(BOOL)success error:(id)error {
     NSString *path = self.audioFilePath.length ? self.audioFilePath : self.recorder.url.path;
     AWECARecordEnhance *enhance = [AWECARecordEnhance shared];
+    AWECAAudioReplacer *replacer = [AWECAAudioReplacer shared];
 
     // 取消残留：上滑取消时抖音也会以 success:YES 走到这里（文件落盘后被丢弃）。
     // cancelledTake 是状态位：从 clear（取消）起置位，到下一次录音开始（markCommentTakeStarted）才清零，
     // 因此无论取消的完成回调迟到多久都能识别；且取消的 DidFinishRecording 必先于用户下一次录音操作，
     // 不存在"误挡正常录音"的窗口（早期用 0.5s 时间窗，主线程忙时必漏）
     BOOL cancelResidue = enhance.cancelledTake;
+    BOOL armedLocal = [enhance hasArmedLocalAudio];
+
+    // 这一行是排查「选了语音包却不替换」的唯一入口：把这一刻的五个开关全摊开。
+    SLLog(@"CMT finish success=%d path=%@ exists=%d cancelResidue=%d armedLocal=%d replacerOn=%d slot=%@ enh=%d armed=%d",
+          success, path.lastPathComponent ?: @"(nil)",
+          (int)(path.length && [[NSFileManager defaultManager] fileExistsAtPath:path]),
+          cancelResidue, armedLocal, replacer.enabled,
+          replacer.replacementAudioPath.lastPathComponent ?: @"(空)",
+          enhance.enhanceEnabled, enhance.armed);
 
     // ① 语音包 / 本地音频 / 文字合成已经装填：直接换文件。
     // 必须排在最前面 —— 之前装了语音包，录音结束照样被 ASR+TTS 的合成结果覆盖，
     // 用户看到的就是「选了包却还是 AI 音色」，而且白花一次识别和合成额度。
-    if (success && !cancelResidue && path.length && [enhance hasArmedLocalAudio]) {
-        %orig;
+    // v0.5.x：替换挪到 %orig **之前**。抖音在 DidFinish 里就会生成预览气泡并起上传，
+    // 等 %orig 返回再换文件，上传可能已经抓着原声走了 —— 表现就是"换了个寂寞"。
+    if (success && !cancelResidue && path.length && armedLocal) {
         NSString *target = self.audioFilePath.length ? self.audioFilePath : self.recorder.url.path;
         if (!target.length) target = path;
         if (![[NSFileManager defaultManager] fileExistsAtPath:target]) target = path;
-        BOOL done = target.length ? [[AWECAAudioReplacer shared] replaceAudioAtPath:target] : NO;
-        SLFloatPushResult(done);
+        BOOL done = target.length ? [replacer replaceAudioAtPath:target] : NO;
+
+        %orig;   // 让原生继续（预览气泡 / 上传读的就是刚换好的文件）
+
         [enhance consumeArmedLocalAudio];   // 一发即用，别让下一条普通录音又被换掉
+        SLFloatPushResult(done);
+        SLLog(@"CMT direct-replace %@ target=%@", done ? @"ok" : @"失败", target.lastPathComponent);
         if (!done) [AWECAUtils showToast:@"替换失败，保留原声"];
         return;
     }
 
     if (success && enhance.enhanceEnabled && enhance.armed
-        && ![enhance hasArmedLocalAudio] && ![enhance shouldRunForCommentRecording]) {
+        && !armedLocal && ![enhance shouldRunForCommentRecording]) {
+        SLLog(@"CMT 跳过合成：凭证缺失");
         [AWECAUtils showToast:@"请先填写火山 API Key"];
         %orig;
         return;
@@ -265,16 +307,15 @@ NSString *SLHookStatusSummary(void) {
 
     if (success && [AWECAAudioReplacer shared].enabled) {
         NSString *recorderURL = self.recorder.url.path;
-        %orig;
-        NSString *pathAfter = self.audioFilePath;
+        // 同上：先换再 %orig，别等原生已经把文件读走
+        NSString *target = self.audioFilePath.length ? self.audioFilePath : recorderURL;
+        if (!target.length) target = path;
+        BOOL done = target.length ? [[AWECAAudioReplacer shared] replaceAudioAtPath:target] : NO;
 
-        BOOL done = NO;
-        if (pathAfter.length > 0) {
-            done = [[AWECAAudioReplacer shared] replaceAudioAtPath:pathAfter];
-        } else if (recorderURL.length > 0) {
-            done = [[AWECAAudioReplacer shared] replaceAudioAtPath:recorderURL];
-        }
+        %orig;
+
         SLFloatPushResult(done);
+        SLLog(@"CMT sticky-replace %@ target=%@", done ? @"ok" : @"失败", target.lastPathComponent);
         if (done) [AWECAUtils showToast:@"语音已替换"];
     } else {
         %orig;
@@ -289,6 +330,7 @@ NSString *SLHookStatusSummary(void) {
     if ([[NSFileManager defaultManager] fileExistsAtPath:audioFilePath]) {
         BOOL done = [[AWECAAudioReplacer shared] replaceAudioAtPath:audioFilePath];
         SLFloatPushResult(done);
+        SLLog(@"CMT setAudioFilePath 替换 %@ %@", done ? @"ok" : @"失败", audioFilePath.lastPathComponent);
     }
 }
 
@@ -695,11 +737,14 @@ static BOOL AWECAPrivateGate(const char *tag, NSString *path, void (^fire)(BOOL 
 
 - (void)startUploadAudioWithFilePath:(id)filePath {
     NSString *path = (NSString *)filePath;
-    if (![[AWECARecordEnhance shared] shouldSkipStickyReplaceForPath:path] &&
-        [AWECAAudioReplacer shared].enabled && filePath) {
-        if ([[NSFileManager defaultManager] fileExistsAtPath:path]) {
-            [[AWECAAudioReplacer shared] replaceAudioAtPath:path];
-        }
+    BOOL skip = [[AWECARecordEnhance shared] shouldSkipStickyReplaceForPath:path];
+    BOOL on = [AWECAAudioReplacer shared].enabled;
+    BOOL exist = path.length && [[NSFileManager defaultManager] fileExistsAtPath:path];
+    SLLog(@"UPLOAD startUpload path=%@ exist=%d replacerOn=%d skip=%d", path.lastPathComponent ?: @"(nil)",
+          (int)exist, (int)on, (int)skip);
+    if (!skip && on && exist) {
+        BOOL done = [[AWECAAudioReplacer shared] replaceAudioAtPath:path];
+        SLLog(@"UPLOAD 上传前替换 %@", done ? @"ok" : @"失败");
     }
     %orig;
 }
@@ -707,9 +752,10 @@ static BOOL AWECAPrivateGate(const char *tag, NSString *path, void (^fire)(BOOL 
 - (void)uploadAudioWithFilePath:(id)filePath completion:(id)completion {
     NSString *path = (NSString *)filePath;
     if (![[AWECARecordEnhance shared] shouldSkipStickyReplaceForPath:path] &&
-        [AWECAAudioReplacer shared].enabled && filePath) {
+        [AWECAAudioReplacer shared].enabled && path.length) {
         if ([[NSFileManager defaultManager] fileExistsAtPath:path]) {
-            [[AWECAAudioReplacer shared] replaceAudioAtPath:path];
+            BOOL done = [[AWECAAudioReplacer shared] replaceAudioAtPath:path];
+            SLLog(@"UPLOAD uploadAudio 替换 %@ %@", done ? @"ok" : @"失败", path.lastPathComponent);
         }
     }
     %orig;
@@ -718,9 +764,10 @@ static BOOL AWECAPrivateGate(const char *tag, NSString *path, void (^fire)(BOOL 
 - (void)uploadAudioWithFilePath:(id)filePath authCompletion:(id)authCompletion completion:(id)completion {
     NSString *path = (NSString *)filePath;
     if (![[AWECARecordEnhance shared] shouldSkipStickyReplaceForPath:path] &&
-        [AWECAAudioReplacer shared].enabled && filePath) {
+        [AWECAAudioReplacer shared].enabled && path.length) {
         if ([[NSFileManager defaultManager] fileExistsAtPath:path]) {
-            [[AWECAAudioReplacer shared] replaceAudioAtPath:path];
+            BOOL done = [[AWECAAudioReplacer shared] replaceAudioAtPath:path];
+            SLLog(@"UPLOAD uploadAudio(auth) 替换 %@ %@", done ? @"ok" : @"失败", path.lastPathComponent);
         }
     }
     %orig;
@@ -751,6 +798,7 @@ static void hook_generateAudioPreviewBubble(id self, SEL _cmd, id recordedModel)
     if (recordedModel && ![enhance shouldSkipStickyReplaceForPath:audioPath] && [AWECAAudioReplacer shared].enabled) {
         if (audioPath.length > 0 && [[NSFileManager defaultManager] fileExistsAtPath:audioPath]) {
             BOOL ok = [[AWECAAudioReplacer shared] replaceAudioAtPath:audioPath];
+            SLLog(@"PREVIEW 气泡前替换 %@ %@", ok ? @"ok" : @"失败", audioPath.lastPathComponent);
 
             if (ok) {
                 double realDur = [AWECAUtils audioDurationAtPath:audioPath];
@@ -765,6 +813,7 @@ static void hook_generateAudioPreviewBubble(id self, SEL _cmd, id recordedModel)
 static void setupAudioInputElementHook(void) {
     Class cls = NSClassFromString(@"AWECommentInputViewSwiftImpl.CommentInputAudioInputElement");
     if (!cls) {
+        SLLog(@"HOOK 预览气泡：找不到 CommentInputAudioInputElement（类名变了，替换仍会在录音结束/上传前生效）");
         return;
     }
     SEL sel = @selector(generateAudioPreviewBubbleWithRecordedModel:);
@@ -772,6 +821,10 @@ static void setupAudioInputElementHook(void) {
     if (method) {
         orig_generateAudioPreviewBubble = (void (*)(id, SEL, id))method_getImplementation(method);
         method_setImplementation(method, (IMP)hook_generateAudioPreviewBubble);
+        sSLHookPreview = YES;
+        SLLog(@"HOOK 预览气泡 ok");
+    } else {
+        SLLog(@"HOOK 预览气泡：方法不在 %@ 上", cls);
     }
 }
 
@@ -804,7 +857,10 @@ static void hook_handleAudioButton(id self, SEL _cmd) {
 
 static void setupAudioIconElementHook(void) {
     Class cls = NSClassFromString(@"AWECommentInputViewSwiftImpl.CommentAudioIconElement");
-    if (!cls) return;
+    if (!cls) {
+        SLLog(@"HOOK 录音按钮：找不到 CommentAudioIconElement（顶栏按钮与红点不会出现）");
+        return;
+    }
     SEL sel = @selector(viewDidLoad);
     Method method = class_getInstanceMethod(cls, sel);
     if (method) {
@@ -817,6 +873,10 @@ static void setupAudioIconElementHook(void) {
     if (btnMethod) {
         orig_handleAudioButton = (void (*)(id, SEL))method_getImplementation(btnMethod);
         method_setImplementation(btnMethod, (IMP)hook_handleAudioButton);
+        sSLHookIconBtn = YES;
+        SLLog(@"HOOK 录音按钮 ok");
+    } else {
+        SLLog(@"HOOK 录音按钮：handleAudioButton 不在 %@ 上", cls);
     }
 }
 
@@ -837,6 +897,10 @@ static void setupAudioIconElementHook(void) {
         // 入口保留两条路 —— 球（随时可开）+ 评论顶栏按钮（在评论区里更顺手）。
         SLLog(@"==== 声临·抖音版 loaded into %@ ====",
               [[NSBundle mainBundle] bundleIdentifier] ?: @"(nil)");
+        // 第一行就把日志落在哪打出来：日志页那一栏显示的就是这个路径。
+        // 「日志功能好像没用」八成是先写失败（沙盒）又没人说，这里自证一次。
+        SLLog(@"log file = %@", [SLLog filePath] ?: @"(不可写)");
+        SLLog(@"bundle container = %@", [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject]);
         @try { SLStartEntryWatcher(); } @catch (NSException *e) {
             SLLog(@"悬浮球装配失败: %@", e);
         }

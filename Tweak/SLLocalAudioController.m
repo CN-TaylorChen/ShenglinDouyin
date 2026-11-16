@@ -5,6 +5,8 @@
 #import "AWECAAudioReplacer.h"
 #import "AWECAUtils.h"
 #import "SLVoicePack.h"
+#import "SLEntry.h"
+#import "SLLog.h"
 #import <AVFoundation/AVFoundation.h>
 
 #if __has_include(<UniformTypeIdentifiers/UniformTypeIdentifiers.h>)
@@ -182,6 +184,9 @@ static BOOL SLLocalPathIsAudio(NSString *p) {
             return;
         }
         [SLVoicePack setOneShotPending:YES];   // 让设置页那行显示成「已装填」
+        [SLVoicePack setArmedSource:SLArmedSourcePack];
+        SLRefreshFloatButton();                // 球跟着变绿，否则「装好了球还是灰的」
+        SLLog(@"LOCAL armed %@", path.lastPathComponent);
         [weakSelf sl_reload];
         NSTimeInterval dur = [AWECAUtils audioDurationAtPath:path];
         [AWECAUtils showToast:[NSString stringWithFormat:@"已装填 %.1f 秒，下次录音直接换成它", dur]

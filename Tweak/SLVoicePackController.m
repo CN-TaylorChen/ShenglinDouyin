@@ -808,20 +808,27 @@ static UIImage *SLPauseGlyph(void) {
     // v0.4.40：和胶囊下拉列表同一套逻辑 —— 点一条装一发，再点同一条撤销。
     BOOL on = [SLVoicePack isOneShotPending] && [SLVoicePack isPackActive:pack];
     if (on) {
-        [SLVoicePack setOneShotPending:NO];
+        [SLVoicePack disarmArmedAudio];
         [self.tableView reloadData];
         SLRefreshFloatButton();
         [AWECAUtils showToast:@"已切回原声" duration:1.5];
         return;
     }
-    [SLVoicePack selectPack:pack];
-    [SLVoicePack setOneShotPending:YES];
-    [SLVoicePack setEnabled:YES];
-    [self.tableView reloadData];
-    SLRefreshFloatButton();
+    // v0.5.x：装填 = 把路径交给替换槽（见 SLVoicePack armPack:）。这里以前只置标记不设路径，
+    // 录音结束走的是 ASR+TTS，所以「选了包也不替换」。
+    [SLVoicePack armPack:pack completion:^(BOOL ok) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [self.tableView reloadData];
+            SLRefreshFloatButton();
+            if (!ok) {
+                [AWECAUtils showToast:@"这个包的文件不在了，重新导入一次" duration:2.2];
+                return;
+            }
+            [AWECAUtils showToast:[NSString stringWithFormat:@"已装好「%@」· 下一条语音发它", pack[@"name"] ?: @""]
+                         duration:1.8];
+        });
+    }];
     SLPackPrewarm();
-    [AWECAUtils showToast:[NSString stringWithFormat:@"已装好「%@」· 下一条语音发它", pack[@"name"] ?: @""]
-                 duration:1.8];
 }
 
 - (UISwipeActionsConfiguration *)tableView:(UITableView *)tv trailingSwipeActionsConfigurationForRowAtIndexPath:(NSIndexPath *)ip {

@@ -47,6 +47,18 @@ typedef NS_ENUM(NSInteger, SLArmedSource) {
 + (BOOL)isPackActive:(NSDictionary *)pack;
 + (void)selectPack:(NSDictionary *)pack;
 
+/// 抖音版：把这条包装进「下一条录音」的替换槽。
+/// 陌陌版是把包解成 PCM 喂进 AudioStreamBus；抖音是录完落盘、直接换文件，
+/// 所以这里必须把**路径**交给 AWECAAudioReplacer。
+/// 只置 one-shot 标记而不设路径时，录音结束那一刻 hasArmedLocalAudio 判为 NO，
+/// 会掉进 ASR+TTS 分支 —— 用户看到的就是「选了包，发出去还是 AI 音色」。
+/// 非 m4a（mp3/wav/amr…）先转一份 m4a 缓存再装：抖音录音器产出的就是 m4a，
+/// 换成同容器字节流最不容易被它的播放/上传链路判死。
++ (void)armPack:(NSDictionary *)pack completion:(void (^)(BOOL ok))completion;
+
+/// 撤销这一发，回到原声：槽位清空、替换关掉、球落回灰（或绿，看还有没有别的装填）。
++ (void)disarmArmedAudio;
+
 /// 导入整个文件夹（递归），返回新增条数
 + (NSInteger)importFolderAtURL:(NSURL *)url error:(NSString **)err;
 /// 导入单个音频文件到指定文件夹（nil = 未分组）

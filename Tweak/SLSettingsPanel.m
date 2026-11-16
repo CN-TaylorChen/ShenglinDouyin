@@ -20,7 +20,6 @@
 #import "SLVoicePack.h"
 #import "SLVoicePackController.h"
 #import "SLAlignBox.h"
-#import "SLTTSAuditionPanel.h"
 #import "SLGlass.h"
 #import "SLLocalAudioController.h"
 #import "AWECAAudioReplacer.h"
@@ -252,7 +251,7 @@ static UIView *SLMakeHeader(NSString *text, CGFloat x, CGFloat width) {
     (void)tv;
     if (section == 0) return 8;   // 语音：开关 + 引擎 + 音色 + 文字合成 + 情绪 + 语速 + 音量 + 音调
     if (section == 1) return 2;   // 本地：本地音频 + 语音包
-    if (section == 2) return 4;   // 发送：合成口令 + 短录音补全 + 合成后先试听 + 失败时放回输入框
+    if (section == 2) return 3;   // 发送：合成口令 + 短录音补全 + 失败时放回输入框
     if (section == 3) return 3;   // 其它：悬浮球图标 + API 凭证 + 运行日志
     return 1;
 }
@@ -390,6 +389,8 @@ static UIView *SLMakeHeader(NSString *text, CGFloat x, CGFloat width) {
             cell.textLabel.text = @"语音包";
             if (![SLVoicePack isOneShotPending]) {
                 cell.detailTextLabel.text = @"原声";
+            } else if ([SLVoicePack armedSource] == SLArmedSourceAI) {
+                cell.detailTextLabel.text = @"AI 语音";   // 槽位里是现场合成的，别谎报成包名
             } else {
                 NSDictionary *active = [SLVoicePack activePack];
                 cell.detailTextLabel.text = active ? (active[@"name"] ?: @"已装填") : @"原声";
@@ -414,13 +415,6 @@ static UIView *SLMakeHeader(NSString *text, CGFloat x, CGFloat width) {
             cell.accessoryView = sw;
             cell.selectionStyle = UITableViewCellSelectionStyleNone;
         } else if (ip.row == 2) {
-            cell.textLabel.text = @"合成后先试听";
-            UISwitch *sw = [[UISwitch alloc] initWithFrame:CGRectZero];
-            sw.on = [SLTTSAuditionPanel isEnabled];
-            [sw addTarget:self action:@selector(sl_auditionChanged:) forControlEvents:UIControlEventValueChanged];
-            cell.accessoryView = sw;
-            cell.selectionStyle = UITableViewCellSelectionStyleNone;
-        } else {
             // 合成失败 / 取消时把口令写回输入框（默认开）；关掉就只复制到剪贴板。
             cell.textLabel.text = @"失败时放回输入框";
             UISwitch *sw = [[UISwitch alloc] initWithFrame:CGRectZero];
@@ -521,11 +515,6 @@ static UIView *SLMakeHeader(NSString *text, CGFloat x, CGFloat width) {
 
 
 
-
-
-- (void)sl_auditionChanged:(UISwitch *)sw {
-    [SLTTSAuditionPanel setEnabled:sw.on];
-}
 
 
 #pragma mark - 虚拟定位

@@ -133,7 +133,7 @@
 }
 
 - (void)sl_reload {
-    NSString *summary = @"没有装上任何钩子（类名/方法签名不匹配，把日志发给开发者）";
+    NSString *summary = SLHookStatusSummary();
     @try { NSString *s = SLHookStatusSummary(); if (s.length) summary = s; } @catch (NSException *e) { }
     self.fullSummary = summary;
 
@@ -145,14 +145,31 @@
     }
     self.hookCount = n;
 
-    self.statusDetail.text = [NSString stringWithFormat:@"%@\n\n文件：%@",
-                              body.length ? body : @"(无)", [SLLog filePath] ?: @"(不可写)"];
+    // 运行态：出问题时这一行比什么都直接（装了什么、槽位里有没有东西）
+    NSString *state = @"";
+    @try { state = SLRuntimeStateSummary() ?: @""; } @catch (NSException *e) { }
+
+    // 文件本身：路径 / 大小 / 行数。日志显示空白时，这三项能立刻区分
+    // 「真没写日志」和「写了但读不出来」（沙盒写失败就是前者，编码坏了是后者）。
+    NSString *path = [SLLog filePath];
+    if (!path.length) path = @"(三个候选路径都不可写，日志只能看 NSLog)";
+    unsigned long long size = 0;
+    NSInteger lines = 0;
+    if ([path hasPrefix:@"/"]) {
+        size = [[[NSFileManager defaultManager] attributesOfItemAtPath:path error:nil][NSFileSize] unsignedLongLongValue];
+        NSString *content = [SLLog tailLines:NSIntegerMax];   // 全量（上限 1MB，够快）
+        lines = content.length ? (NSInteger)[content componentsSeparatedByString:@"\n"].count : 0;
+    }
+
+    self.statusDetail.text = [NSString stringWithFormat:
+        @"%@\n\n%@\n\n文件：%@\n大小：%.1f KB · %ld 行",
+        body.length ? body : @"(无)", state, path, size / 1024.0, (long)lines];
     [self sl_updateStatusLabel];
 
     NSString *logBody = [SLLog tailLines:400];
     if (!logBody.length) {
         logBody = [SLLog fileReadable]
-            ? @"(暂无日志)"
+            ? @"(暂无日志：先点开设置里的「录音转音色」录一条，再回来看)"
             : @"(日志文件里有半截中文字，读不出来。这一版已改成按行截断，清空一次就好)";
     }
     self.tv.text = logBody;
@@ -163,8 +180,9 @@
 
 - (void)sl_copy {
     UIPasteboard *pb = [UIPasteboard generalPasteboard];
-    pb.string = [NSString stringWithFormat:@"%@\n文件：%@\n---\n%@",
-                 self.fullSummary ?: @"", [SLLog filePath] ?: @"", self.tv.text ?: @""];
+    pb.string = [NSString stringWithFormat:@"%@\n%@\n文件：%@\n---\n%@",
+                 self.fullSummary ?: @"", SLRuntimeStateSummary() ?: @"",
+                 [SLLog filePath] ?: @"", self.tv.text ?: @""];
     UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"已复制"
                                                                message:@"粘贴给开发者即可定位问题"
                                                         preferredStyle:UIAlertControllerStyleAlert];

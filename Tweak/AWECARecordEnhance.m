@@ -7,8 +7,8 @@
 #import "AWECAUtils.h"
 #import "AWECATOSUploader.h"
 #import "SLVoicePack.h"
-#import "SLTTSAuditionPanel.h"
 #import "SLEntry.h"
+#import "SLLog.h"
 #import <UIKit/UIKit.h>
 
 // 录音文件识别标准版：submit 提交 + query 轮询（两段式异步）
@@ -435,15 +435,14 @@ static void AWECAWalkHideStatusDots(UIView *v, BOOL hide) {
     }
     [self flushWaitersOk:ok path:path message:msg];
 
-    // 结论落在胶囊上：成功 0.2s 收成绿球；成功且开了「合成后先试听」则停在
-    // 「已替换 · 点这里试听」，点一下播、点右端重来。失败原地转红并给一次重试。
+    // 结论落在胶囊上：成功直接收球（颜色由胶囊自己按槽位落定）；失败原地转红并给一次重试。
     __weak typeof(self) weakRetry = self;
     NSString *retryPath = path;
     void (^retryBlock)(void) = ^{
         if (retryPath.length) [weakRetry startPipelineAtPath:retryPath];
     };
-    BOOL audition = (ok && path.length && [SLTTSAuditionPanel isEnabled]);
-    SLFloatTTSEndWithAudition(ok, msg, audition ? path : nil, retryBlock);
+    SLLog(@"pipeline end ok=%d path=%@ msg=%@", ok, path.lastPathComponent, msg);
+    SLFloatTTSEnd(ok, msg, retryBlock);
 }
 
 - (void)startPipelineAtPath:(NSString *)path {
@@ -457,10 +456,13 @@ static void AWECAWalkHideStatusDots(UIView *v, BOOL hide) {
 
     // 进度不再弹 toast：全部长在悬浮胶囊里（识别中 → 合成中 → 绿球/红球）。
     // toast 是全局黑框，和球的颜色各说各话，用户得先看两处才知道在干嘛。
+    SLLog(@"pipeline start path=%@", path.lastPathComponent);
     __weak typeof(self) weakSelfCancel = self;
     SLFloatTTSBeginWithTitle(@"识别中", kEnhanceTimeout, ^{
+        SLLog(@"pipeline cancelled by user");
         [weakSelfCancel invalidatePipeline:@"已取消"];
-        SLFloatTTSEnd(NO, @"已取消，原声保留", nil);
+        // 取消不能走失败态：红字停 2.6 秒再收，收完没人刷颜色，球就挂在合成蓝上。
+        SLFloatTTSAbort(@"已取消，原声保留");
     });
 
     __weak typeof(self) weakSelf = self;
@@ -472,19 +474,26 @@ static void AWECAWalkHideStatusDots(UIView *v, BOOL hide) {
     [self recognizeAudioAtPath:path completion:^(NSString *text, NSString *error) {
         if (weakSelf.finishedOnce || weakSelf.pipelineEpoch != epoch) return;
         if (!text.length) {
+            SLLog(@"ASR 失败: %@", error);
             [weakSelf finishPipelineOk:NO path:path message:error.length ? error : @"识别失败，已保留原声"];
             return;
         }
+        SLLog(@"ASR ok len=%lu text=%@", (unsigned long)text.length,
+              text.length > 40 ? [[text substringToIndex:40] stringByAppendingString:@"…"] : text);
         SLFloatTTSPhase(@"合成中");
         [[AWECATTSManager shared] synthesizeVolcanoPreviewText:text completion:^(BOOL success, NSString *audioPath, NSString *ttsError) {
             if (weakSelf.finishedOnce || weakSelf.pipelineEpoch != epoch) return;
             if (!success || !audioPath.length) {
+                SLLog(@"TTS 失败: %@", ttsError ?: @"(无路径)");
                 [weakSelf finishPipelineOk:NO path:path message:ttsError.length ? [NSString stringWithFormat:@"%@，已保留原声", ttsError] : @"合成失败，已保留原声"];
                 return;
             }
+            SLLog(@"TTS ok file=%@ %.1fKB", audioPath.lastPathComponent,
+                  [[[NSFileManager defaultManager] attributesOfItemAtPath:audioPath error:nil][NSFileSize] unsignedLongLongValue] / 1024.0);
             // 文件指纹保护：目标文件若已被改动（典型：路径被新录音复用），绝不安装，
             // 否则会 removeItem + copy 把别人/新录音的文件物理替换掉
             if (![weakSelf.inFlightStamp isEqualToString:[weakSelf fileStampForPath:path]]) {
+                SLLog(@"安装放弃：文件已被改动 %@", path.lastPathComponent);
                 [weakSelf finishPipelineOk:NO path:path message:@"录音文件已被改动，保留原声"];
                 return;
             }
@@ -493,6 +502,7 @@ static void AWECAWalkHideStatusDots(UIView *v, BOOL hide) {
                 if (installed) {
                     [weakSelf finishPipelineOk:YES path:path message:@"已转换为所选音色"];
                 } else {
+                    SLLog(@"安装失败：写不进 %@", path.lastPathComponent);
                     [weakSelf finishPipelineOk:NO path:path message:@"写入失败，已保留原声"];
                 }
             }];
@@ -539,7 +549,9 @@ static void AWECAWalkHideStatusDots(UIView *v, BOOL hide) {
 
 - (void)recognizeAudioAtPath:(NSString *)path completion:(void(^)(NSString *text, NSString *error))completion {
     NSString *wavPath = [path stringByAppendingString:@".aweca.wav"];
+    SLLog(@"ASR begin src=%@", path.lastPathComponent);
     [AWECAUtils convertAudioAtPath:path toWAV16kPath:wavPath completion:^(BOOL success, NSError *error) {
+        if (!success) SLLog(@"ASR 转 16k wav 失败（改用原文件）: %@", error.localizedDescription ?: @"?");
         NSString *sendPath = success ? wavPath : path;
         [self uploadThenRecognizeAtPath:sendPath completion:^(NSString *text, NSString *err) {
             [[NSFileManager defaultManager] removeItemAtPath:wavPath error:nil];

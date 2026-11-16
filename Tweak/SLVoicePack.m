@@ -2,6 +2,8 @@
 
 #import "SLVoicePack.h"
 #import "AWECAUtils.h"
+#import "AWECAAudioReplacer.h"
+#import "SLEntry.h"
 #import "SLAMREncoder.h"
 #import "SLLog.h"
 
@@ -422,6 +424,92 @@ static SLArmedSource sSLArmedSource = SLArmedSourceNone;
     if (rel.length) [d setObject:rel forKey:kSLPackSelKey];
     else [d removeObjectForKey:kSLPackSelKey];
     [d synchronize];
+}
+
+#pragma mark - 抖音：装进替换槽
+
+// 转好的 m4a 放在 voicepacks/_m4a 下，键 = 相对路径 + 修改时间。
+// 同一个包重复点不会反复转码；包被裁掉/替换后 mtime 变了，自然换一份新的。
++ (NSString *)sl_m4aCachePathForPack:(NSDictionary *)pack source:(NSString *)src {
+    NSString *dir = [[self rootDir] stringByAppendingPathComponent:@"_m4a"];
+    NSFileManager *fm = [NSFileManager defaultManager];
+    if (![fm fileExistsAtPath:dir]) {
+        [fm createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:nil];
+    }
+    NSDictionary *attr = [fm attributesOfItemAtPath:src error:nil];
+    // 不用 attr.fileModificationDate 这个分类属性：它标了 deprecated，
+    // 工程开着 -Werror，CI 上会直接编译失败。
+    NSTimeInterval mtime = [(NSDate *)attr[NSFileModificationDate] timeIntervalSince1970];
+    NSString *rel = pack[@"rel"] ?: src.lastPathComponent;
+    NSString *key = [AWECAUtils sanitizeFilename:rel maxLength:64];
+    return [dir stringByAppendingPathComponent:
+            [NSString stringWithFormat:@"%@_%.0f.m4a", key, mtime]];
+}
+
++ (void)armPack:(NSDictionary *)pack completion:(void (^)(BOOL ok))completion {
+    NSString *path = [self pathOfPack:pack];
+    NSFileManager *fm = [NSFileManager defaultManager];
+    if (!path.length || ![fm fileExistsAtPath:path]) {
+        SLLog(@"ARM pack 失败：文件不在 %@", path ?: @"(nil)");
+        if (completion) completion(NO);
+        return;
+    }
+
+    void (^apply)(NSString *) = ^(NSString *ready) {
+        AWECAAudioReplacer *r = [AWECAAudioReplacer shared];
+        r.replacementAudioPath = ready;
+        r.ttsAudioPath = nil;        // 同一个槽位，合成音让位
+        r.enabled = YES;
+        [r saveState];
+
+        [self selectPack:pack];
+        [self setEnabled:YES];
+        sSLOneShotPending = YES;
+        sSLArmedSource = SLArmedSourcePack;
+        SLRefreshFloatButton();      // 球立刻变绿 + 胶囊名字换成包名
+
+        unsigned long long sz = [[fm attributesOfItemAtPath:ready error:nil][NSFileSize] unsignedLongLongValue];
+        SLLog(@"ARM pack ok name=%@ file=%@ %.1fKB", pack[@"name"] ?: @"-",
+              ready.lastPathComponent, sz / 1024.0);
+        if (completion) completion(YES);
+    };
+
+    if ([path.pathExtension.lowercaseString isEqualToString:@"m4a"]) {
+        apply(path);
+        return;
+    }
+
+    NSString *cache = [self sl_m4aCachePathForPack:pack source:path];
+    if ([fm fileExistsAtPath:cache] &&
+        [[fm attributesOfItemAtPath:cache error:nil][NSFileSize] unsignedLongLongValue] > 0) {
+        apply(cache);
+        return;
+    }
+
+    SLLog(@"ARM pack 转码 %@ -> m4a", path.lastPathComponent);
+    [[NSFileManager defaultManager] removeItemAtPath:cache error:nil];
+    [AWECAUtils convertAudioAtPath:path toOutputPath:cache completion:^(BOOL success, NSError *error) {
+        if (success && [[NSFileManager defaultManager] fileExistsAtPath:cache]) {
+            apply(cache);
+            return;
+        }
+        // 转码失败也别把这一发吞掉：原文件直接用，最多是容器头对不上，
+        // 总好过「点了没反应」。日志里留一条，真放不出来时能对上因。
+        SLLog(@"ARM pack 转码失败(%@)，直接用原文件 %@", error.localizedDescription ?: @"?", path.lastPathComponent);
+        apply(path);
+    }];
+}
+
++ (void)disarmArmedAudio {
+    sSLOneShotPending = NO;
+    sSLArmedSource = SLArmedSourceNone;
+    AWECAAudioReplacer *r = [AWECAAudioReplacer shared];
+    r.enabled = NO;
+    r.replacementAudioPath = nil;
+    r.ttsAudioPath = nil;
+    [r saveState];
+    SLRefreshFloatButton();
+    SLLog(@"ARM cleared -> 原声");
 }
 
 #pragma mark - 索引维护

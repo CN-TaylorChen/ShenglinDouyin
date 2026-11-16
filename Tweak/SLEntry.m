@@ -3,6 +3,7 @@
 #import "SLVoicePackController.h"
 #import "SLVoicePack.h"
 #import "AWECAUtils.h"
+#import "AWECAAudioReplacer.h"
 #import "AWECATTSManager.h"
 #import "SLLog.h"
 #import "SLGlass.h"
@@ -327,11 +328,16 @@ static UIImage *SLTransparentImage(void) {
 /// v0.4.82：合成状态直接长在胶囊里（取代 v0.4.81 的独立进度卡片）
 - (void)sl_ttsBegin:(NSString *)title limit:(NSTimeInterval)limit cancel:(void (^)(void))cancelBlock;
 - (void)sl_ttsPhase:(NSString *)title;
-/// v0.5.x：替换完成后的「已替换 · 试听」态。点了播音频，右端按钮是「重来」。
-- (void)sl_ttsEnd:(BOOL)success failText:(NSString *)failText audition:(NSString *)auditionPath retry:(void (^)(void))retryBlock;
+/// 结论落定：成功 → 直接收球；失败 → 原地转红停一会儿，右端给「重试」。
+/// v0.5.x：试听态整段删掉 —— 抖音评论语音松手就上传，替换后再听只是"事后的录音"，
+/// 点开也改变不了已经发出去的那条，留着只会让人以为还能改。
+- (void)sl_ttsEnd:(BOOL)success failText:(NSString *)failText retry:(void (^)(void))retryBlock;
 - (void)sl_ttsTapAreaTapped;
-- (void)sl_ttsAuditionPlay;
-- (void)sl_ttsAuditionReset;
+/// 取消（对勾右边那个叉）：立刻收球，球按「槽位里还有没有装填」落定成绿 / 灰。
+/// 原来取消走的是「失败态红胶囊」，收完之后没人把蓝刷回来 —— 球就一直挂在合成蓝上。
+- (void)sl_ttsAbort;
+/// 收球之后重算颜色：装了东西 → 绿，什么都没装 → 灰。
+- (void)sl_settleState;
 /// v0.4.85：合成还没出结论。SLFloatSetState 拿它当闸门，合成中不接受「回灰」。
 - (BOOL)sl_ttsBusy;
 - (void)sl_ttsReveal;
@@ -586,12 +592,9 @@ static UIImage *SLTransparentImage(void) {
     NSTimer *_ttsTimer;
     CFTimeInterval _ttsStart;
     NSTimeInterval _ttsLimit;
-    NSInteger _ttsPhase;         // 0 = 关闭 / 1 = 合成中 / 2 = 失败提示中 / 3 = 已替换（可试听）
-    // v0.5.x：替换完成后停在胶囊上的那一发音频，点胶囊即播。
-    // 抖音评论语音是「松手就上传」，用户根本听不到换成了什么，这个入口是唯一的回听机会。
-    NSString *_ttsAuditionPath;
-    // v0.4.85：胶囊是否已经铺开。合成开始后的前 3 秒不铺 —— 火山 1.2 秒就完了，
-    // 立刻铺开等于「刚展开就收起」，那一下蓝球根本看不见，球形状态白设计。
+    NSInteger _ttsPhase;         // 0 = 关闭 / 1 = 合成中 / 2 = 失败提示中
+    // v0.4.85：胶囊是否已经铺开。v0.5.x 起合成一开始就铺开（用户要的是「合成的时候就看到它在做事」），
+    // 所以这个标记现在只表示「当前铺开的形变是为了合成态」，不再是延迟展开的开关。
     BOOL _ttsShown;
     void (^_ttsCancelBlock)(void);
     void (^_ttsRetryBlock)(void);
@@ -1673,25 +1676,16 @@ static UIImage *SLTransparentImage(void) {
     _ttsTapArea.frame = b;
 }
 
-// v0.4.85：合成开始后多久才把胶囊铺开。
-// 火山实测 1.2 秒就完了，立刻铺开等于「刚展开就收起」，蓝球根本看不见；
-// Fish 慢的时候 3~12 秒，超过这个点才值得把进度条和取消键亮出来。
-// 定 3.0：快的全程只有球，慢的才等到胶囊。
-static const NSTimeInterval kSLTTSRevealDelay = 3.0;
-
 - (void)sl_ttsBegin:(NSString *)title limit:(NSTimeInterval)limit cancel:(void (^)(void))cancelBlock {
-    // v0.4.88：正在开着胶囊时（从失败态点「重试」）不能再走 `_ttsShown = NO` 那条路。
-    // 那一刻 sl_pillSize 会按 phase 回到 146，形变 + 再展开 = 胶囊先缩一下又长回来，
-    // 宽度其实一直是 196，肉眼看到的却是闪。直接沿用「已铺开」状态，一次形变都不做。
-    BOOL stayOpen = self.slExpanded;
-
     _ttsPhase = 1;
-    _ttsShown = stayOpen;   // v0.4.85：先当球，等 3 秒还没完再铺开；重试时保持铺开
+    // v0.5.x：合成一开始就铺开（原来是「先当 3 秒球，卡住了再展开」）。
+    // 用户的反馈很直接：「合成的时候胶囊自动展开」—— 转圈的那三秒他看不见在干什么，
+    // 只看到一颗蓝球，还会以为点空了。现在一律立刻铺，膨胀动画本来就 0.26s，不吵。
+    _ttsShown = NO;
     _ttsLimit = (limit > 1.0) ? limit : 30.0;
     _ttsStart = CACurrentMediaTime();
     _ttsCancelBlock = [cancelBlock copy];
     _ttsRetryBlock = nil;
-    _ttsAuditionPath = nil;   // 新一发开始，上一发的试听文件立刻作废
 
     _ttsTitle.text = title.length ? title : @"合成中";
     _ttsTitle.textColor = [UIColor labelColor];
@@ -1713,27 +1707,9 @@ static const NSTimeInterval kSLTTSRevealDelay = 3.0;
                                                userInfo:nil
                                                 repeats:YES];
 
-    // v0.4.85：延迟展开（3.0s）。这之前只有球在转 —— 合成够快的话用户只会看到
-    // 「蓝球转一下 → 绿」，胶囊全程不出现；真卡住了才把进度条和取消键铺出来。
-    // 例外：从失败态点「重试」时胶囊本来就开着，不能等 3 秒，也不能缩一次再长回来。
+    // v0.5.x：不再延迟展开。立刻铺成 196pt 胶囊，内容在形变走完后淡入（见 sl_ttsReveal）。
     [NSObject cancelPreviousPerformRequestsWithTarget:self selector:@selector(sl_ttsReveal) object:nil];
-    if (stayOpen) {
-        // 重试：胶囊本来开着，没有形变要等，直接让内容淡回来
-        _ttsTitle.hidden = NO;
-        _ttsSub.hidden = NO;
-        _ttsTrack.hidden = NO;
-        _ttsCancel.hidden = NO;
-        _ttsStroke.hidden = YES;
-        _ttsTitle.alpha = 0.0;
-        _ttsSub.alpha = 0.0;
-        _ttsTrack.alpha = 0.0;
-        _ttsCancel.alpha = 0.0;
-        [self sl_resizePillForName];
-        [self setNeedsLayout];
-        [self sl_ttsFadeInContentAfter:0.0];
-    } else {
-        [self performSelector:@selector(sl_ttsReveal) withObject:nil afterDelay:kSLTTSRevealDelay];
-    }
+    [self sl_ttsReveal];
     [self setNeedsLayout];
 }
 
@@ -1825,18 +1801,18 @@ static const NSTimeInterval kSLTTSRevealDelay = 3.0;
     _ttsFill.frame = CGRectMake(0, 0, tw * p, 2.0);
 }
 
-- (void)sl_ttsEnd:(BOOL)success failText:(NSString *)failText audition:(NSString *)auditionPath retry:(void (^)(void))retryBlock {
+- (void)sl_ttsEnd:(BOOL)success failText:(NSString *)failText retry:(void (^)(void))retryBlock {
     [_ttsTimer invalidate];
     _ttsTimer = nil;
 
     if (!success && failText.length) {
         // 失败：原地转红停 2.6s，不走「先收球再弹一下」那条路 —— 收球会把提示也一起收掉。
         _ttsPhase = 2;
-        // v0.4.85：合成没撑到 3 秒就失败（网络直接 401 之类）时胶囊还没铺开，
+        // 合成没撑到一秒就失败（网络直接 401 之类）时胶囊还没铺开，
         // 这里必须立刻铺 —— 否则红字提示根本没地方显示，用户只看到球闪了一下。
         _ttsShown = YES;
         _ttsRetryBlock = [retryBlock copy];
-        // v0.4.88：调用方传的是「合成失败 · 网络错误」一整串，17 个字挤在 84pt 里必然截断。
+        // 调用方传的是「合成失败 · 网络错误」一整串，17 个字挤在 84pt 里必然截断。
         // 这里按「 · 」拆成两行：标题只留结论，原因挪到副标。拆不开就整串当标题、副标空着。
         NSString *title = failText;
         NSString *detail = nil;
@@ -1850,7 +1826,7 @@ static const NSTimeInterval kSLTTSRevealDelay = 3.0;
         _ttsSub.textColor = [UIColor secondaryLabelColor];
         _ttsSub.text = detail;   // 没原因就不显示，别再填「已放回输入框」这种废话
         _ttsFill.backgroundColor = [UIColor systemRedColor];
-        // v0.4.89：先复位 alpha / transform（可能正卡在淡入中途），再按失败态摆出来 ——
+        // 先复位 alpha / transform（可能正卡在淡入中途），再按失败态摆出来 ——
         // 否则红字会以半透明或带 3pt 位移的样子停在那里。
         [self sl_ttsHideContent];
         _ttsTitle.hidden = NO;
@@ -1869,36 +1845,9 @@ static const NSTimeInterval kSLTTSRevealDelay = 3.0;
         return;
     }
 
-    // 成功且手里有可播的文件 → 停在「已替换」态 4 秒：
-    // 点胶囊播一遍，点右端「重来」再合成一次。抖音评论语音松手即上传，
-    // 用户没有「发之前听一下」的机会，这里是唯一的回听入口。
-    if (success && auditionPath.length &&
-        [[NSFileManager defaultManager] fileExistsAtPath:auditionPath]) {
-        _ttsPhase = 3;
-        _ttsAuditionPath = [auditionPath copy];
-        _ttsRetryBlock = [retryBlock copy];
-        _ttsShown = YES;
-        [self sl_ttsHideContent];
-        _ttsTitle.hidden = NO;
-        _ttsTitle.text = @"已替换";
-        _ttsTitle.textColor = [UIColor labelColor];
-        _ttsSub.hidden = NO;
-        _ttsSub.text = @"点这里试听";
-        _ttsSub.textColor = [UIColor secondaryLabelColor];
-        _ttsTrack.hidden = NO;
-        _ttsFill.backgroundColor = [UIColor systemGreenColor];
-        [_ttsCancel setTitle:@"重来" forState:UIControlStateNormal];
-        _ttsCancel.hidden = NO;
-        _ttsStroke.hidden = YES;
-        _ttsTapArea.hidden = NO;      // 整条胶囊可点 = 试听
-        if (!self.slExpanded) [self sl_expand:YES animated:YES];
-        [self setNeedsLayout];
-
-        [NSObject cancelPreviousPerformRequestsWithTarget:self selector:@selector(sl_ttsAutoCollapse) object:nil];
-        [self performSelector:@selector(sl_ttsAutoCollapse) withObject:nil afterDelay:4.0];
-        return;
-    }
-
+    // 成功：直接收球，颜色由 sl_settleState 按「槽位里还有没有东西」定（绿 / 灰）。
+    // v0.5.x：原来这里还会停在「已替换 · 点这里试听」4 秒 —— 抖音松手就上传了，
+    // 听完也改不了已经发出去的那条，纯属给人一个假入口，删掉。
     [self sl_ttsAutoCollapse];
 }
 
@@ -1913,8 +1862,6 @@ static const NSTimeInterval kSLTTSRevealDelay = 3.0;
     // 叠成一团（用户第二张截图里三个词组同时可见）。挪到 sl_ttsCollapseShape，和收缩同帧清。
     _ttsCancelBlock = nil;
     _ttsRetryBlock = nil;
-    _ttsAuditionPath = nil;
-    [NSObject cancelPreviousPerformRequestsWithTarget:self selector:@selector(sl_ttsAuditionReset) object:nil];
     // v0.4.89：先让内容跟着一起收（0.08s 淡出），再走 0.18s 的收缩形变。
     // 原来内容是一帧消失、胶囊一帧缩回，两件事同时硬切。现在至少有个「收」的过程。
     for (UIView *v in @[_ttsTitle, _ttsSub, _ttsTrack, _ttsCancel]) {
@@ -1940,6 +1887,12 @@ static const NSTimeInterval kSLTTSRevealDelay = 3.0;
     // showChrome 已经是假，名字不会冒出来。
     _ttsShown = NO;
     [self sl_expand:NO animated:YES];
+
+    // v0.5.x：收完球再落定颜色。放在形变之后（0.18s 收缩 + 一点余量）——
+    // 形变期间改颜色会连宽度一起重算，收缩动画会被打断成一次跳变。
+    // 这一步是「点叉之后球还挂在蓝上」的收尾：合成态被闸门锁着，只有这里能把颜色还回去。
+    [NSObject cancelPreviousPerformRequestsWithTarget:self selector:@selector(sl_settleState) object:nil];
+    [self performSelector:@selector(sl_settleState) withObject:nil afterDelay:0.32];
 }
 
 /// v0.4.89：给淡出留出 0.08s，再把控件真正藏起来（否则 hidden 会立刻掐掉正在跑的淡出）。
@@ -1953,39 +1906,22 @@ static const NSTimeInterval kSLTTSRevealDelay = 3.0;
 - (void)sl_ttsBtnTapped {
     if (_ttsPhase == 1) [self sl_ttsCancelTapped];
     else if (_ttsPhase == 2) [self sl_ttsRetryTapped];
-    else if (_ttsPhase == 3) [self sl_ttsRetryTapped];   // 「重来」和失败态的重试同一条路
 }
 
-/// 整条胶囊的点击：合成失败时=重试，替换完成后=试听。
+/// 整条胶囊的点击：只在失败态有意义（点一下重试）。
 - (void)sl_ttsTapAreaTapped {
-    if (_ttsPhase == 3) { [self sl_ttsAuditionPlay]; return; }
     [self sl_ttsRetryTapped];
 }
 
-- (void)sl_ttsAuditionPlay {
-    if (!_ttsAuditionPath.length) return;
-    if (![[NSFileManager defaultManager] fileExistsAtPath:_ttsAuditionPath]) {
-        _ttsSub.text = @"文件已不在";
-        return;
-    }
-    [[AWECATTSManager shared] playAudioAtPath:_ttsAuditionPath];
-    _ttsSub.text = @"播放中…";
-
-    NSTimeInterval dur = [AWECAUtils audioDurationAtPath:_ttsAuditionPath];
-    if (dur < 0.4) dur = 1.2;   // 时长读不出来时给个兜底，别让「播放中」一直挂着
-
-    [NSObject cancelPreviousPerformRequestsWithTarget:self selector:@selector(sl_ttsAuditionReset) object:nil];
-    [self performSelector:@selector(sl_ttsAuditionReset) withObject:nil afterDelay:dur + 0.15];
-
-    // 播放期间别被 4 秒的自动收起打断
+/// 取消：立刻收球，不等那 2.6 秒的失败态 —— 用户点的是叉，不是"看看结果"。
+/// v0.5.x：以前取消走的是 `SLFloatTTSEnd(NO, …)`，胶囊红字停 2.6 秒再收，
+/// 收完之后没有任何人把颜色刷回来，球就一直挂在合成蓝上（用户：「点叉后还是蓝色」）。
+- (void)sl_ttsAbort {
     [NSObject cancelPreviousPerformRequestsWithTarget:self selector:@selector(sl_ttsAutoCollapse) object:nil];
-    [self performSelector:@selector(sl_ttsAutoCollapse) withObject:nil afterDelay:dur + 2.0];
-}
-
-- (void)sl_ttsAuditionReset {
-    if (_ttsPhase != 3) return;
-    _ttsSub.text = @"点这里试听";
-    [self setNeedsLayout];
+    _ttsPhase = 0;
+    _ttsCancelBlock = nil;
+    _ttsRetryBlock = nil;
+    [self sl_ttsAutoCollapse];
 }
 
 - (void)sl_ttsCancelTapped {
@@ -1996,8 +1932,22 @@ static const NSTimeInterval kSLTTSRevealDelay = 3.0;
     if (cb) cb();
 }
 
+/// 收球之后重算颜色：槽位里有东西 → 绿（Ready），没有 → 灰（Idle）。
+/// 合成期间 SLFloatSetState 被闸门拦着，任何"顺手刷一下"的调用都进不来，
+/// 所以这里必须自己落定一次；否则蓝球会一直亮着，直到下一次录音。
+/// 只在「当前还是合成蓝」时动手 —— 红（录音）/ 绿（刚替换成功）都是别人刚给的结论，
+/// 抢过来改会把"成功了"刷成灰的。
+- (void)sl_settleState {
+    if ([self sl_ttsBusy]) return;
+    if (self.slState != SLFloatStateSynthesizing) return;
+    AWECAAudioReplacer *r = [AWECAAudioReplacer shared];
+    BOOL armed = [SLVoicePack isOneShotPending] && r.enabled && r.replacementAudioPath.length;
+    [self sl_applyState:(armed ? SLFloatStateReady : SLFloatStateIdle)];
+    SLLog(@"capsule settle -> %@", armed ? @"ready(green)" : @"idle(grey)");
+}
+
 - (void)sl_ttsRetryTapped {
-    if (_ttsPhase != 2 && _ttsPhase != 3) return;
+    if (_ttsPhase != 2) return;
     void (^rb)(void) = _ttsRetryBlock;
     _ttsRetryBlock = nil;
     // 不先收球：原地退回「合成中」再由 sl_ttsBegin 重铺。收球再展开会缩一下又长回来，
@@ -2787,22 +2737,23 @@ static NSMutableSet<NSString *> *SLExpandedFolderSet(void) {
     BOOL on = [SLVoicePack isOneShotPending] && [SLVoicePack isPackActive:pack];
     if (on) {
         // 再点一次已装好的那条 = 撤销这一发，回到原声（不用发出去消耗掉）
-        [SLVoicePack setOneShotPending:NO];
-        SLClearArmedAudio();
+        [SLVoicePack disarmArmedAudio];
         [AWECAUtils showToast:@"已切回原声" duration:1.5];
         SLLog(@"one-shot cancelled by re-tap");
     } else {
-        [SLVoicePack selectPack:pack];
-        [SLVoicePack setOneShotPending:YES];
-        [SLVoicePack setArmedSource:SLArmedSourcePack];
-        [SLVoicePack setEnabled:YES];
-        // v0.4.41：槽位只有一个 —— 之前用 #tts 合成的音必须在这里让位，
-        // 否则会出现「明明选了包，发出去却是刚才那段合成音」。
-        SLClearArmedAudio();
+        // v0.5.x：装填必须落到 AWECAAudioReplacer 上（路径 + enabled）。
+        // 以前这里只置了 one-shot 标记，录音结束判定「没装填」→ 走了 ASR+TTS，
+        // 用户看到的就是「选了包，发出去还是 AI 音色」。
+        [SLVoicePack armPack:pack completion:^(BOOL ok) {
+            if (!ok) {
+                [AWECAUtils showToast:@"这个包的文件不在了，重新导入一次" duration:2.2];
+                return;
+            }
+            [AWECAUtils showToast:[NSString stringWithFormat:@"已装好「%@」· 下一条语音发它", pack[@"name"] ?: @""]
+                         duration:1.8];
+            SLLog(@"one-shot armed %@", pack[@"name"] ?: @"-");
+        }];
         SLPackPrewarm();
-        [AWECAUtils showToast:[NSString stringWithFormat:@"已装好「%@」· 下一条语音发它", pack[@"name"] ?: @""]
-                     duration:1.8];
-        SLLog(@"one-shot armed %@", pack[@"name"] ?: @"-");
     }
     SLRefreshFloatButton();
     [self sl_dismiss];
@@ -3324,12 +3275,10 @@ void SLFloatTTSPhase(NSString *title) {
     else dispatch_async(dispatch_get_main_queue(), work);
 }
 
-void SLFloatTTSEndWithAudition(BOOL success, NSString *failText, NSString *auditionPath, void (^retryBlock)(void)) {
-    // v0.4.87：同样改成「主线程就直接跑」。
-    // 原来无条件 dispatch_async，而 Tweak.x 里「先 SLFloatTTSEnd 再 SLFloatSetState(Idle)」
-    // 是同步连着写的 —— Idle 抢在 TTSEnd 前面执行，那一刻相位还是 1，被闸门拦掉，
-    // 结果球停在蓝、胶囊却在报失败（日志 17:26:30 tts timeout 之后紧跟的那行
-    // 「idle suppressed」就是它）。改顺序没用，得让 TTSEnd 真的先落地。
+void SLFloatTTSEnd(BOOL success, NSString *failText, void (^retryBlock)(void)) {
+    // v0.4.87：改成「主线程就直接跑」。原来无条件 dispatch_async，
+    // 而调用方「先 SLFloatTTSEnd 再 SLFloatSetState(Idle)」是同步连着写的 ——
+    // Idle 抢在前面执行，那一刻相位还是 1，被闸门拦掉，结果球停在蓝、胶囊却在报失败。
     void (^work)(void) = ^{
         SLFloatButton *btn = sSLFloatBtn;
         if (!btn) {
@@ -3337,14 +3286,24 @@ void SLFloatTTSEndWithAudition(BOOL success, NSString *failText, NSString *audit
             btn = (SLFloatButton *)[w viewWithTag:SLBtnTag];
         }
         if (!btn) return;
-        [btn sl_ttsEnd:success failText:failText audition:auditionPath retry:retryBlock];
+        [btn sl_ttsEnd:success failText:failText retry:retryBlock];
     };
     if ([NSThread isMainThread]) work();
     else dispatch_async(dispatch_get_main_queue(), work);
 }
 
-void SLFloatTTSEnd(BOOL success, NSString *failText, void (^retryBlock)(void)) {
-    SLFloatTTSEndWithAudition(success, failText, nil, retryBlock);
+void SLFloatTTSAbort(NSString *hint) {
+    void (^work)(void) = ^{
+        SLFloatButton *btn = sSLFloatBtn;
+        if (!btn) {
+            UIWindow *w = SLKeyWindow();
+            btn = (SLFloatButton *)[w viewWithTag:SLBtnTag];
+        }
+        if (btn) [btn sl_ttsAbort];
+        if (hint.length) [AWECAUtils showToast:hint duration:1.6];
+    };
+    if ([NSThread isMainThread]) work();
+    else dispatch_async(dispatch_get_main_queue(), work);
 }
 
 // 把中心点夹在「不会被屏幕边缘切掉」的范围内。

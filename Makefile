@@ -23,7 +23,6 @@ ShenglinDouyin_FILES = Tweak/Tweak.x \
 	Tweak/SLVoicePack.m \
 	Tweak/SLVoicePackController.m \
 	Tweak/SLVoiceImportController.m \
-	Tweak/SLTTSAuditionPanel.m \
 	Tweak/SLTTSComposeController.m \
 	Tweak/AWECAUtils.m \
 	Tweak/AWECATTSManager.m \

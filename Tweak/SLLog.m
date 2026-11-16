@@ -3,31 +3,61 @@
 #define SL_LOG_MAX_BYTES  (1024 * 1024)
 #define SL_LOG_KEEP_BYTES (512 * 1024)
 
+// 真的往这个路径写一次，然后把字节数读回来核对。
+// 为什么不能只信 isWritableFileAtPath / createFileAtPath：
+// 插件跑在抖音自己的沙盒进程里，/var/mobile/Documents 这类"越狱可见"的路径
+// 建文件可能返回成功，随后 writeData 全丢（或干脆抛异常被吞）。日志页于是永远空白，
+// 而代码看上是"写成功"的 —— 用户说的「日志功能好像没用」就是这一条。
+static BOOL SLLogProbe(NSString *path) {
+    NSFileManager *fm = [NSFileManager defaultManager];
+    NSString *dir = [path stringByDeletingLastPathComponent];
+    if (![fm fileExistsAtPath:dir]) {
+        [fm createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:nil];
+    }
+    if (![fm fileExistsAtPath:path]) {
+        if (![fm createFileAtPath:path contents:nil attributes:nil]) return NO;
+    }
+    NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:path];
+    if (!fh) return NO;
+
+    BOOL ok = NO;
+    @try {
+        unsigned long long before = [fh seekToEndOfFile];
+        NSData *probe = [@"\n" dataUsingEncoding:NSUTF8StringEncoding];
+        [fh writeData:probe];
+        [fh synchronizeFile];
+        [fh closeFile];
+        unsigned long long after =
+            [[fm attributesOfItemAtPath:path error:nil][NSFileSize] unsignedLongLongValue];
+        ok = (after >= before + probe.length);
+    } @catch (NSException *e) {
+        ok = NO;
+    }
+    return ok;
+}
+
 static NSString *SLLogPath(void) {
     static NSString *p = nil;
     static dispatch_once_t once;
     dispatch_once(&once, ^{
-        NSFileManager *fm = [NSFileManager defaultManager];
+        // 只放两个候选：根目录 /var/mobile（有越狱权限时，Filza 直接能看）、
+        // rootless 的 /var/jb。App 自己的沙盒永远可写，作为最后一档兜底。
         NSArray<NSString *> *cands = @[
             @"/var/mobile/Documents/ShenglinDouyin/slmomo.log",
             @"/var/jb/var/mobile/Documents/ShenglinDouyin/slmomo.log"
         ];
         for (NSString *c in cands) {
-            NSString *dir = [c stringByDeletingLastPathComponent];
-            if (![fm fileExistsAtPath:dir]) {
-                [fm createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:nil];
-            }
-            if (![fm fileExistsAtPath:c]) [fm createFileAtPath:c contents:nil attributes:nil];
-            if ([fm isWritableFileAtPath:c]) { p = c; break; }
+            if (SLLogProbe(c)) { p = c; break; }
         }
         if (!p) {
             NSString *doc = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject];
             NSString *dir = [doc stringByAppendingPathComponent:@"ShenglinDouyin"];
-            if (![fm fileExistsAtPath:dir]) {
-                [fm createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:nil];
-            }
-            p = [dir stringByAppendingPathComponent:@"slmomo.log"];
-            if (![fm fileExistsAtPath:p]) [fm createFileAtPath:p contents:nil attributes:nil];
+            NSString *fallback = [dir stringByAppendingPathComponent:@"slmomo.log"];
+            if (SLLogProbe(fallback)) p = fallback;
+        }
+        if (!p) {
+            // 三个都写不进去：日志页会显示「(不可写)」，至少不是静默失败
+            p = @"";
         }
     });
     return p;
@@ -60,6 +90,8 @@ void SLLogWrite(NSString *line) {
                 [fh seekToEndOfFile];
                 [fh writeData:[full dataUsingEncoding:NSUTF8StringEncoding]];
                 unsigned long long end = [fh offsetInFile];
+                // 写完就落盘：日志是给"出问题之后"看的，进程被系统杀掉时缓存里的内容全丢
+                [fh synchronizeFile];
                 [fh closeFile];
                 if (end > SL_LOG_MAX_BYTES) {
                     NSData *d = [NSData dataWithContentsOfFile:path];

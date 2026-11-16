@@ -18,14 +18,14 @@ void SLRaiseFloatButton(void);
 UIImage *SLBrandIconImage(CGFloat side);
 UIImage *SLBrandIconImageTinted(CGFloat side, UIColor *bg);
 
-// v0.4.34：悬浮球三态。录音红 / 合成蓝 / 就绪蓝常亮（直到语音真正发出去）。
+// v0.4.34：悬浮球三态。录音红 / 合成蓝 / 就绪绿（直到语音真正发出去）。
 // v0.4.36：就绪不再自动回空闲；Ready → Idle 的切换会外扩一圈涟漪。
 // Tweak.x 只在钩子里调这个，界面细节全部留在 SLEntry.m。
 typedef NS_ENUM(NSInteger, SLFloatState) {
-    SLFloatStateIdle = 0,
-    SLFloatStateRecording = 1,
-    SLFloatStateSynthesizing = 2,
-    SLFloatStateReady = 3,
+    SLFloatStateIdle = 0,          // 灰：槽位空，原声
+    SLFloatStateRecording = 1,     // 红：正在录
+    SLFloatStateSynthesizing = 2,  // 蓝：识别 / 合成中
+    SLFloatStateReady = 3,         // 绿：槽位里装好了东西
 };
 void SLFloatSetState(SLFloatState state);
 
@@ -44,15 +44,17 @@ void SLFloatTTSBegin(NSTimeInterval limitSec, void (^cancelBlock)(void));
 void SLFloatTTSBeginWithTitle(NSString *title, NSTimeInterval limitSec, void (^cancelBlock)(void));
 void SLFloatTTSPhase(NSString *title);
 
-// success=YES：0.2s 收起回绿球，不弹任何提示。
-// success=NO ：胶囊原地转红，主行 failText、副行「口令已放回输入框」，停 2.2s 收球；
-//              期间点胶囊会执行 retryBlock（重来一次合成），用户不用重打口令。
+// success=YES：0.2s 收起回球，不弹任何提示。
+// success=NO ：胶囊原地转红，主行 failText、副行原因，停 2.6s 收球；
+//              期间点胶囊 / 右端「重试」会执行 retryBlock（重来一次合成）。
 void SLFloatTTSEnd(BOOL success, NSString *failText, void (^retryBlock)(void));
 
-// success=YES 且给了 auditionPath（刚写回的那条音频）时，胶囊不停留成一句话就走，
-// 而是转成「已替换 · 点这里试听」并停 4 秒：点胶囊播一遍，点右端「重来」重新合成。
-// 抖音评论语音是松手即上传，用户没有发之前听一次的机会，这是唯一的回听入口。
-void SLFloatTTSEndWithAudition(BOOL success, NSString *failText, NSString *auditionPath, void (^retryBlock)(void));
+// 用户点了胶囊上的「取消」：立刻收球，球按槽位状态落定（装了 → 绿，没装 → 灰），
+// 停在失败态再收会让球挂在合成蓝上。hint 非空时弹一次短 toast。
+void SLFloatTTSAbort(NSString *hint);
+
+// v0.5.x：「合成后先试听」整段删除。抖音评论语音松手即上传，替换后再听只是
+// "事后回放"，改不了已经发出去的那条 —— 留着是假入口。
 
 // v0.4.34：设置 / 语音包都装在浮窗里，内部是子控制器，
 // 点「完成」要先向上找到真正的呈现者，否则 dismiss 自己什么也不会发生。

@@ -6,3 +6,5 @@
 
 // 由 Tweak.x 提供：钩子安装情况摘要
 NSString *SLHookStatusSummary(void);
+// 由 Tweak.x 提供：当前运行态（增强开关 / 槽位内容 / 装填来源 / 文件大小）
+NSString *SLRuntimeStateSummary(void);
