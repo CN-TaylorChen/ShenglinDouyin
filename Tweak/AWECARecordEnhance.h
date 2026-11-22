@@ -60,6 +60,11 @@
 // 该路径是否已是插件自有的临时副本（aweca_im 目录）——是则无需再快照
 + (BOOL)isPluginOwnedPath:(NSString *)path;
 
+// 闸门最终「放行发原声」时收掉 privateBeginForSourcePath 提前起跑的那条流水线。
+// 只在该源正是在飞任务、且没有任何 waiter 在等它的时候动手（有 waiter = 真拦截链路，不能杀）。
+// 不做这件事的话，球会一直挂「合成中」，结束时还弹「已转换为所选音色」——而消息发的其实是原声。
+- (void)abortSpeculativePipelineForSourcePath:(NSString *)sourcePath;
+
 - (BOOL)shouldRunForCommentRecording;
 // 替换槽里是否已经装了一发本地音频（语音包 / 本地文件 / 文字合成）。
 // 装了就走「直接换文件」，绝不再跑 ASR+TTS —— 否则用户选的语音包会被合成结果覆盖，

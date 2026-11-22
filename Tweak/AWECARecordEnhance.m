@@ -232,6 +232,14 @@ static void AWECAWalkHideStatusDots(UIView *v, BOOL hide) {
     AWECAAudioReplacer *r = [AWECAAudioReplacer shared];
     NSString *p = r.replacementAudioPath;
     if (!r.enabled || !p.length) return NO;
+    // v0.5.1：必须认 SLVoicePack 的一次性装填标记，不能只看 replacer.enabled + path。
+    // 旧版本的录音转音色流水线（synthesizeVolcanoPreviewText）会把合成结果塞进槽位，
+    // 只置 enabled/path、不带来源标记；加上 replacer 状态是落盘持久化的，而
+    // oneShotPending 刻意不落盘 —— 于是出现「替换开 + 槽位有文件 + 来源无」的脏槽。
+    // 脏槽让这里误判 YES → 私聊 gate 放行原声（替换失效）、评论区跳过 ASR 合成
+    // （用上一条的合成音直替换本条，表现为「延迟填充」）。只有正规装填
+    // （armPack / SLTTSPageArm 都会置 oneShotPending=YES）才算真的装了一发。
+    if (![SLVoicePack isOneShotPending]) return NO;
     return [[NSFileManager defaultManager] fileExistsAtPath:p];
 }
 
@@ -354,6 +362,22 @@ static void AWECAWalkHideStatusDots(UIView *v, BOOL hide) {
 - (NSString *)snapshotPathForSourcePath:(NSString *)sourcePath {
     if ([AWECARecordEnhance isPluginOwnedPath:sourcePath]) return sourcePath;
     return self.snapMap[sourcePath];
+}
+
+// 闸门放行（这一发要发原声 / 直接换文件）时，把「提前起跑」的那条流水线收掉。
+// 背景：AWECAPrivateNotePath 为了省掉用户在确认面板上干等的几十秒，录音一落盘就起跑
+// 识别+合成。可一旦闸门最终决定不转换（装填了语音包 / 只有脏槽 / 没凭证），这条流水线
+// 就是纯投机：它会继续占着胶囊显示「合成中」，结束后还会弹「已转换为所选音色」，
+// 而真正发出去的其实是原声 —— 用户看到的就是「球一直在合成，原声已经发了」。
+- (void)abortSpeculativePipelineForSourcePath:(NSString *)sourcePath {
+    if (!sourcePath.length || !self.busy) return;
+    if (![self.inFlightSourcePath isEqualToString:sourcePath]) return;
+    // 有 waiter 说明这一发确实在等结果（正常拦截链路），绝不能杀
+    if (self.waiters.count > 0) return;
+    SLLog(@"abort speculative pipeline src=%@", sourcePath.lastPathComponent);
+    [self invalidatePipeline:@"已取消，保留原声"];
+    // 不弹 toast：用户没做错什么，只是这一发走了捷径
+    SLFloatTTSAbort(nil);
 }
 
 - (void)waitForEnhancedPath:(NSString *)path

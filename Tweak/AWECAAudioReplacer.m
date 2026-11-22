@@ -169,6 +169,20 @@
         self.replacementAudioPath = nil;
         [self saveState];
     }
+
+    // v0.5.1：一次性装填不跨进程（SLVoicePack 的 oneShotPending 只在内存里）。
+    // 启动时槽里若还留着 enabled + path，那一定是上一进程没消费掉的残留：
+    //   · 旧版本「录音转音色」的 TTS 结果会被塞进这里（previewOnly:NO），且从不带来源标记；
+    //   · 崩溃 / 被系统杀掉时，正常装填的那一发也来不及消费。
+    // 旧行为是让它一直挂着，状态栏显示「替换 开 · 槽位有文件 · 来源 无」——
+    // 私聊闸门据此误判「已装填」而放行原声（替换永远不生效），评论区则拿上一条的
+    // 合成音直替换本次录音（表现为「合成完还要延迟一会儿才填充」）。
+    // 一次性装填的语义本来就是「发完就没、重启回原声」，这里直接清干净，别留着骗判定。
+    if (self.enabled && self.replacementAudioPath.length) {
+        self.enabled = NO;
+        self.replacementAudioPath = nil;
+        [self saveState];
+    }
     if (self.ttsAudioPath && ![[NSFileManager defaultManager] fileExistsAtPath:self.ttsAudioPath]) {
         self.ttsAudioPath = nil;
         [self saveState];

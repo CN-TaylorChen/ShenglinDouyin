@@ -129,11 +129,13 @@ static NSArray<NSDictionary *> *AWECAJSONObjectsFromData(NSData *data) {
 - (void)synthesizeVolcanoPreviewText:(NSString *)text
                           completion:(void(^)(BOOL success, NSString *audioPath, NSString *error))completion {
     // 流水线统一入口：按引擎分流（录音转音色 ASR 仍走火山，仅 TTS 分流）
-    if (self.fishEngine) {
-        [self synthesizeFishText:text previewOnly:NO completion:completion];
-        return;
-    }
-    [self synthesizeVolcanoV3Text:text previewOnly:YES completion:completion];
+    // v0.5.1：两条分支都必须 previewOnly:YES。这个函数只给「录音转音色流水线」用，
+    // 合成结果由调用方 install 到录音文件；一旦 previewOnly:NO，finishWithAudioData
+    // 会把结果塞进 AWECAAudioReplacer 替换槽（enabled + replacementAudioPath），
+    // 却不带 SLVoicePack 的来源标记 —— 脏槽让 hasArmedLocalAudio 误判为 YES，
+    // 于是私聊 gate 放行原声、评论区跳过合成（表现为「替换没用 / 延迟填充」）。
+    // 真正要装填走的是文本转语音页 → SLPipeline → SLTTSPageArm，与本函数无关。
+    [self synthesizeText:text previewOnly:YES completion:completion];
 }
 
 static int aweca_mapRatioToV3(float ratio, int scale, int lo, int hi) {

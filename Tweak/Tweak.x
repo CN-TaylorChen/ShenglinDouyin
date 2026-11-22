@@ -222,7 +222,9 @@ NSString *SLRuntimeStateSummary(void) {
         return;
     }
 
-    if (success && [AWECAAudioReplacer shared].enabled) {
+    // v0.5.1：认来源标记而非裸 enabled——脏槽（流水线合成残留）不能触发替换，
+    // 否则会拿上一条的合成音盖本次录音，且合成流水线本该跑却被跳过（表现成「延迟填充」）。
+    if (success && [enhance hasArmedLocalAudio]) {
         NSString *recorderURL = self.recorder.url.path;
         // 同上：先换再 %orig，别等原生已经把文件读走
         NSString *target = self.audioFilePath.length ? self.audioFilePath : recorderURL;
@@ -245,7 +247,8 @@ NSString *SLRuntimeStateSummary(void) {
     %orig;
     if (!audioFilePath.length) return;
     if ([[AWECARecordEnhance shared] shouldSkipStickyReplaceForPath:audioFilePath]) return;
-    if (![AWECAAudioReplacer shared].enabled) return;
+    // v0.5.1：认来源标记而非裸 enabled——脏槽（流水线合成残留）不能触发替换
+    if (![[AWECARecordEnhance shared] hasArmedLocalAudio]) return;
     if ([[NSFileManager defaultManager] fileExistsAtPath:audioFilePath]) {
         BOOL done = [[AWECAAudioReplacer shared] replaceAudioAtPath:audioFilePath];
         SLFloatPushResult(done);
@@ -354,6 +357,12 @@ static BOOL AWECAPrivateGate(const char *tag, NSString *path,
     if (path.length) enhance.privateRecordPath = path;
     if (![enhance shouldRunForPrivateRecording]) {
         NSLog(@"AWECA-IM: [%s] passthrough (not eligible)", tag);
+        // 装了本地音频（语音包 / AI 语音）→ 这一发本来就不该转换，只直替换。
+        // 但 NotePath 已经投机起跑了流水线：必须收掉，否则球一直"合成中"、最后还报成功，
+        // 而消息发的是原声（用户：「悬浮球显示合成中，实际上原声已经发送了」）。
+        if ([enhance hasArmedLocalAudio]) {
+            [enhance abortSpeculativePipelineForSourcePath:path];
+        }
         return NO;
     }
 
@@ -672,7 +681,7 @@ static BOOL AWECAPrivateGate(const char *tag, NSString *path,
 - (void)startUploadAudioWithFilePath:(id)filePath {
     NSString *path = (NSString *)filePath;
     BOOL skip = [[AWECARecordEnhance shared] shouldSkipStickyReplaceForPath:path];
-    BOOL on = [AWECAAudioReplacer shared].enabled;
+    BOOL on = [[AWECARecordEnhance shared] hasArmedLocalAudio];   // v0.5.1：认来源标记，脏槽不替换
     BOOL exist = path.length && [[NSFileManager defaultManager] fileExistsAtPath:path];
     SLLog(@"UPLOAD startUpload path=%@ exist=%d replacerOn=%d skip=%d", path.lastPathComponent ?: @"(nil)",
           (int)exist, (int)on, (int)skip);
@@ -686,7 +695,7 @@ static BOOL AWECAPrivateGate(const char *tag, NSString *path,
 - (void)uploadAudioWithFilePath:(id)filePath completion:(id)completion {
     NSString *path = (NSString *)filePath;
     if (![[AWECARecordEnhance shared] shouldSkipStickyReplaceForPath:path] &&
-        [AWECAAudioReplacer shared].enabled && path.length) {
+        [[AWECARecordEnhance shared] hasArmedLocalAudio] && path.length) {
         if ([[NSFileManager defaultManager] fileExistsAtPath:path]) {
             BOOL done = [[AWECAAudioReplacer shared] replaceAudioAtPath:path];
             SLLog(@"UPLOAD uploadAudio 替换 %@ %@", done ? @"ok" : @"失败", path.lastPathComponent);
@@ -698,7 +707,7 @@ static BOOL AWECAPrivateGate(const char *tag, NSString *path,
 - (void)uploadAudioWithFilePath:(id)filePath authCompletion:(id)authCompletion completion:(id)completion {
     NSString *path = (NSString *)filePath;
     if (![[AWECARecordEnhance shared] shouldSkipStickyReplaceForPath:path] &&
-        [AWECAAudioReplacer shared].enabled && path.length) {
+        [[AWECARecordEnhance shared] hasArmedLocalAudio] && path.length) {
         if ([[NSFileManager defaultManager] fileExistsAtPath:path]) {
             BOOL done = [[AWECAAudioReplacer shared] replaceAudioAtPath:path];
             SLLog(@"UPLOAD uploadAudio(auth) 替换 %@ %@", done ? @"ok" : @"失败", path.lastPathComponent);
@@ -729,7 +738,7 @@ static void hook_generateAudioPreviewBubble(id self, SEL _cmd, id recordedModel)
         return;
     }
 
-    if (recordedModel && ![enhance shouldSkipStickyReplaceForPath:audioPath] && [AWECAAudioReplacer shared].enabled) {
+    if (recordedModel && ![enhance shouldSkipStickyReplaceForPath:audioPath] && [enhance hasArmedLocalAudio]) {
         if (audioPath.length > 0 && [[NSFileManager defaultManager] fileExistsAtPath:audioPath]) {
             BOOL ok = [[AWECAAudioReplacer shared] replaceAudioAtPath:audioPath];
             SLLog(@"PREVIEW 气泡前替换 %@ %@", ok ? @"ok" : @"失败", audioPath.lastPathComponent);
