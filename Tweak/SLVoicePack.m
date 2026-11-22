@@ -26,6 +26,47 @@ static BOOL SLIsAudioFile(NSString *path) {
     return [SLAudioExts() containsObject:path.pathExtension.lowercaseString];
 }
 
+// 内部目录（转码缓存等）一律以下划线/点开头，永不进语音包列表。
+// 老版本把转码缓存放在 voicepacks/_m4a，用户看到的就是「语音包里总多一个 m4a 文件夹」。
+static BOOL SLIsInternalDirName(NSString *name) {
+    if (![name isKindOfClass:[NSString class]] || !name.length) return YES;
+    return [name hasPrefix:@"."] || [name hasPrefix:@"_"];
+}
+
+// 历史遗留的缓存目录：清一次就够。
+// 关键：这段必须挂在 rootDir 上。旧实现只在「需要转码」的路径里清理，而绝大多数包
+// 本身就是 m4a（走 apply(path) 直接返回），清理代码根本执行不到 —— 文件夹就一直留着。
+static void SLPurgeLegacyCacheDirs(NSString *root) {
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        NSFileManager *fm = [NSFileManager defaultManager];
+        NSString *docs = [AWECAUtils documentsPath];
+        NSMutableArray<NSString *> *victims = [NSMutableArray array];
+        [victims addObject:[root stringByAppendingPathComponent:@"_m4a"]];
+        [victims addObject:[docs stringByAppendingPathComponent:@"ShenglinDouyin/_m4a_cache"]];
+        for (NSString *item in ([fm contentsOfDirectoryAtPath:root error:nil] ?: @[])) {
+            // 下划线开头的目录一律视为内部残留（旧版缓存），直接清；
+            // 恰好叫 m4a / m4a_cache 的只在空目录时清，避免误删用户导入的素材。
+            NSString *full = [root stringByAppendingPathComponent:item];
+            BOOL isDir = NO;
+            if (![fm fileExistsAtPath:full isDirectory:&isDir] || !isDir) continue;
+            NSString *low = item.lowercaseString;
+            BOOL internalName = [item hasPrefix:@"_"];
+            BOOL legacyName = ([low isEqualToString:@"m4a"] || [low isEqualToString:@"m4a_cache"]);
+            if (internalName || (legacyName && [fm contentsOfDirectoryAtPath:full error:nil].count == 0)) {
+                [victims addObject:full];
+            }
+        }
+        for (NSString *p in victims) {
+            BOOL isDir = NO;
+            if ([fm fileExistsAtPath:p isDirectory:&isDir] && isDir) {
+                [fm removeItemAtPath:p error:nil];
+                SLLog(@"pack cleanup legacy dir %@", p.lastPathComponent);
+            }
+        }
+    });
+}
+
 static NSString *SLSafeName(NSString *name) {
     if (![name isKindOfClass:[NSString class]] || !name.length) return @"未命名";
     NSCharacterSet *bad = [NSCharacterSet characterSetWithCharactersInString:@"/\\:*?\"<>|"];
@@ -88,6 +129,7 @@ static NSString *SLRelOfPath(NSString *path) {
     if (![fm fileExistsAtPath:dir]) {
         [fm createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:nil];
     }
+    SLPurgeLegacyCacheDirs(dir);
     return dir;
 }
 
@@ -128,7 +170,7 @@ static NSString *SLRelOfPath(NSString *path) {
     // 磁盘上的目录（含刚新建、还没放音频的空文件夹）
     NSArray *items = [fm contentsOfDirectoryAtPath:root error:nil] ?: @[];
     for (NSString *item in items) {
-        if ([item hasPrefix:@"."]) continue;
+        if (SLIsInternalDirName(item)) continue;   // 下划线/点开头 = 内部目录，不当成用户文件夹
         BOOL isDir = NO;
         NSString *full = [root stringByAppendingPathComponent:item];
         if ([fm fileExistsAtPath:full isDirectory:&isDir] && isDir) {
@@ -169,7 +211,7 @@ static NSString *SLRelOfPath(NSString *path) {
     void (^scan)(NSString *, NSString *) = ^(NSString *dir, NSString *folder) {
         NSArray *items = [fm contentsOfDirectoryAtPath:dir error:nil] ?: @[];
         for (NSString *item in items) {
-            if ([item hasPrefix:@"."]) continue;
+            if (SLIsInternalDirName(item)) continue;
             NSString *full = [dir stringByAppendingPathComponent:item];
             BOOL isDir = NO;
             if (![fm fileExistsAtPath:full isDirectory:&isDir]) continue;
@@ -190,7 +232,7 @@ static NSString *SLRelOfPath(NSString *path) {
 
     scan(root, @"");
     for (NSString *sub in ([fm contentsOfDirectoryAtPath:root error:nil] ?: @[])) {
-        if ([sub hasPrefix:@"."]) continue;
+        if (SLIsInternalDirName(sub)) continue;
         BOOL isDir = NO;
         if ([fm fileExistsAtPath:[root stringByAppendingPathComponent:sub] isDirectory:&isDir] && isDir) {
             scan([root stringByAppendingPathComponent:sub], sub);
@@ -428,22 +470,17 @@ static SLArmedSource sSLArmedSource = SLArmedSourceNone;
 
 #pragma mark - 抖音：装进替换槽
 
-// v0.4.0：转码缓存放在 ShenglinDouyin/_m4a_cache —— 与 voicepacks 平级，不在其内。
-// 原来放在 voicepacks/_m4a，会被 allPacks 的目录扫描当成一个语音包文件夹显示出来
-// （用户：「选了语音包怎么自动多个文件夹」）。挪出去后对用户完全不可见。
+// 转码缓存只放在 Caches 里：不进 Documents，用户怎么翻文件都看不到，
+// 也不会被 voicepacks 的目录扫描当成一个语音包文件夹。
 // 键 = 相对路径 + 修改时间；同一个包重复点不反复转码，包被裁掉/替换后 mtime 变了自然换新的。
 + (NSString *)sl_m4aCacheDir {
-    NSString *dir = [[AWECAUtils documentsPath] stringByAppendingPathComponent:@"ShenglinDouyin/_m4a_cache"];
+    NSString *base = [NSSearchPathForDirectoriesInDomains(NSCachesDirectory, NSUserDomainMask, YES) firstObject];
+    if (!base.length) base = NSTemporaryDirectory();
+    NSString *dir = [base stringByAppendingPathComponent:@"ShenglinDouyin/m4a_cache"];
     NSFileManager *fm = [NSFileManager defaultManager];
     if (![fm fileExistsAtPath:dir]) {
         [fm createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:nil];
     }
-    // 一次性清掉老版本遗留在 voicepacks 里的 _m4a 文件夹（就是用户看到的那个多出来的文件夹）。
-    static dispatch_once_t once;
-    dispatch_once(&once, ^{
-        NSString *old = [[self rootDir] stringByAppendingPathComponent:@"_m4a"];
-        if ([fm fileExistsAtPath:old]) [fm removeItemAtPath:old error:nil];
-    });
     return dir;
 }
 

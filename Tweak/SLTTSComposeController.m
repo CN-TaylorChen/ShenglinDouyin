@@ -778,10 +778,9 @@ static NSArray<NSNumber *> *SLComposeWaveHeights(NSData *pcm, NSInteger bars) {
         [AWECAUtils showToast:@"先输入要合成的文字" duration:1.6];
         return;
     }
-    if (!SLTTSPageIsEnabled()) {
-        [AWECAUtils showToast:@"请先在设置里打开「录音转音色」" duration:2.0];
-        return;
-    }
+    // v0.5.2：不再被「评论录音转音色」开关拦。文本转语音是用户主动点进来合成的，
+    // 生成的就是「下一条要发的音频」，跟评论/私聊的自动转换开关无关。
+    // 以前这里读 SLTTSPageIsEnabled()（= 评论开关），用户把评论关掉后连合成都被拒。
     self.sourceText = text;
     self.settled = NO;
     [self.textBox resignFirstResponder];

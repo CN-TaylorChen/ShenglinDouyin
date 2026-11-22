@@ -3351,6 +3351,61 @@ static CGPoint SLLoadFloatPos(CGSize size) {
     return CGPointMake(size.width - 36.0, size.height * 0.55);
 }
 
+#pragma mark - 三指下滑：显示 / 隐藏悬浮球（v0.5.2）
+
+// 三指下滑是个很「空闲」的手势，抖音自己没占用；刷视频 / 聊天时一滑就把球收起来，
+// 不用进设置。用「隐藏」而不是「卸载」：位置、图标、当前状态全部留着，再滑一下原样回来。
+static BOOL sSLFloatHidden = NO;
+static __weak UIWindow *sSLGestureWindow = nil;
+void SLEnsureFloatButton(void);
+
+@interface SLFloatGestureProxy : NSObject
+- (void)sl_toggleFloatHidden:(UISwipeGestureRecognizer *)g;
+@end
+
+@implementation SLFloatGestureProxy
+
+- (void)sl_toggleFloatHidden:(UISwipeGestureRecognizer *)g {
+    (void)g;
+    BOOL hidden = !sSLFloatHidden;
+    sSLFloatHidden = hidden;
+
+    SLFloatButton *btn = sSLFloatBtn;
+    if (!btn) {
+        UIWindow *w = SLKeyWindow();
+        btn = (SLFloatButton *)[w viewWithTag:SLBtnTag];
+    }
+    // 要露出来时先补挂一次：期间窗口可能已经换过，球还挂在旧窗口上
+    if (!hidden) {
+        SLEnsureFloatButton();
+        if (sSLFloatBtn) btn = sSLFloatBtn;
+    }
+    btn.hidden = hidden;
+    SLLog(@"SL-MOMO: three-finger swipe -> %@", hidden ? @"hidden" : @"shown");
+}
+
+@end
+
+static SLFloatGestureProxy *sSLGestureProxy = nil;
+
+// 每个顶层窗口只装一次。手势挂在窗口上而不是球上 —— 球被隐藏之后，手势还得能把它叫回来。
+// cancelsTouchesInView = NO：只旁听，不吞抖音自己的触摸。
+static void SLInstallFloatGesture(UIWindow *w) {
+    if (!w) return;
+    if (sSLGestureWindow == w) return;
+    sSLGestureWindow = w;
+    if (!sSLGestureProxy) sSLGestureProxy = [[SLFloatGestureProxy alloc] init];
+    UISwipeGestureRecognizer *swipe =
+        [[UISwipeGestureRecognizer alloc] initWithTarget:sSLGestureProxy
+                                                  action:@selector(sl_toggleFloatHidden:)];
+    swipe.numberOfTouchesRequired = 3;
+    swipe.direction = UISwipeGestureRecognizerDirectionDown;
+    swipe.cancelsTouchesInView = NO;
+    swipe.delaysTouchesEnded = NO;
+    [w addGestureRecognizer:swipe];
+    SLLog(@"SL-MOMO: three-finger gesture installed (%@)", NSStringFromClass([w class]));
+}
+
 void SLEnsureFloatButton(void) {
     UIWindow *w = SLKeyWindow();
     if (!w) {
@@ -3365,6 +3420,7 @@ void SLEnsureFloatButton(void) {
     }
     SLFloatButton *btn = (SLFloatButton *)[w viewWithTag:SLBtnTag];
     if (!btn) btn = sSLFloatBtn;   // 可能还挂在已经被换下去的旧窗口上
+    SLInstallFloatGesture(w);      // 窗口每换一次就补装一次三指下滑（隐藏球之后手势仍然有效）
     if (btn && btn.superview != w) {
         // v0.4.37：窗口被换（启动页 / 广告窗关掉、场景重建）时把球迁到新的顶层窗口，
         // 否则球跟着旧窗一起消失，而且在新窗口里找不到 tag、只能等下次冷启动。

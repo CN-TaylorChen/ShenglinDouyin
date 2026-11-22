@@ -53,7 +53,9 @@ BOOL SLTTSPageArm(NSString *audioPath, double duration, NSData *pcm16k, NSString
     (void)duration;
     (void)pcm16k;   // 抖音走文件替换，用不上 16k PCM；参数保留只为兼容原有调用点
     if (![audioPath isKindOfClass:[NSString class]] || audioPath.length == 0) return NO;
-    if (!SLTTSPageIsEnabled()) return NO;
+    // v0.5.2：不再看「评论录音转音色」开关。用户在文本转语音页主动合成出来的，
+    // 语义就是「下一条录音用这段」，不该被自动转换的开关否决（以前私聊装了也用不上，
+    // 一部分原因就是评论开关关着，这里直接 return NO，装填静默失败）。
 
     AWECAAudioReplacer *replacer = [AWECAAudioReplacer shared];
     // 这里不能用 clearReplacement：它会弹「已关闭语音替换」——
@@ -332,6 +334,12 @@ static void AWECAPrivateNotePath(NSString *path) {
     if ([AWECARecordEnhance isPluginOwnedPath:path]) return;
     if (!enhance.privateArmed) [enhance markPrivateTakeStarted];
     enhance.privateRecordPath = path;
+    // 装了本地音频（语音包 / 文本转语音）：这一发走直替换，根本不需要识别+合成。
+    // 以前照样投机起跑流水线，白花一次 ASR+TTS，还会让球卡在「合成中」抢走直替换的收尾。
+    if ([enhance hasArmedLocalAudio]) {
+        SLLog(@"IM 已装填，跳过预转换 %@", path.lastPathComponent);
+        return;
+    }
     [enhance privateBeginForSourcePath:path];   // 趁用户停确认面板上，提前消化数十秒合成耗时
 }
 
@@ -355,14 +363,39 @@ static BOOL AWECAPrivateGate(const char *tag, NSString *path,
         return NO;
     }
     if (path.length) enhance.privateRecordPath = path;
+
+    // 装填了本地音频（语音包 / 文本转语音合成的 AI 语音）：私聊链路和评论区不一样 ——
+    // 评论区有 setAudioFilePath / 上传前 / 预览气泡三处换文件的钩子，私聊一个都没有，
+    // 发送点就是唯一能换的地方。v0.5.1 之前这里直接 passthrough，结果就是
+    // 「球是绿的、发出去还是原声」（用户：文本转语音 / 语音包在私聊里用不了）。
+    // 现在：先把这一发要发的文件换成装填音，再原样重放一次（重放走 skipOnce 放行）。
+    if ([enhance hasArmedLocalAudio]) {
+        AWECAAudioReplacer *replacer = [AWECAAudioReplacer shared];
+        NSString *armed = [replacer.replacementAudioPath copy];
+        // 就地覆盖：路径不变，抖音后续的上传/转码/时长计算全都读真实内容，
+        // 比直接发一个别处的文件稳（评论区也是这么做的）。
+        BOOL inPlace = (path.length && [replacer replaceAudioAtPath:path]);
+        NSString *replay = inPlace ? path : armed;   // 覆盖失败就改发装填文件本身
+        SLLog(@"IM 直替换 %@ target=%@", inPlace ? @"ok" : @"回退装填文件", replay.lastPathComponent);
+        [enhance abortSpeculativePipelineForSourcePath:path];   // 收掉可能已在飞的投机流水线
+        [enhance consumeArmedLocalAudio];                       // 一发即用
+        enhance.privateSkipOnce = YES;                          // 重放不再拦截
+        void (^go)(void) = ^{
+            @try {
+                if (fire) fire(YES, nil, replay);
+            } @catch (NSException *e) {
+                NSLog(@"AWECA-IM: [%s] armed fire exception: %@", tag, e);
+            }
+            [enhance resetPrivateTake];
+            SLFloatPushResult(YES);   // 替换已发生：球回灰
+        };
+        if ([NSThread isMainThread]) go();
+        else dispatch_async(dispatch_get_main_queue(), go);
+        return YES;
+    }
+
     if (![enhance shouldRunForPrivateRecording]) {
         NSLog(@"AWECA-IM: [%s] passthrough (not eligible)", tag);
-        // 装了本地音频（语音包 / AI 语音）→ 这一发本来就不该转换，只直替换。
-        // 但 NotePath 已经投机起跑了流水线：必须收掉，否则球一直"合成中"、最后还报成功，
-        // 而消息发的是原声（用户：「悬浮球显示合成中，实际上原声已经发送了」）。
-        if ([enhance hasArmedLocalAudio]) {
-            [enhance abortSpeculativePipelineForSourcePath:path];
-        }
         return NO;
     }
 
