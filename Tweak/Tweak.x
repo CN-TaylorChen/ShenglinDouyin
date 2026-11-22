@@ -332,6 +332,15 @@ static void AWECAPrivateNotePath(NSString *path) {
     if (!path.length || !enhance.privateEnhanceEnabled) return;
     // 重放再入护栏：重放带的是插件自有快照路径，不是新录音，绝不能武装/覆盖 privateRecordPath
     if ([AWECARecordEnhance isPluginOwnedPath:path]) return;
+    // v0.5.3：重放（skipOnce=YES）时这条文件**已经换好了**，绝不能再起跑投机流水线。
+    // 直替换是「就地覆盖」的，路径没变（仍是 audio1.m4a）→ 重放会原样回到本函数，
+    // 而那一刻装填已被 consume，hasArmedLocalAudio=NO，于是白跑一遍 ASR+TTS：
+    // 胶囊被它顶成「识别中/合成中」、SLFloatPushResult(Idle) 又被合成闸拦掉，
+    // 用户看到的就是「语音包明明替换成功，球却一直转蓝、永远不回灰」。
+    if (enhance.privateSkipOnce) {
+        SLLog(@"IM 重放，跳过预转换 %@", path.lastPathComponent);
+        return;
+    }
     if (!enhance.privateArmed) [enhance markPrivateTakeStarted];
     enhance.privateRecordPath = path;
     // 装了本地音频（语音包 / 文本转语音）：这一发走直替换，根本不需要识别+合成。
