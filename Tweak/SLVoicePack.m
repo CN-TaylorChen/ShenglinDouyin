@@ -177,9 +177,10 @@ static NSString *SLRelOfPath(NSString *path) {
             if (![names containsObject:item]) [names addObject:item];
         }
     }
-    // 索引里出现但目录已被手工改名的，也补进来
+    // 索引里出现但目录已被手工改名的，也补进来（内部残留目录不补）
     for (NSDictionary *p in [self allPacks]) {
         NSString *f = [p[@"folder"] isKindOfClass:[NSString class]] ? p[@"folder"] : @"未分组";
+        if (SLIsInternalDirName(f)) continue;
         if (![names containsObject:f]) [names addObject:f];
     }
     [names sortUsingComparator:^NSComparisonResult(NSString *a, NSString *b) {
