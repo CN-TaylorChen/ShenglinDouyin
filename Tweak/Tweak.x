@@ -895,9 +895,9 @@ static void setupAudioIconElementHook(void) {
         @try { SLBallCommandStart(); } @catch (NSException *e) {
             SLLog(@"#ball 口令装配失败: %@", e);
         }
-        // v0.5.7 闪图探测：图片消息时 dump 整对象 ivar（含父类），不改任何发送行为
+        // v0.5.8 闪图勘察：无钩子纯读（v0.5.7 在图片消息 setter 上挂钩子会导致相册发图闪退，已整段拆掉）
         @try { SLFlashProbeStart(); } @catch (NSException *e) {
-            SLLog(@"闪图探测启动失败: %@", e);
+            SLLog(@"闪图勘察启动失败: %@", e);
         }
     }
 }

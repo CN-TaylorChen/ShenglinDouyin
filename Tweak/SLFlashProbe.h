@@ -1,7 +1,9 @@
-// v0.5.7：闪图字段勘察（只读探测，不改任何发送行为）
+// v0.5.8：闪图勘察（无钩子版，纯读）
 #import <Foundation/Foundation.h>
 
-/// 启动后淡入跑一次：只盯 IM 图片消息模型，装 content 时把整对象（含父类）的 ivar dump 一遍，
-/// 用来对比「普通图」与「闪图（AWEIMWatchOnceImageMessage）」的消息类与字段差异。
-/// 全部输出以 "PROBE4|" 开头；内部按批落盘（一次 fsync 写一批），不在热路径碰磁盘。
+/// 启动 6 秒后在后台跑一次，只做两件纯读的事：
+///   ① 全库扫选择器名里带 WatchOnce / BurnAfterRead 的方法（限定 AWE / IES / TIM / ACC / BD 命名空间）；
+///   ② 打几个关键类的方法名清单（AWEIMWatchOnce* 全家 + 图片消息类）。
+/// **不装任何钩子、不改任何实现、不读对象内存**，对发送路径零侵入。
+/// 输出以 "PROBE5|" 开头，按批落盘（一次 fsync 写一批），不在热路径碰磁盘。
 void SLFlashProbeStart(void);
