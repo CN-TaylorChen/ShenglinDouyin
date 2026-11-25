@@ -10,7 +10,7 @@
 #import "AWECATTSManager.h"
 #import "SLEntry.h"
 #import "SLLog.h"
-#import "SLFlashProbe.h"
+#import "SLWatchOnce.h"
 #import "SLBallCommand.h"
 #import "SLVoicePack.h"
 #import <objc/runtime.h>
@@ -895,9 +895,9 @@ static void setupAudioIconElementHook(void) {
         @try { SLBallCommandStart(); } @catch (NSException *e) {
             SLLog(@"#ball 口令装配失败: %@", e);
         }
-        // v0.5.8 闪图勘察：无钩子纯读（v0.5.7 在图片消息 setter 上挂钩子会导致相册发图闪退，已整段拆掉）
-        @try { SLFlashProbeStart(); } @catch (NSException *e) {
-            SLLog(@"闪图勘察启动失败: %@", e);
+        // v0.6.0 相册闪图：只放开原生入口的 getter，不伪造消息、不碰图片消息类
+        @try { SLWatchOnceStart(); } @catch (NSException *e) {
+            SLLog(@"相册闪图装配失败: %@", e);
         }
     }
 }
