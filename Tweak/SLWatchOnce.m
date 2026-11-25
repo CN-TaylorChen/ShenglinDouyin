@@ -339,6 +339,7 @@ static void h_barLayout(id self, SEL _cmd) {
 
 typedef struct {
     SEL sel;
+    Class cls;
     IMP orig;
     int argc;
 } SLTraceSlot;
@@ -347,9 +348,18 @@ static SLTraceSlot sSLSlots[128];
 static int sSLSlotCount = 0;
 static int sSLTraceLines = 0;
 
-static IMP SLTraceOrigIMP(SEL sel) {
+// v0.8.0 修：原来只按 SEL 找 orig，可 -sendButton 这种同名方法在 V2 和 V1 上各有一份，
+// 于是 V1 的调用会跑去执行 V2 的实现（读的是 V2 的 ivar）—— 这种错调就是崩溃源。
+// 现在按「接收者类」匹配，找不到再顺着父类往上找，绝不跨到不相干的类。
+static IMP SLTraceOrigIMP(id self, SEL sel) {
+    Class c = object_getClass(self);
     for (int i = 0; i < sSLSlotCount; i++) {
-        if (sSLSlots[i].sel == sel) return sSLSlots[i].orig;
+        if (sSLSlots[i].sel == sel && sSLSlots[i].cls == c) return sSLSlots[i].orig;
+    }
+    for (Class k = class_getSuperclass(c); k; k = class_getSuperclass(k)) {
+        for (int i = 0; i < sSLSlotCount; i++) {
+            if (sSLSlots[i].sel == sel && sSLSlots[i].cls == k) return sSLSlots[i].orig;
+        }
     }
     return NULL;
 }
@@ -359,7 +369,7 @@ static void sl_trace0(id self, SEL _cmd) {
         sSLTraceLines++;
         SLLog(@"V2| call -%s  (%@)", sel_getName(_cmd), NSStringFromClass([self class]));
     }
-    IMP o = SLTraceOrigIMP(_cmd);
+    IMP o = SLTraceOrigIMP(self, _cmd);
     if (o) ((void (*)(id, SEL))o)(self, _cmd);
 }
 
@@ -368,7 +378,7 @@ static void sl_trace1(id self, SEL _cmd, id a1) {
         sSLTraceLines++;
         SLLog(@"V2| call -%s  arg=%@", sel_getName(_cmd), NSStringFromClass([a1 class]));
     }
-    IMP o = SLTraceOrigIMP(_cmd);
+    IMP o = SLTraceOrigIMP(self, _cmd);
     if (o) ((void (*)(id, SEL, id))o)(self, _cmd, a1);
 }
 
@@ -396,18 +406,17 @@ static void SLTraceClass(Class cls, NSString *tag) {
         for (const char *p = sel_getName(s); *p; p++) if (*p == ':') argc++;
         if (argc > 1) continue;
 
-        // 单参的必须是对象或整数，浮点/结构体会走寄存器不同位置，硬套签名会把参数传坏
+        // 只跟对象参数。整数、浮点、结构体的实参不能当对象打日志（[a1 class] 直接炸），
+        // 而且这些方法对定位没有价值 —— 宁可少跟几个，不让追踪本身成为崩溃源。
         if (argc == 1) {
             char at[8] = {0};
             method_getArgumentType(list[i], 2, at, sizeof(at));
-            char t = at[0];
-            BOOL ok = (t == '@' || t == '#' || t == ':' || t == 'i' || t == 'I' ||
-                       t == 'q' || t == 'Q' || t == 'B' || t == 'c' || t == 'l');
-            if (!ok) continue;
+            if (at[0] != '@') continue;
         }
 
         IMP orig = method_getImplementation(list[i]);
         sSLSlots[sSLSlotCount].sel = s;
+        sSLSlots[sSLSlotCount].cls = cls;
         sSLSlots[sSLSlotCount].orig = orig;
         sSLSlots[sSLSlotCount].argc = argc;
         sSLSlotCount++;
@@ -840,6 +849,14 @@ static void h_modelSetCtx(id self, SEL _cmd, id ctx) {
     if (sSLOncePending) SLMarkWatchOnce(ctx, @"SendMessageModel.sendContext");
 }
 
+// v0.8.0：发文字的入口只留一行日志。万一还崩，这行就是「崩在发送之前 / 之后」的分界线，
+// 一次就能定位，不用再来回试。
+static void (*o_sendText)(id, SEL, id);
+static void h_sendText(id self, SEL _cmd, id arg) {
+    SLLog(@"TXT| 发送文字 pending=%d", sSLOncePending);
+    if (o_sendText) o_sendText(self, _cmd, arg);
+}
+
 #pragma mark - 装配
 
 void SLWatchOnceStart(void) {
@@ -847,7 +864,7 @@ void SLWatchOnceStart(void) {
     if (started) return;
     started = YES;
 
-    SLLog(@"ONCE| ==== 相册闪图 v0.7.2 · 入口=%d · 默认闪图=%d ====",
+    SLLog(@"ONCE| ==== 相册闪图 v0.8.0 · 入口=%d · 默认闪图=%d ====",
           SLWatchOnceEntryOn(), SLWatchOnceForceOn());
 
     // v0.6.0 那两个开关没有生效（钩子从未被调用），设置页已撤掉；
@@ -903,12 +920,20 @@ void SLWatchOnceStart(void) {
     c = objc_getClass("AWEIMSendMessageContext");
     SLInstallBool(c, @selector(isClickWatchOnce), (IMP)h_ctxIsClick, (IMP *)&o_ctxIsClick,
                   @"context.isClickWatchOnce");
-    SLInstallVoid(c, @selector(setSendFrom:), (IMP)h_ctxSendFrom, (IMP *)&o_ctxSendFrom,
-                  @"context.setSendFrom:");
+    // v0.8.0：setSendFrom: 的参数类型不知道（枚举/结构体都可能，猜错就把实参传坏），
+    // 只有确认是对象才挂。它在 0.7.x 的日志里一次都没被调用过，删了也不影响闪图。
+    SLInstallVoidTyped(c, @selector(setSendFrom:), "@", (IMP)h_ctxSendFrom, (IMP *)&o_ctxSendFrom,
+                       @"context.setSendFrom:");
 
     c = objc_getClass("IESIMSendMessageModel");
     SLInstallVoid(c, @selector(setSendContext:), (IMP)h_modelSetCtx, (IMP *)&o_modelSetCtx,
                   @"model.setSendContext:");
+
+    // 发文字的入口：只打日志（参数必须确认是对象，否则不挂）
+    c = objc_getClass("IESIMInputViewController");
+    SLInstallVoidTyped(c, @selector(sendTextViewTextMessage:), "@",
+                       (IMP)h_sendText, (IMP *)&o_sendText,
+                       @"input.sendTextViewTextMessage:");
 
     // ---- v0.6.1 定位相册：只观察，不改任何值 ----
     // 三个锚点覆盖三种可能：present（一定能过）、viewDidLoad、viewDidAppear
