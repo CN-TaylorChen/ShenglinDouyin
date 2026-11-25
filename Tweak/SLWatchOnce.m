@@ -15,6 +15,7 @@
 #import "SLWatchOnce.h"
 #import "SLLog.h"
 #import <objc/runtime.h>
+#import <objc/message.h>
 #import <UIKit/UIKit.h>
 
 #define kSLOnceEntry @"SLWatchOnceEntry"
@@ -268,6 +269,8 @@ static void SLDumpViewController(UIViewController *vc) {
 }
 
 // 打开哪些页会进这里：只要类名像相册 / 选图 / 预览就 dump 一次
+static void SLInstallOnceButton(UIViewController *vc);   // v0.7.0：相册页那颗闪图按钮
+
 static void (*o_vcAppear)(id, SEL, BOOL);
 static void h_vcAppear(id self, SEL _cmd, BOOL animated) {
     o_vcAppear(self, _cmd, animated);
@@ -276,6 +279,10 @@ static void h_vcAppear(id self, SEL _cmd, BOOL animated) {
         if (SLNameHas(cn, @[@"Picker", @"Album", @"Gallery", @"Photo", @"Asset",
                             @"Preview", @"Selection", @"IMInput", @"InputVC"])) {
             SLDumpViewController(self);
+        }
+        // 就是它：私聊相册页
+        if ([cn isEqualToString:@"AWEIMPickerViewController"]) {
+            SLInstallOnceButton((UIViewController *)self);
         }
     } @catch (NSException *e) { (void)e; }
 }
@@ -452,6 +459,148 @@ static void h_v2Layout(id self, SEL _cmd) {
     } @catch (NSException *e) { (void)e; }
 }
 
+#pragma mark - v0.7.0 在相册页加一个「闪图」按钮
+
+// 用户要的是「相册里多一个闪图按钮，点它才发闪图」。
+// 抖音原生的「仅看一次」藏在发送按钮的长按菜单里，位置不固定；这里自己放一个按钮，
+// 点它就去调原生的闪图发送入口（找到就发，找不到就把现场状态写进日志，一次定位）。
+
+static UIButton *sSLOctBtn = nil;
+
+static UIViewController *SLParentVC(UIView *v) {
+    for (UIResponder *r = v.nextResponder; r; r = r.nextResponder) {
+        if ([r isKindOfClass:[UIViewController class]]) return (UIViewController *)r;
+    }
+    return nil;
+}
+
+static UIView *SLFindByClass(UIView *root, NSString *cls, int depth) {
+    if (!root || depth > 12) return nil;
+    if ([NSStringFromClass([root class]) isEqualToString:cls]) return root;
+    for (UIView *sub in root.subviews) {
+        UIView *hit = SLFindByClass(sub, cls, depth + 1);
+        if (hit) return hit;
+    }
+    return nil;
+}
+
+static UIButton *SLFindButtonWithTitle(UIView *root, NSString *needle, int depth) {
+    if (!root || depth > 12) return nil;
+    if ([root isKindOfClass:[UIButton class]]) {
+        NSString *t = [(UIButton *)root titleForState:UIControlStateNormal];
+        if (t.length && [t containsString:needle]) return (UIButton *)root;
+    }
+    for (UIView *sub in root.subviews) {
+        UIButton *hit = SLFindButtonWithTitle(sub, needle, depth + 1);
+        if (hit) return hit;
+    }
+    return nil;
+}
+
+static void SLScanButtons(UIView *v, int depth, int *budget) {
+    if (!v || depth > 12 || *budget <= 0) return;
+    if ([v isKindOfClass:[UIButton class]] || [v isKindOfClass:[UIControl class]]) {
+        NSString *t = [v isKindOfClass:[UIButton class]]
+            ? [(UIButton *)v titleForState:UIControlStateNormal] : nil;
+        SLLog(@"BTN|   %@ title=%@ hidden=%d frame=%@", NSStringFromClass([v class]),
+              t ?: @"", v.hidden, NSStringFromCGRect(v.frame));
+        (*budget)--;
+    }
+    for (UIView *sub in v.subviews) SLScanButtons(sub, depth + 1, budget);
+}
+
+static void SLOnceTapped(UIButton *b);
+
+@interface SLOnceTarget : NSObject
+@end
+@implementation SLOnceTarget
+- (void)tap:(UIButton *)b { SLOnceTapped(b); }
+@end
+
+// UIButton 不持有 target，得自己留一个，否则点一下就野指针
+static SLOnceTarget *sSLOctTarget = nil;
+
+static void SLOnceTapped(UIButton *b) {
+    SLLog(@"BTN| == 点了闪图按钮 ==");
+    UIViewController *vc = SLParentVC(b);
+    SLLog(@"BTN| 所在页面 %@", NSStringFromClass([vc class]));
+
+    UIView *bar = vc.isViewLoaded ? SLFindByClass(vc.view, @"AWEIMPhotoPickerToolbarViewV2", 0) : nil;
+    SLLog(@"BTN| 工具栏 %@", bar ? NSStringFromClass([bar class]) : @"(没找到)");
+
+    // 把工具栏上的按钮全部摊开：如果原生本来就有一个隐藏的闪图/眼睛按钮，这里会露出来
+    int budget = 40;
+    if (bar) SLScanButtons(bar, 0, &budget);
+
+    // 找原生入口：先工具栏、再页面、再工具栏的 delegate/VC
+    NSArray *sels = @[@"watchOnceSendButtonInPickerPressed:",
+                      @"watchOnceSendButtonInPreviewPressed:",
+                      @"sendWatchOnce",
+                      @"sendAsWatchOnce"];
+    NSMutableArray *targets = [NSMutableArray array];
+    if (bar) [targets addObject:bar];
+    if (vc) [targets addObject:vc];
+    if (bar && [bar respondsToSelector:@selector(delegate)]) {
+        id del = nil;
+        @try { del = [bar performSelector:@selector(delegate)]; } @catch (NSException *e) { (void)e; }
+        if (del) [targets addObject:del];
+    }
+
+    for (NSString *name in sels) {
+        SEL sel = NSSelectorFromString(name);
+        for (id t in targets) {
+            if (![t respondsToSelector:sel]) continue;
+            SLLog(@"BTN| 调用 -%@ on %@", name, NSStringFromClass([t class]));
+            @try {
+                ((void (*)(id, SEL))objc_msgSend)(t, sel);
+                return;
+            } @catch (NSException *e) {
+                SLLog(@"BTN| 调用失败 %@", e);
+            }
+        }
+    }
+
+    SLLog(@"BTN| 没找到原生闪图入口，已把工具栏按钮写进日志");
+}
+
+static void SLInstallOnceButton(UIViewController *vc) {
+    if (sSLOctBtn.superview) return;
+    if (!vc.isViewLoaded) return;
+
+    UIView *host = SLFindByClass(vc.view, @"AWEIMPhotoPickerToolbarViewV2", 0) ?: vc.view;
+    UIButton *send = SLFindButtonWithTitle(host, @"发送", 0);
+
+    UIButton *b = [UIButton buttonWithType:UIButtonTypeCustom];
+    b.frame = CGRectMake(0, 0, 40, 40);
+    b.backgroundColor = [UIColor colorWithRed:0.47 green:0.33 blue:0.96 alpha:0.92];
+    b.layer.cornerRadius = 20;
+    b.layer.shadowColor = [UIColor colorWithRed:0.47 green:0.33 blue:0.96 alpha:0.5].CGColor;
+    b.layer.shadowRadius = 8;
+    b.layer.shadowOpacity = 1;
+    b.layer.shadowOffset = CGSizeZero;
+    if (@available(iOS 13.0, *)) {
+        UIImage *icon = [UIImage systemImageNamed:@"eye.fill"];
+        if (icon) [b setImage:icon forState:UIControlStateNormal];
+    }
+    if (!b.imageView.image) [b setTitle:@"闪" forState:UIControlStateNormal];
+    b.tintColor = [UIColor whiteColor];
+    if (!sSLOctTarget) sSLOctTarget = [SLOnceTarget new];
+    [b addTarget:sSLOctTarget action:@selector(tap:) forControlEvents:UIControlEventTouchUpInside];
+
+    if (send && send.superview == host) {
+        CGRect f = send.frame;
+        b.center = CGPointMake(f.origin.x - 26, CGRectGetMidY(f));
+    } else {
+        b.center = CGPointMake(host.bounds.size.width - 26,
+                               host.bounds.size.height - 26);
+    }
+    b.autoresizingMask = UIViewAutoresizingFlexibleLeftMargin | UIViewAutoresizingFlexibleTopMargin;
+    [host addSubview:b];
+    sSLOctBtn = b;
+    SLLog(@"BTN| 闪图按钮已放到 %@（发送按钮 %@）", NSStringFromClass([host class]),
+          send ? @"找到" : @"没找到");
+}
+
 // 聊天窗口图片的「发闪图」操作条（这条原生一定能用，作为参照）
 static void (*o_actionBarLayout)(id, SEL);
 static void h_actionBarLayout(id self, SEL _cmd) {
@@ -472,7 +621,7 @@ void SLWatchOnceStart(void) {
     if (started) return;
     started = YES;
 
-    SLLog(@"ONCE| ==== 相册闪图 v0.6.2 · 入口=%d · 默认闪图=%d ====",
+    SLLog(@"ONCE| ==== 相册闪图 v0.7.0 · 入口=%d · 默认闪图=%d ====",
           SLWatchOnceEntryOn(), SLWatchOnceForceOn());
 
     // v0.6.0 那两个开关没有生效（钩子从未被调用），设置页已撤掉；
