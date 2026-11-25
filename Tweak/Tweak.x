@@ -10,6 +10,7 @@
 #import "AWECATTSManager.h"
 #import "SLEntry.h"
 #import "SLLog.h"
+#import "SLFlashProbe.h"
 #import "SLVoicePack.h"
 #import <objc/runtime.h>
 #import <objc/message.h>
@@ -888,6 +889,10 @@ static void setupAudioIconElementHook(void) {
         SLLog(@"bundle container = %@", [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES) firstObject]);
         @try { SLStartEntryWatcher(); } @catch (NSException *e) {
             SLLog(@"悬浮球装配失败: %@", e);
+        }
+        // v0.5.4 闪图探测：只枚举类 + 记录 setter，不改任何发送行为
+        @try { SLFlashProbeStart(); } @catch (NSException *e) {
+            SLLog(@"闪图探测启动失败: %@", e);
         }
     }
 }
