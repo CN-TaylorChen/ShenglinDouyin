@@ -68,7 +68,7 @@ static UIImage *SLThinSliderThumb(void) {
 
 #define kSLEnabledKey @"SLEnhanceEnabled"
 // 与 control 的 Version 保持一致（0.5.0）。原来写死 1.0.0，设置页标题栏一直显示旧号。
-#define SLVersion @"0.6.0"
+#define SLVersion @"0.6.1"
 
 // v0.4.52：单元格玻璃色搬到 SLGlass（全站二级页共用同一个数），这里不再重复定义。
 
@@ -244,7 +244,7 @@ static UIView *SLMakeHeader(NSString *text, CGFloat x, CGFloat width) {
     (void)tv;
     // 音色与合成：评论开关 + 私聊开关 + 引擎 + 音色 + 情绪 + 语速 + 音量 + 音调 + 文本转语音 + 语音包
     if (section == 0) return 10;
-    if (section == 1) return 5;   // 其它：悬浮球图标 + 闪图两项 + API 凭证 + 运行日志
+    if (section == 1) return 3;   // 其它：悬浮球图标 + API 凭证 + 运行日志
     return 0;
 }
 
@@ -400,26 +400,6 @@ static UIView *SLMakeHeader(NSString *text, CGFloat x, CGFloat width) {
             return cell;
         }
         if (ip.row == 1) {
-            // 放开原生「相册 → 闪图」入口：相册里多出闪图发送按钮，发不发起作用由用户点
-            cell.textLabel.text = @"相册闪图";
-            UISwitch *sw = [[UISwitch alloc] initWithFrame:CGRectZero];
-            sw.on = SLWatchOnceEntryOn();
-            [sw addTarget:self action:@selector(sl_watchOnceEntryChanged:) forControlEvents:UIControlEventValueChanged];
-            cell.accessoryView = sw;
-            cell.selectionStyle = UITableViewCellSelectionStyleNone;
-            return cell;
-        }
-        if (ip.row == 2) {
-            // 保底：相册选完直接按闪图发出去，不给选择
-            cell.textLabel.text = @"相册默认闪图";
-            UISwitch *sw = [[UISwitch alloc] initWithFrame:CGRectZero];
-            sw.on = SLWatchOnceForceOn();
-            [sw addTarget:self action:@selector(sl_watchOnceForceChanged:) forControlEvents:UIControlEventValueChanged];
-            cell.accessoryView = sw;
-            cell.selectionStyle = UITableViewCellSelectionStyleNone;
-            return cell;
-        }
-        if (ip.row == 3) {
             cell.textLabel.text = @"API 凭证";
             cell.detailTextLabel.text = mgr.fishEngine
                 ? (mgr.fishAPIKey.length ? @"Fish Audio 已配置" : @"未配置 Fish Audio")
@@ -477,12 +457,11 @@ static UIView *SLMakeHeader(NSString *text, CGFloat x, CGFloat width) {
             [self.navigationController pushViewController:[[SLFloatIconController alloc] init] animated:YES];
             return;
         }
-        if (ip.row == 3) {                                  // API 凭证
+        if (ip.row == 1) {                                  // API 凭证
             AWECAAPISettingsController *vc = [[AWECAAPISettingsController alloc] init];
             [self.navigationController pushViewController:vc animated:YES];
             return;
         }
-        if (ip.row < 3) return;                             // 0/1/2 是按钮与两个开关
         SLLogViewController *vc = [[SLLogViewController alloc] init];   // 运行日志
         [self.navigationController pushViewController:vc animated:YES];
         return;
@@ -640,6 +619,17 @@ static UIView *SLMakeHeader(NSString *text, CGFloat x, CGFloat width) {
     [[NSUserDefaults standardUserDefaults] synchronize];
     [AWECARecordEnhance shared].privateEnhanceEnabled = sw.on;
     [AWECAUtils showToast:sw.on ? @"私聊语音已转成音色" : @"私聊发自己的原声" duration:1.5];
+}
+
+// v0.6.0：闪图两项。钩子在启动时就装好了，这里只改开关值 —— 立刻生效，不用重开抖音。
+- (void)sl_watchOnceEntryChanged:(UISwitch *)sw {
+    SLWatchOnceSetEntry(sw.on);
+    [AWECAUtils showToast:sw.on ? @"相册里可以发闪图了" : @"相册闪图入口已关" duration:1.5];
+}
+
+- (void)sl_watchOnceForceChanged:(UISwitch *)sw {
+    SLWatchOnceSetForce(sw.on);
+    [AWECAUtils showToast:sw.on ? @"相册选图后直接发闪图" : @"相册选图恢复为普通图" duration:1.5];
 }
 
 // v0.6.0：闪图两项。钩子在启动时就装好了，这里只改开关值 —— 立刻生效，不用重开抖音。

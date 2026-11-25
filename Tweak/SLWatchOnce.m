@@ -15,6 +15,7 @@
 #import "SLWatchOnce.h"
 #import "SLLog.h"
 #import <objc/runtime.h>
+#import <UIKit/UIKit.h>
 
 #define kSLOnceEntry @"SLWatchOnceEntry"
 #define kSLOnceForce @"SLWatchOnceForce"
@@ -180,6 +181,155 @@ static void h_sendAssets(id self, SEL _cmd, id assets, BOOL once) {
     if (o_sendAssets) o_sendAssets(self, _cmd, assets, once);
 }
 
+#pragma mark - v0.6.1 定位：相册到底用哪个类
+
+// 依据：v0.6.0 日志里 9 个钩子全部挂上，但除了 enableOptWatchOnceStrategy（本来就是 1）
+// 一个都没被调用 —— 说明 41.2.0 的「相册 → 发送」不走那条链。
+// 这里只做一件事：把用户真正打开的相册类抓出来（类名 + 方法名 + ivar 名 + 子视图类），
+// 不钩发送、不读对象内存、不扫全库，打开一次相册就出结果。
+
+static NSInteger sSLPickDumps = 0;
+static NSMutableSet *sSLPickSeen = nil;
+static NSMutableSet *sSLViewSeen = nil;
+
+static BOOL SLNameHas(NSString *s, NSArray *keys) {
+    if (!s.length) return NO;
+    for (NSString *k in keys) if ([s containsString:k]) return YES;
+    return NO;
+}
+
+static void SLDumpMethods(Class cls, NSString *tag, NSArray *keys, NSInteger cap) {
+    if (!cls) { SLLog(@"PICK| %@ 类不存在", tag); return; }
+    unsigned int n = 0;
+    Method *list = class_copyMethodList(cls, &n);
+    NSInteger shown = 0;
+    for (unsigned int i = 0; i < n && shown < cap; i++) {
+        NSString *sn = NSStringFromSelector(method_getName(list[i]));
+        if (keys.count && !SLNameHas(sn, keys)) continue;
+        SLLog(@"PICK| %@  -%@", tag, sn);
+        shown++;
+    }
+    if (list) free(list);
+    SLLog(@"PICK| %@  共 %u 个本类方法（列出 %ld 个）", tag, n, (long)shown);
+}
+
+// 只打名字，不碰内存：类链上每层的 ivar 名里带 watch/once/send/disable 的
+static void SLDumpIvars(Class cls, NSString *tag) {
+    int depth = 0;
+    for (Class c = cls; c && c != [NSObject class] && depth < 4; c = class_getSuperclass(c), depth++) {
+        unsigned int n = 0;
+        Ivar *ivars = class_copyIvarList(c, &n);
+        for (unsigned int i = 0; i < n; i++) {
+            NSString *in = [NSString stringWithUTF8String:ivar_getName(ivars[i]) ?: ""];
+            if (SLNameHas(in, @[@"watch", @"Watch", @"once", @"Once", @"send", @"Send", @"disable", @"Disable"])) {
+                SLLog(@"PICK| %@  ivar %@.%@", tag, NSStringFromClass(c), in);
+            }
+        }
+        if (ivars) free(ivars);
+    }
+}
+
+static void SLDumpViews(UIView *v, NSString *tag, NSInteger depth, NSInteger *budget) {
+    if (!v || depth > 3 || *budget <= 0) return;
+    for (UIView *sub in v.subviews) {
+        if (*budget <= 0) return;
+        NSString *cn = NSStringFromClass([sub class]);
+        if (SLNameHas(cn, @[@"Watch", @"Once", @"Button", @"Bar", @"Toolbar"])) {
+            SLLog(@"PICK| %@  视图 %@ hidden=%d", tag, cn, sub.hidden);
+            (*budget)--;
+        }
+        SLDumpViews(sub, tag, depth + 1, budget);
+    }
+}
+
+static void SLDumpViewController(UIViewController *vc) {
+    NSString *cn = NSStringFromClass([vc class]);
+    if (!sSLPickSeen) sSLPickSeen = [NSMutableSet set];
+    if (!sSLViewSeen) sSLViewSeen = [NSMutableSet set];
+
+    if (![sSLPickSeen containsObject:cn] && sSLPickDumps < 12) {
+        [sSLPickSeen addObject:cn];
+        sSLPickDumps++;
+        SLLog(@"PICK| == VC %@  父类 %@ ==", cn, NSStringFromClass(class_getSuperclass([vc class])));
+        SLDumpMethods([vc class], cn, @[@"send", @"Send", @"watch", @"Watch", @"once", @"Once",
+                                       @"confirm", @"Confirm", @"select", @"Select",
+                                       @"done", @"Done", @"album", @"Album"], 40);
+        SLDumpIvars([vc class], cn);
+    }
+
+    // 视图树要等 loadView 之后才有，present 那一刻先记类名，出现时再补一次子视图
+    if ([vc isViewLoaded] && ![sSLViewSeen containsObject:cn]) {
+        [sSLViewSeen addObject:cn];
+        NSInteger budget = 24;
+        SLLog(@"PICK| -- %@ 子视图 --", cn);
+        SLDumpViews(vc.view, cn, 0, &budget);
+        if (budget == 24) SLLog(@"PICK| -- %@ 子视图里没有 Button/Bar/Watch 命名的 --", cn);
+    }
+}
+
+// 打开哪些页会进这里：只要类名像相册 / 选图 / 预览就 dump 一次
+static void (*o_vcAppear)(id, SEL, BOOL);
+static void h_vcAppear(id self, SEL _cmd, BOOL animated) {
+    o_vcAppear(self, _cmd, animated);
+    @try {
+        NSString *cn = NSStringFromClass([self class]);
+        if (SLNameHas(cn, @[@"Picker", @"Album", @"Gallery", @"Photo", @"Asset",
+                            @"Preview", @"Selection", @"IMInput", @"InputVC"])) {
+            SLDumpViewController(self);
+        }
+    } @catch (NSException *e) { (void)e; }
+}
+
+static void (*o_vcLoad)(id, SEL);
+static void h_vcLoad(id self, SEL _cmd) {
+    o_vcLoad(self, _cmd);
+    @try {
+        NSString *cn = NSStringFromClass([self class]);
+        if (SLNameHas(cn, @[@"Picker", @"Album", @"Gallery", @"Photo", @"Asset", @"Preview"])) {
+            SLDumpViewController(self);
+        }
+    } @catch (NSException *e) { (void)e; }
+}
+
+// 相册很多是 present 出来的：不管它自己覆没覆写 viewDidAppear，present 这一跳一定过
+static void (*o_vcPresent)(id, SEL, UIViewController *, BOOL, id);
+static void h_vcPresent(id self, SEL _cmd, UIViewController *vc, BOOL animated, id completion) {
+    o_vcPresent(self, _cmd, vc, animated, completion);
+    @try {
+        SLLog(@"PICK| present %@ ← %@", NSStringFromClass([vc class]), NSStringFromClass([self class]));
+        SLDumpViewController(vc);
+    } @catch (NSException *e) { (void)e; }
+}
+
+// 新版相册工具栏：闪图发送按钮就在这个 view 上，看看它到底有没有、隐没隐
+static void (*o_barLayout)(id, SEL);
+static void h_barLayout(id self, SEL _cmd) {
+    o_barLayout(self, _cmd);
+    static BOOL once = NO;
+    if (once) return;
+    once = YES;
+    @try {
+        id btn = [self performSelector:@selector(watchOnceSendButton)];
+        SLLog(@"PICK| NewPhotoPickerToolbar watchOnceSendButton = %@", btn);
+        if (btn && [btn isKindOfClass:[UIView class]]) {
+            SLLog(@"PICK| NewPhotoPickerToolbar 按钮 hidden=%d", ((UIView *)btn).hidden);
+        }
+    } @catch (NSException *e) { (void)e; }
+}
+
+// 聊天窗口图片的「发闪图」操作条（这条原生一定能用，作为参照）
+static void (*o_actionBarLayout)(id, SEL);
+static void h_actionBarLayout(id self, SEL _cmd) {
+    o_actionBarLayout(self, _cmd);
+    static BOOL once = NO;
+    if (once) return;
+    once = YES;
+    @try {
+        SLLog(@"PICK| ExchangeAndSendImageActionBar init 完成");
+        SLDumpIvars([self class], @"ExchangeBar");
+    } @catch (NSException *e) { (void)e; }
+}
+
 #pragma mark - 装配
 
 void SLWatchOnceStart(void) {
@@ -187,8 +337,15 @@ void SLWatchOnceStart(void) {
     if (started) return;
     started = YES;
 
-    SLLog(@"ONCE| ==== 相册闪图 v0.6.0 · 入口=%d · 默认闪图=%d ====",
+    SLLog(@"ONCE| ==== 相册闪图 v0.6.1 · 入口=%d · 默认闪图=%d ====",
           SLWatchOnceEntryOn(), SLWatchOnceForceOn());
+
+    // v0.6.0 那两个开关没有生效（钩子从未被调用），设置页已撤掉；
+    // 万一用户当时把「默认闪图」打开了，值还在 defaults 里，这里清掉，避免以后误触发。
+    if (SLWatchOnceForceOn()) {
+        SLWatchOnceSetForce(NO);
+        SLLog(@"ONCE| 已清除 v0.6.0 遗留的「默认闪图」开关值");
+    }
 
     Class c = Nil;
 
@@ -231,6 +388,29 @@ void SLWatchOnceStart(void) {
     c = objc_getClass("AWEIMContextRecommendUtil");
     SLInstallBool(c, @selector(enableOptWatchOnceStrategy), (IMP)h_optStrategy, (IMP *)&o_optStrategy,
                   @"contextRecommend.enableOptWatchOnceStrategy");
+
+    // ---- v0.6.1 定位相册：只观察，不改任何值 ----
+    // 三个锚点覆盖三种可能：present（一定能过）、viewDidLoad、viewDidAppear
+    SLInstallVoid([UIViewController class], @selector(viewDidLoad), (IMP)h_vcLoad,
+                  (IMP *)&o_vcLoad, @"vc.viewDidLoad");
+    SLInstallVoid([UIViewController class], @selector(viewDidAppear:), (IMP)h_vcAppear,
+                  (IMP *)&o_vcAppear, @"vc.viewDidAppear:");
+    SLInstallVoid([UIViewController class],
+                  @selector(presentViewController:animated:completion:), (IMP)h_vcPresent,
+                  (IMP *)&o_vcPresent, @"vc.presentViewController:");
+
+    c = objc_getClass("AWEIMNewPhotoPickerToolbarView");
+    SLInstallVoid(c, @selector(layoutSubviews), (IMP)h_barLayout, (IMP *)&o_barLayout,
+                  @"newPickerToolbar.layoutSubviews");
+
+    c = objc_getClass("AWEIMExchangeAndSendImageActionBarView");
+    SLInstallVoid(c, @selector(layoutSubviews), (IMP)h_actionBarLayout, (IMP *)&o_actionBarLayout,
+                  @"exchangeBar.layoutSubviews");
+
+    // 已知一定在发图链路上的模型类：直接把方法名摊开，找有没有闪图相关入口
+    SLDumpMethods(objc_getClass("IESIMSendMessageModel"), @"IESIMSendMessageModel", @[], 100);
+    SLDumpMethods(objc_getClass("AWEIMSendMessageContext"), @"AWEIMSendMessageContext",
+                  @[@"watch", @"Watch", @"send", @"Send", @"image", @"Image", @"model", @"Model"], 60);
 
     SLLog(@"ONCE| 装配完成");
 }
