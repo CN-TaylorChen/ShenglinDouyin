@@ -1,12 +1,16 @@
-// v0.5.4：闪图字段勘察（只读探测）
+// v0.5.5：闪图字段勘察（只读探测）
 //
 // 要回答的问题只有一个：抖音私聊的「闪图」和普通图片，在模型层到底差在哪？
 //   ① 是否存在独立的闪图消息类（名字里带 Flash / Burn / Ephemeral）；
-//   ② 闪图标记是 ext 字典里的一个字段，还是消息模型上的独立属性（setFlash: / setBurnAfterRead:）。
+//   ② 闪图标记是 ext 字典里的一个字段，还是消息模型上的独立属性。
 //
-// 只要拿到 ①②，就能判断「相册选图」能不能在原地上包一层闪图发出去。
-// 本文件只做三件事：枚举类名、打印候选方法、给候选 setter 挂一个「记完就转交」的钩子。
-// 不构造、不修改、不拦截任何业务调用 —— 所有 setter 都先调原实现，再写日志。
+// v0.5.4 的教训：一口气 dump 上千个类方法、每行日志一次 fsync —— 装完直接卡成 PPT，
+// 而且 FLASH 全命中了电商「FlashSale」秒杀业务类，一条有用信息都没有。这一版：
+//   · 只打类名，不再全量 dump 方法（最多挑 3 个最相关的类各打 20 行）；
+//   · 闪图类必须同时命中 msg/message/image/chat 之类的 IM 词，秒杀类一律排除；
+//   · 日志先在内存攒批，40 行或 0.5s 才落一次盘；总行数封顶 400；
+//   · 钩子只挂 ext/flash 家族，最多 80 个，单 sel 记 3 次，5 分钟后自动失活（只剩一次转发）。
+// 所有 setter 都是「先调原实现，再记一行」，不构造、不修改、不拦截任何业务调用。
 
 #import "SLFlashProbe.h"
 #import "SLLog.h"
@@ -15,20 +19,53 @@
 #import <string.h>
 #import <stdarg.h>
 
-#define kSLProbeLineCap     1800   // 防止一次刷爆日志文件
-#define kSLProbeMaxHooks    1024
-#define kSLProbePerSelLogs    40   // 同一个 setter 最多记 40 次，避免高频属性刷屏
+#define kSLProbeMaxLines     400    // 整份探测日志的上限
+#define kSLProbeBatchLines    40    // 攒够这么多行落一次盘
+#define kSLProbeMaxHooks      80    // 钩子数量上限
+#define kSLProbePerSelLogs     3    // 同一个 setter 最多记 3 次
+#define kSLProbeActiveSec    300    // 5 分钟后钩子自动失活
 
-static NSInteger sProbeLines = 0;
+static NSMutableArray<NSString *> *sBuf = nil;
+static NSInteger sTotalLines = 0;          // 只在这条串行队列里读写
+static BOOL sFlushScheduled = NO;
+static volatile BOOL sProbeActive = YES;   // 钩子热路径只看这一个 bool
+
+// 一次 SLLogWrite = 一次 open + write + fsync + close，绝不能每行来一发
+static void PFlushLocked(void) {
+    if (sBuf.count == 0) return;
+    NSString *joined = [sBuf componentsJoinedByString:@"\n"];
+    [sBuf removeAllObjects];
+    SLLogWrite(joined);
+}
+
+static void PBuf(NSString *line) {
+    if (!line.length) return;
+    static dispatch_queue_t q = NULL;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        q = dispatch_queue_create("com.shenglin.probe", DISPATCH_QUEUE_SERIAL);
+        sBuf = [NSMutableArray array];
+    });
+    dispatch_async(q, ^{
+        if (sTotalLines >= kSLProbeMaxLines) return;
+        sTotalLines++;
+        [sBuf addObject:line];
+        if (sBuf.count >= kSLProbeBatchLines) { PFlushLocked(); return; }
+        if (sFlushScheduled) return;
+        sFlushScheduled = YES;
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)), q, ^{
+            sFlushScheduled = NO;
+            PFlushLocked();
+        });
+    });
+}
 
 static void PLog(NSString *fmt, ...) {
-    if (sProbeLines >= kSLProbeLineCap) return;
-    sProbeLines++;
     va_list ap;
     va_start(ap, fmt);
     NSString *body = [[NSString alloc] initWithFormat:fmt arguments:ap];
     va_end(ap);
-    SLLog(@"PROBE| %@", body);
+    PBuf([@"PROBE2| " stringByAppendingString:body]);
 }
 
 static NSString *SLProbeTrunc(id v, NSUInteger max) {
@@ -39,8 +76,7 @@ static NSString *SLProbeTrunc(id v, NSUInteger max) {
     return s;
 }
 
-static BOOL SLProbeNameHas(NSString *name, NSArray<NSString *> *keys) {
-    if (!name.length) return NO;
+static BOOL SLProbeHas(NSString *name, NSArray<NSString *> *keys) {
     NSString *low = name.lowercaseString;
     for (NSString *k in keys) {
         if ([low containsString:k]) return YES;
@@ -48,11 +84,18 @@ static BOOL SLProbeNameHas(NSString *name, NSArray<NSString *> *keys) {
     return NO;
 }
 
-// 只认「IM 消息/图片」这一片，避免把整个 App 的类都翻一遍
+// 只认「IM 消息/图片」这一片
 static BOOL SLProbeIsIMClass(NSString *n) {
     if ([n containsString:@"Message"] || [n containsString:@"Msg"]) return YES;
     if ([n hasPrefix:@"AWEIM"] || [n hasPrefix:@"IESIM"] || [n hasPrefix:@"TTIM"]) return YES;
     return NO;
+}
+
+// 电商秒杀（FlashSale）/ 直播间 / 商品 SKU 这些「Flash」是干扰项，一律不碰
+static BOOL SLProbeIsCommerceNoise(NSString *n) {
+    return SLProbeHas(n, @[@"sale", @"shop", @"sku", @"commerce", @"product", @"entrance",
+                           @"countdown", @"reduction", @"privilege", @"anchor", @"room",
+                           @"category", @"banner", @"coupon", @"checkout"]);
 }
 
 static void SLProbeDumpMethods(Class cls, NSString *tag, NSArray<NSString *> *onlyKeys, NSInteger maxLines) {
@@ -61,10 +104,9 @@ static void SLProbeDumpMethods(Class cls, NSString *tag, NSArray<NSString *> *on
     if (!ms) return;
     NSMutableArray<NSString *> *lines = [NSMutableArray array];
     for (unsigned int i = 0; i < n; i++) {
-        SEL sel = method_getName(ms[i]);
-        NSString *sn = [NSString stringWithUTF8String:sel_getName(sel)];
-        if (!sn) continue;
-        if (onlyKeys.count && !SLProbeNameHas(sn, onlyKeys)) continue;
+        NSString *sn = [NSString stringWithUTF8String:sel_getName(method_getName(ms[i]))];
+        if (!sn.length) continue;
+        if (onlyKeys.count && !SLProbeHas(sn, onlyKeys)) continue;
         const char *enc = method_getTypeEncoding(ms[i]);
         NSString *es = enc ? [NSString stringWithUTF8String:enc] : @"";
         [lines addObject:[NSString stringWithFormat:@"%@ %@ %@", tag, sn, es]];
@@ -73,16 +115,28 @@ static void SLProbeDumpMethods(Class cls, NSString *tag, NSArray<NSString *> *on
     [lines sortUsingSelector:@selector(compare:)];
     NSInteger shown = 0;
     for (NSString *l in lines) {
-        if (shown >= maxLines) {
-            PLog(@"%@ …(还有 %lu 条未打印)", tag, (unsigned long)(lines.count - (NSUInteger)shown));
-            break;
-        }
+        if (shown >= maxLines) break;
         PLog(@"%@", l);
         shown++;
     }
 }
 
-#pragma mark - 类清单
+#pragma mark - 类清单（只打名字，成本可忽略）
+
+// 类名粗筛：直接在 C 字符串上做，避免给 20 万个类各建一个 NSString
+static BOOL SLProbeCStrHas(const char *s, const char *needle) {
+    return s && needle && strstr(s, needle) != NULL;
+}
+
+static BOOL SLProbeMaybeRelevant(const char *cn) {
+    if (!cn) return NO;
+    if (SLProbeCStrHas(cn, "lash") || SLProbeCStrHas(cn, "urn") ||
+        SLProbeCStrHas(cn, "phemeral") || SLProbeCStrHas(cn, "napchat")) return YES;
+    if (SLProbeCStrHas(cn, "Message") || SLProbeCStrHas(cn, "Msg") ||
+        SLProbeCStrHas(cn, "AWEIM") || SLProbeCStrHas(cn, "IESIM") ||
+        SLProbeCStrHas(cn, "TTIM") || SLProbeCStrHas(cn, "Image") || SLProbeCStrHas(cn, "Picker")) return YES;
+    return NO;
+}
 
 static void SLProbeInventory(void) {
     int count = objc_getClassList(NULL, 0);
@@ -96,63 +150,74 @@ static void SLProbeInventory(void) {
     NSMutableArray<NSString *> *imSend = [NSMutableArray array];
     NSMutableArray<NSString *> *picker = [NSMutableArray array];
 
+    NSArray<NSString *> *imWords = @[@"msg", @"message", @"image", @"pic", @"media", @"chat"];
+
     for (int i = 0; i < count; i++) {
-        Class c = list[i];
-        const char *cn = class_getName(c);
-        if (!cn) continue;
+        const char *cn = class_getName(list[i]);
+        if (!SLProbeMaybeRelevant(cn)) continue;
         NSString *n = [NSString stringWithUTF8String:cn];
         if (!n.length) continue;
 
-        if (SLProbeNameHas(n, @[@"flash", @"burn", @"ephemeral", @"snapchat", @"yuehou"])) {
+        if (SLProbeHas(n, @[@"flash", @"burn", @"ephemeral", @"snapchat"]) &&
+            SLProbeHas(n, imWords) && !SLProbeIsCommerceNoise(n)) {
             [flash addObject:n];
             continue;
         }
-        if (SLProbeIsIMClass(n) && SLProbeNameHas(n, @[@"image", @"pic", @"media", @"photo", @"album"])) {
+        if (SLProbeIsIMClass(n) && SLProbeHas(n, @[@"image", @"pic", @"media", @"photo", @"album"])) {
             [imImage addObject:n];
             continue;
         }
-        if (SLProbeIsIMClass(n) && SLProbeNameHas(n, @[@"send", @"upload"])) {
+        if (SLProbeIsIMClass(n) && SLProbeHas(n, @[@"send", @"upload"])) {
             [imSend addObject:n];
             continue;
         }
-        if (SLProbeNameHas(n, @[@"imagepicker", @"photopicker", @"albumpicker", @"mediapicker"])) {
+        if (SLProbeHas(n, @[@"imagepicker", @"photopicker", @"albumpicker", @"mediapicker"])) {
             [picker addObject:n];
         }
     }
     free(list);
 
-    PLog(@"== 类清单：总计 %d 个；闪图候选 %lu；IM 图片 %lu；IM 发送 %lu；选图器 %lu ==",
+    PLog(@"== 类清单：共 %d 类；闪图 %lu / IM图 %lu / IM发送 %lu / 选图器 %lu ==",
          count, (unsigned long)flash.count, (unsigned long)imImage.count,
          (unsigned long)imSend.count, (unsigned long)picker.count);
 
     [flash sortUsingSelector:@selector(compare:)];
+    NSInteger fc = 0;
     for (NSString *n in flash) {
+        if (fc++ >= 25) { PLog(@"FLASH-CLASS …(截断)"); break; }
         PLog(@"FLASH-CLASS %@", n);
     }
+    // 只挑前 3 个类看方法，够判断「是不是独立消息类」了
+    NSInteger dumps = 0;
     for (NSString *n in flash) {
+        if (dumps++ >= 3) break;
         Class c = NSClassFromString(n);
-        if (c) SLProbeDumpMethods(c, @"FLASH-M", nil, 60);
+        if (c) SLProbeDumpMethods(c, @"FLASH-M", @[@"flash", @"burn", @"send", @"ext", @"content"], 20);
     }
 
     [imImage sortUsingSelector:@selector(compare:)];
-    for (NSString *n in imImage) PLog(@"IMIMG-CLASS %@", n);
+    NSInteger ic = 0;
     for (NSString *n in imImage) {
-        Class c = NSClassFromString(n);
-        if (c) SLProbeDumpMethods(c, @"IMIMG-M", @[@"send", @"image", @"flash", @"upload", @"ext", @"content"], 30);
+        if (ic++ >= 45) { PLog(@"IMIMG-CLASS …(截断)"); break; }
+        PLog(@"IMIMG-CLASS %@", n);
     }
 
     [imSend sortUsingSelector:@selector(compare:)];
-    for (NSString *n in imSend) PLog(@"IMSEND-CLASS %@", n);
+    NSInteger sc = 0;
     for (NSString *n in imSend) {
-        Class c = NSClassFromString(n);
-        if (c) SLProbeDumpMethods(c, @"IMSEND-M", @[@"send", @"upload", @"flash", @"image"], 30);
+        if (sc++ >= 30) { PLog(@"IMSEND-CLASS …(截断)"); break; }
+        PLog(@"IMSEND-CLASS %@", n);
     }
 
     [picker sortUsingSelector:@selector(compare:)];
-    for (NSString *n in picker) PLog(@"PICKER-CLASS %@", n);
+    NSInteger pc = 0;
+    for (NSString *n in picker) {
+        if (pc++ >= 15) { PLog(@"PICKER-CLASS …(截断)"); break; }
+        PLog(@"PICKER-CLASS %@", n);
+    }
 }
 
-#pragma mark - 候选 setter 钩子（先调原实现，再记一行）
+#pragma mark - 少量 setter 钩子（先调原实现，再记一行）
 
 typedef struct {
     Class cls;
@@ -173,7 +238,7 @@ static void SLProbeEnsureDicts(void) {
     });
 }
 
-// 这个类「自己」有没有实现 sel（class_copyMethodList 只返回本类方法）
+// 这个类「自己」有没有实现 sel
 static BOOL SLProbeClassOwnsSel(Class k, SEL sel) {
     NSString *key = [NSString stringWithFormat:@"%s|%s", class_getName(k), sel_getName(sel)];
     @synchronized (sProbeOwnsCache) {
@@ -191,8 +256,7 @@ static BOOL SLProbeClassOwnsSel(Class k, SEL sel) {
     }
 }
 
-// 沿继承链找「这次调用原本该走的实现」。
-// 只认我们钩过的类是不够的：中间层若自己重写了 setter，直接跳到祖先实现会把中间层逻辑吞掉。
+// 找「这次调用原本该走的实现」；中间层自己重写了就交给它，不许跳过
 static IMP SLProbeOrigIMP(Class cls, SEL sel) {
     for (Class k = cls; k; k = class_getSuperclass(k)) {
         for (int i = 0; i < sProbeHookCount; i++) {
@@ -217,37 +281,42 @@ static BOOL SLProbeShouldLog(SEL sel) {
 static void SLProbeObjSetter(id self, SEL _cmd, id arg) {
     IMP o = SLProbeOrigIMP(object_getClass(self), _cmd);
     if (o) ((void (*)(id, SEL, id))o)(self, _cmd, arg);
-    if (!SLProbeShouldLog(_cmd)) return;
-    PLog(@"SET %s -%s = %@", class_getName(object_getClass(self)), sel_getName(_cmd), SLProbeTrunc(arg, 600));
+    if (!sProbeActive || !SLProbeShouldLog(_cmd)) return;
+    PLog(@"SET %s -%s = %@", class_getName(object_getClass(self)), sel_getName(_cmd), SLProbeTrunc(arg, 500));
 }
 
 static void SLProbeIntSetter(id self, SEL _cmd, long arg) {
     IMP o = SLProbeOrigIMP(object_getClass(self), _cmd);
     if (o) ((void (*)(id, SEL, long))o)(self, _cmd, arg);
-    if (!SLProbeShouldLog(_cmd)) return;
+    if (!sProbeActive || !SLProbeShouldLog(_cmd)) return;
     PLog(@"SET %s -%s = %ld", class_getName(object_getClass(self)), sel_getName(_cmd), arg);
 }
 
 static void SLProbeDblSetter(id self, SEL _cmd, double arg) {
     IMP o = SLProbeOrigIMP(object_getClass(self), _cmd);
     if (o) ((void (*)(id, SEL, double))o)(self, _cmd, arg);
-    if (!SLProbeShouldLog(_cmd)) return;
+    if (!sProbeActive || !SLProbeShouldLog(_cmd)) return;
     PLog(@"SET %s -%s = %f", class_getName(object_getClass(self)), sel_getName(_cmd), arg);
 }
 
-// 只碰这几种 setter：ext 家族（大概率装闪图标记）+ 名字里直接带 flash/burn
+// 只碰 ext / flash 家族；MessageType 这类超高频属性不碰（信息量低、影响大）
 static BOOL SLProbeIsInterestingSetter(const char *sn) {
     if (!sn || strncmp(sn, "set", 3) != 0) return NO;
-    static const char *keys[] = { "Ext", "Extra", "Flash", "Burn", "Snap", "Ephemeral", "MessageType", "MsgType" };
+    static const char *keys[] = { "Ext", "Extra", "Flash", "Burn", "Snap", "Ephemeral" };
     for (size_t i = 0; i < sizeof(keys) / sizeof(keys[0]); i++) {
         if (strstr(sn + 3, keys[i])) return YES;
     }
     return NO;
 }
 
+static BOOL SLProbeHookableClass(NSString *n) {
+    if (!( [n containsString:@"Message"] || [n containsString:@"Msg"] )) return NO;
+    if (SLProbeIsCommerceNoise(n)) return NO;
+    return !SLProbeHas(n, @[@"cell", @"view", @"controller", @"banner", @"card", @"label", @"button"]);
+}
+
 static void SLProbeHookSetter(Class cls, Method m) {
     if (sProbeHookCount >= kSLProbeMaxHooks) return;
-    SEL sel = method_getName(m);
     const char *enc = method_getTypeEncoding(m);
     if (!enc) return;
     NSMethodSignature *sig = [NSMethodSignature signatureWithObjCTypes:enc];
@@ -257,13 +326,13 @@ static void SLProbeHookSetter(Class cls, Method m) {
     BOOL obj = (t == '@');
     BOOL dbl = (t == 'd');
     BOOL intg = (strchr("cCsSiIlLqQB", t) != NULL);
-    if (!obj && !dbl && !intg) return;   // 结构体/指针/float 一律不碰，宁缺勿错
+    if (!obj && !dbl && !intg) return;   // 结构体/指针/float 一律不碰
 
     IMP repl = obj ? (IMP)SLProbeObjSetter : (dbl ? (IMP)SLProbeDblSetter : (IMP)SLProbeIntSetter);
     IMP orig = method_setImplementation(m, repl);
     if (!orig) return;
     sProbeHooks[sProbeHookCount].cls = cls;
-    sProbeHooks[sProbeHookCount].sel = sel;
+    sProbeHooks[sProbeHookCount].sel = method_getName(m);
     sProbeHooks[sProbeHookCount].imp = orig;
     sProbeHookCount++;
 }
@@ -277,26 +346,32 @@ static void SLProbeInstallHooks(void) {
     count = objc_getClassList(list, count);
 
     int classes = 0;
-    for (int i = 0; i < count; i++) {
-        Class c = list[i];
-        const char *cn = class_getName(c);
-        if (!cn) continue;
+    for (int i = 0; i < count && sProbeHookCount < kSLProbeMaxHooks; i++) {
+        const char *cn = class_getName(list[i]);
+        if (!SLProbeCStrHas(cn, "Message") && !SLProbeCStrHas(cn, "Msg")) continue;
         NSString *n = [NSString stringWithUTF8String:cn];
-        if (!n.length || !SLProbeIsIMClass(n)) continue;
+        if (!n.length || !SLProbeHookableClass(n)) continue;
         classes++;
 
         unsigned int mn = 0;
-        Method *ms = class_copyMethodList(c, &mn);
+        Method *ms = class_copyMethodList(list[i], &mn);
         if (!ms) continue;
-        for (unsigned int k = 0; k < mn; k++) {
+        for (unsigned int k = 0; k < mn && sProbeHookCount < kSLProbeMaxHooks; k++) {
             if (SLProbeIsInterestingSetter(sel_getName(method_getName(ms[k])))) {
-                SLProbeHookSetter(c, ms[k]);
+                SLProbeHookSetter(list[i], ms[k]);
             }
         }
         free(ms);
     }
     free(list);
-    PLog(@"== setter 钩子：候选类 %d 个，实际挂上 %d 个 ==", classes, sProbeHookCount);
+    PLog(@"== setter 钩子：候选类 %d 个，挂上 %d 个（%d 秒后自动失活）==",
+         classes, sProbeHookCount, kSLProbeActiveSec);
+
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(kSLProbeActiveSec * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        sProbeActive = NO;
+        PLog(@"== 探测窗口结束，钩子已失活（只保留转发）==");
+    });
 }
 
 #pragma mark - 入口
@@ -306,11 +381,11 @@ void SLFlashProbeStart(void) {
     if (sStarted) return;
     sStarted = YES;
 
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.0 * NSEC_PER_SEC)),
-                   dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(6.0 * NSEC_PER_SEC)),
+                   dispatch_get_global_queue(QOS_CLASS_BACKGROUND, 0), ^{
         @autoreleasepool {
             CFTimeInterval t0 = CFAbsoluteTimeGetCurrent();
-            PLog(@"==== 闪图探测开始 v0.5.4 · 抖音 %@ ====",
+            PLog(@"==== 闪图探测 v0.5.5 · 抖音 %@ ====",
                  [[NSBundle mainBundle] objectForInfoDictionaryKey:@"CFBundleShortVersionString"] ?: @"?");
             @try {
                 SLProbeInventory();
@@ -322,7 +397,7 @@ void SLFlashProbeStart(void) {
             } @catch (NSException *e) {
                 PLog(@"装钩异常: %@", e.reason ?: @"?");
             }
-            PLog(@"==== 闪图探测就绪（%.2fs）：现在发一条普通图片、再发一条闪图 ====",
+            PLog(@"==== 探测就绪（%.2fs）：请发一条普通图片、再发一条闪图 ====",
                  CFAbsoluteTimeGetCurrent() - t0);
         }
     });

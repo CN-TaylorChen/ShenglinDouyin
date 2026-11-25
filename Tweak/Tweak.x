@@ -890,7 +890,7 @@ static void setupAudioIconElementHook(void) {
         @try { SLStartEntryWatcher(); } @catch (NSException *e) {
             SLLog(@"悬浮球装配失败: %@", e);
         }
-        // v0.5.4 闪图探测：只枚举类 + 记录 setter，不改任何发送行为
+        // v0.5.5 闪图探测：只枚举类 + 记录 setter，不改任何发送行为（按批落盘，不卡界面）
         @try { SLFlashProbeStart(); } @catch (NSException *e) {
             SLLog(@"闪图探测启动失败: %@", e);
         }
