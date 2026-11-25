@@ -64,6 +64,11 @@ void SLCloseHostingPanel(UIViewController *vc);
 // 实现在 SLEntry.m（SLFloatPanelController 是私有类，外面拿不到）。
 void SLPresentSettings(UIViewController *host);
 
+// v0.5.7：#ball 口令控制显隐。
+// 隐藏只是 hidden = YES —— 位置、图标、当前状态全部保留，再打一次 #ball 原样回来。
+BOOL SLFloatIsHidden(void);
+void SLSetFloatHidden(BOOL hidden);
+
 // v0.4.41：清掉当前装填的那一发（语音包 / 生成语音都算）。
 // 语音包和「生成语音」共用同一个槽位，后写覆盖先写 —— 选包时调它把合成音赶走，
 // 否则会出现「明明选了包，发出去却是刚才那段合成音」。实现放在 Tweak.x。

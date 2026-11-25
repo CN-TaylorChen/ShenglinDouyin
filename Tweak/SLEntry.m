@@ -3353,6 +3353,35 @@ static CGPoint SLLoadFloatPos(CGSize size) {
 
 #pragma mark - 悬浮球挂载
 
+// v0.5.7：#ball 口令的显隐状态。
+// 只用 hidden，不卸载 —— 球的位置、图标、三态颜色都留着，再打一次口令原样回来。
+// 必须放在 SLEnsureFloatButton 前面：窗口每换一次都会重新挂载，隐藏状态要能带过去。
+static BOOL sSLFloatHidden = NO;
+
+BOOL SLFloatIsHidden(void) {
+    return sSLFloatHidden;
+}
+
+void SLSetFloatHidden(BOOL hidden) {
+    void (^work)(void) = ^{
+        sSLFloatHidden = hidden;
+        // 隐藏期间窗口可能换过、球被迁走了，这里重新确保一次再取
+        SLEnsureFloatButton();
+        SLFloatButton *btn = sSLFloatBtn;
+        if (!btn) {
+            UIWindow *w = SLKeyWindow();
+            btn = (SLFloatButton *)[w viewWithTag:SLBtnTag];
+        }
+        btn.hidden = hidden;
+        [AWECAUtils showToast:(hidden ? @"悬浮球已收起 · 再打 #ball 叫回来"
+                                     : @"悬浮球回来了")
+                     duration:1.5];
+        SLLog(@"SL-MOMO: float button %@ (#ball)", hidden ? @"hidden" : @"shown");
+    };
+    if ([NSThread isMainThread]) work();
+    else dispatch_async(dispatch_get_main_queue(), work);
+}
+
 void SLEnsureFloatButton(void) {
     UIWindow *w = SLKeyWindow();
     if (!w) {
@@ -3384,6 +3413,8 @@ void SLEnsureFloatButton(void) {
         SLLog(@"SL-MOMO: float button mounted at %@", NSStringFromCGPoint(c));
         SLPackPrewarm();   // v0.4.34：启动后就把当前语音包解好，第一次录音也不用等
     }
+    // v0.5.7：被 #ball 收起来之后，换窗口重新挂载也不能自己冒头
+    btn.hidden = sSLFloatHidden;
     sSLFloatBtn = btn;
 }
 

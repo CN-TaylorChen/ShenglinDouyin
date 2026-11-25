@@ -11,6 +11,7 @@
 #import "SLEntry.h"
 #import "SLLog.h"
 #import "SLFlashProbe.h"
+#import "SLBallCommand.h"
 #import "SLVoicePack.h"
 #import <objc/runtime.h>
 #import <objc/message.h>
@@ -890,7 +891,11 @@ static void setupAudioIconElementHook(void) {
         @try { SLStartEntryWatcher(); } @catch (NSException *e) {
             SLLog(@"悬浮球装配失败: %@", e);
         }
-        // v0.5.6 闪图探测：图片消息时 dump 整对象 ivar，不改任何发送行为（按批落盘，不卡界面）
+        // v0.5.7：#ball 口令 —— 任意输入框里打 #ball 收起 / 叫回悬浮球
+        @try { SLBallCommandStart(); } @catch (NSException *e) {
+            SLLog(@"#ball 口令装配失败: %@", e);
+        }
+        // v0.5.7 闪图探测：图片消息时 dump 整对象 ivar（含父类），不改任何发送行为
         @try { SLFlashProbeStart(); } @catch (NSException *e) {
             SLLog(@"闪图探测启动失败: %@", e);
         }
