@@ -16,6 +16,7 @@
 #import "SLLog.h"
 #import <objc/runtime.h>
 #import <objc/message.h>
+#import <string.h>
 #import <UIKit/UIKit.h>
 
 #define kSLOnceEntry @"SLWatchOnceEntry"
@@ -111,6 +112,36 @@ static void SLInstallVoid(Class cls, SEL sel, IMP imp, IMP *origSlot, NSString *
         if (r) free(r);
         return;
     }
+    SLInstall(cls, sel, imp, origSlot, tag);
+}
+
+// 参数签名校验：'@' = 对象，'i' = 整数（NSInteger / NSUInteger / enum 都算），'B' = BOOL。
+// 参数类型不明就挂钩 = 把实参传坏，这类错误在运行时只表现为「发消息闪退」，所以必须先验。
+static BOOL SLArgsAre(Method m, const char *types) {
+    unsigned int n = method_getNumberOfArguments(m);
+    size_t len = strlen(types);
+    if (n != len + 2) return NO;
+    for (size_t i = 0; i < len; i++) {
+        char buf[16] = {0};
+        method_getArgumentType(m, (unsigned int)(i + 2), buf, sizeof(buf));
+        char t = buf[0], want = types[i];
+        if (want == '@') { if (t != '@') return NO; }
+        else if (want == 'i') {
+            if (t != 'q' && t != 'i' && t != 'I' && t != 'Q' && t != 'l' && t != 'L') return NO;
+        }
+        else if (want == 'B') { if (t != 'B' && t != 'c') return NO; }
+        else if (t != want) return NO;
+    }
+    return YES;
+}
+
+static void SLInstallVoidTyped(Class cls, SEL sel, const char *types,
+                               IMP imp, IMP *origSlot, NSString *tag) {
+    if (!cls) { SLLog(@"ONCE| 跳过 %@：类不存在", tag); return; }
+    Method m = SLExactMethod(cls, sel);
+    if (!m) { SLLog(@"ONCE| 跳过 %@：%@ 未实现该 selector", tag, NSStringFromClass(cls)); return; }
+    if (!SLReturnTypeIs(m, 'v')) { SLLog(@"ONCE| 跳过 %@：返回不是 void", tag); return; }
+    if (!SLArgsAre(m, types)) { SLLog(@"ONCE| 跳过 %@：参数签名不匹配", tag); return; }
     SLInstall(cls, sel, imp, origSlot, tag);
 }
 
