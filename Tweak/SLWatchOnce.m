@@ -579,19 +579,72 @@ static void SLFireWatchOnce(UIView *source) {
     }
 
     sSLOncePending = YES;
-    SLLog(@"BTN| 触发闪图发送 pending=1（工具栏 %@）", bar ? @"有" : @"无");
+    SLLog(@"BTN| 触发闪图发送 pending=1");
 
-    @try {
-        if (bar && [bar respondsToSelector:@selector(onSendButtonTapped)]) {
-            ((void (*)(id, SEL))objc_msgSend)(bar, @selector(onSendButtonTapped));
-            SLLog(@"BTN| 已调 -onSendButtonTapped");
-        } else if (send) {
-            [send sendActionsForControlEvents:UIControlEventTouchUpInside];
-            SLLog(@"BTN| 已触发发送按钮");
-        }
-    } @catch (NSException *e) {
-        SLLog(@"BTN| 触发异常 %@", e);
+    // v0.7.2：日志证明工具栏 delegate = AWEIMMessageListGalleryEntryComponent，
+    // 它身上就有 watchOnceSendButtonInPickerPressed: / sendAsWatchOnce / sendAsNormal。
+    // 之前调 onSendButtonTapped = 普通发送，所以发出去的是普通图。
+    id del = nil;
+    if (bar && [bar respondsToSelector:@selector(delegate)]) {
+        @try { del = [bar performSelector:@selector(delegate)]; } @catch (NSException *e) { (void)e; }
     }
+    if (del) SLLog(@"BTN| delegate = %@", NSStringFromClass([del class]));
+
+    // 第一步：把 delegate 切到「闪图」模式
+    if (del) {
+        if ([del respondsToSelector:@selector(setSendAsWatchOnce:)]) {
+            ((void (*)(id, SEL, BOOL))objc_msgSend)(del, @selector(setSendAsWatchOnce:), YES);
+            SLLog(@"BTN| delegate.sendAsWatchOnce → 1");
+        }
+        if ([del respondsToSelector:@selector(setSendAsNormal:)]) {
+            ((void (*)(id, SEL, BOOL))objc_msgSend)(del, @selector(setSendAsNormal:), NO);
+            SLLog(@"BTN| delegate.sendAsNormal → 0");
+        }
+        if ([del respondsToSelector:@selector(setDisableSendWatchOnce:)]) {
+            ((void (*)(id, SEL, BOOL))objc_msgSend)(del, @selector(setDisableSendWatchOnce:), NO);
+            SLLog(@"BTN| delegate.disableSendWatchOnce → 0");
+        }
+    }
+
+    // 第二步：按优先级真正触发一次发送
+    BOOL fired = NO;
+    if (del && [del respondsToSelector:@selector(watchOnceSendButtonInPickerPressed:)]) {
+        @try {
+            ((void (*)(id, SEL, id))objc_msgSend)(del,
+                @selector(watchOnceSendButtonInPickerPressed:), (id)(send ?: bar));
+            fired = YES;
+            SLLog(@"BTN| 已调 -watchOnceSendButtonInPickerPressed:");
+        } @catch (NSException *e) { SLLog(@"BTN| 闪图发送异常 %@", e); }
+    }
+    if (!fired && del && [del respondsToSelector:@selector(sendButtonInPickerPressed:)]) {
+        @try {
+            ((void (*)(id, SEL, id))objc_msgSend)(del,
+                @selector(sendButtonInPickerPressed:), (id)(send ?: bar));
+            fired = YES;
+            SLLog(@"BTN| 已调 -sendButtonInPickerPressed:（delegate 已置闪图模式）");
+        } @catch (NSException *e) { SLLog(@"BTN| 发送异常 %@", e); }
+    }
+    if (!fired && bar && [bar respondsToSelector:@selector(onSendButtonTapped)]) {
+        @try {
+            ((void (*)(id, SEL))objc_msgSend)(bar, @selector(onSendButtonTapped));
+            fired = YES;
+            SLLog(@"BTN| 已调 -onSendButtonTapped（兜底）");
+        } @catch (NSException *e) { SLLog(@"BTN| 兜底异常 %@", e); }
+    }
+    if (!fired) SLLog(@"BTN| 没有任何可用发送入口");
+
+    // 第三步：3 秒后把 delegate 复位，免得下一次点普通发送也变成闪图
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.0 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        if (!del) return;
+        @try {
+            if ([del respondsToSelector:@selector(setSendAsWatchOnce:)])
+                ((void (*)(id, SEL, BOOL))objc_msgSend)(del, @selector(setSendAsWatchOnce:), NO);
+            if ([del respondsToSelector:@selector(setSendAsNormal:)])
+                ((void (*)(id, SEL, BOOL))objc_msgSend)(del, @selector(setSendAsNormal:), YES);
+            SLLog(@"BTN| delegate 已复位（sendAsWatchOnce=0 / sendAsNormal=1）");
+        } @catch (NSException *e) { (void)e; }
+    });
 
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.5 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
@@ -643,49 +696,47 @@ static void SLLayoutOnceButton(UIViewController *vc, BOOL verbose) {
     b.layer.zPosition = 3000;
     b.hidden = NO;
 
-    UIView *bar = SLFindByClass(root, @"AWEIMPhotoPickerToolbarViewV2", 0);
-    CGRect barRect = CGRectZero;
-    UIButton *send = nil;
-    if (bar) {
-        barRect = [bar convertRect:bar.bounds toView:root];
-        send = SLFindButtonWithTitle(bar, @"发送", 0);
-    }
-    if (!send) send = SLFindButtonWithTitle(root, @"发送", 0);
+    // v0.7.2：不再换坐标系算位置 —— 日志证明 toolbar 高度是 0、发送按钮 y=940 已经超出页面 926，
+    // 任何 convertRect 都会算歪。直接挂到「发送」按钮的父视图上，用同一套本地坐标，天然对齐同一行。
+    UIButton *send = SLFindButtonWithTitle(root, @"发送", 0);
+    UIView *p = send.superview;
+    CGRect sr = send.frame;
+    BOOL ok = (p != nil) && (sr.size.height > 1) && (sr.size.width > 1);
 
-    CGRect dst = CGRectZero;
-    NSString *how = @"右下角兜底";
-
-    if (send) {
-        CGRect r = [send convertRect:send.bounds toView:root];
-        if (r.size.width > 1 && r.size.height > 1) {
-            dst = CGRectMake(r.origin.x - 48, CGRectGetMidY(r) - 20, 40, 40);
-            how = @"发送键左侧";
+    if (ok) {
+        if (b.superview != p) {
+            [b removeFromSuperview];
+            [p addSubview:b];
         }
-    }
-    if (CGRectIsEmpty(dst) && barRect.size.height > 1) {
-        dst = CGRectMake(barRect.origin.x + 12, CGRectGetMidY(barRect) - 20, 40, 40);
-        how = @"工具栏左端";
-    }
-    if (CGRectIsEmpty(dst)) {
-        CGSize ss = root.bounds.size;
-        dst = CGRectMake(ss.width - 60, ss.height - 120, 40, 40);
+        [p bringSubviewToFront:b];
+        b.layer.zPosition = 3000;
+        CGFloat h = sr.size.height > 22 ? sr.size.height : 30;
+        CGFloat w = 40;
+        CGFloat x = sr.origin.x - w - 8;
+        if (x < 2) x = CGRectGetMaxX(sr) + 8;          // 左边放不下就放右边
+        b.frame = CGRectMake(x, CGRectGetMidY(sr) - h / 2, w, h);
+        b.layer.cornerRadius = h / 2;
+        if (verbose) {
+            SLLog(@"BTN| 摆位 %@ 方式=与发送同一行 父=%@ 发送=%@",
+                  NSStringFromCGRect(b.frame), NSStringFromClass([p class]),
+                  NSStringFromCGRect(sr));
+        }
+        return;
     }
 
-    // 绝不能跑出屏幕：不在可见范围内就等于没放
+    // 兜底：发送按钮还没建出来，先贴页面右下角，后面几次重排会纠正
+    if (b.superview != root) {
+        [b removeFromSuperview];
+        [root addSubview:b];
+    }
+    [root bringSubviewToFront:b];
+    b.layer.zPosition = 3000;
     CGSize ss = root.bounds.size;
-    if (ss.width > 80 && ss.height > 80) {
-        if (dst.origin.x < 8) dst.origin.x = 8;
-        if (dst.origin.y < 8) dst.origin.y = 8;
-        if (CGRectGetMaxX(dst) > ss.width - 8)  dst.origin.x = ss.width - 8 - dst.size.width;
-        if (CGRectGetMaxY(dst) > ss.height - 8) dst.origin.y = ss.height - 8 - dst.size.height;
-    }
-    b.frame = dst;
-
+    b.layer.cornerRadius = 20;
+    b.frame = CGRectMake(ss.width - 60, ss.height - 140, 40, 40);
     if (verbose) {
-        SLLog(@"BTN| 摆位 %@ 方式=%@ 根=%@ 栏=%@ 发送=%@", NSStringFromCGRect(dst), how,
-              NSStringFromCGRect(root.bounds),
-              bar ? NSStringFromCGRect(barRect) : @"无",
-              send ? NSStringFromCGRect([send convertRect:send.bounds toView:root]) : @"无");
+        SLLog(@"BTN| 摆位 %@ 方式=右下角兜底 根=%@ 发送=%@",
+              NSStringFromCGRect(b.frame), NSStringFromCGRect(root.bounds), send ? @"有" : @"无");
     }
 }
 
@@ -796,7 +847,7 @@ void SLWatchOnceStart(void) {
     if (started) return;
     started = YES;
 
-    SLLog(@"ONCE| ==== 相册闪图 v0.7.1 · 入口=%d · 默认闪图=%d ====",
+    SLLog(@"ONCE| ==== 相册闪图 v0.7.2 · 入口=%d · 默认闪图=%d ====",
           SLWatchOnceEntryOn(), SLWatchOnceForceOn());
 
     // v0.6.0 那两个开关没有生效（钩子从未被调用），设置页已撤掉；
