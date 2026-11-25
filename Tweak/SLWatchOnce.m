@@ -497,6 +497,7 @@ static UIButton *SLFindButtonWithTitle(UIView *root, NSString *needle, int depth
     return nil;
 }
 
+__attribute__((unused))
 static void SLScanButtons(UIView *v, int depth, int *budget) {
     if (!v || depth > 12 || *budget <= 0) return;
     if ([v isKindOfClass:[UIButton class]] || [v isKindOfClass:[UIControl class]]) {
@@ -510,95 +511,228 @@ static void SLScanButtons(UIView *v, int depth, int *budget) {
 }
 
 static void SLOnceTapped(UIButton *b);
+static void SLFireWatchOnce(UIView *source);
+static void SLShowOnceMenu(UIView *source);
 
 @interface SLOnceTarget : NSObject
 @end
 @implementation SLOnceTarget
 - (void)tap:(UIButton *)b { SLOnceTapped(b); }
+- (void)longPress:(UILongPressGestureRecognizer *)g {
+    if (g.state != UIGestureRecognizerStateBegan) return;
+    SLShowOnceMenu(g.view);
+}
 @end
 
 // UIButton 不持有 target，得自己留一个，否则点一下就野指针
 static SLOnceTarget *sSLOctTarget = nil;
+static BOOL sSLOncePending = NO;    // 点了「闪图」之后、这次发送结束之前为 YES
+static BOOL sSLBarDumped   = NO;    // delegate 方法名只 dump 一次
+
+// 长按「发送」时的选择菜单：普通 / 仅看一次。这是不依赖任何布局的兜底入口。
+static void SLShowOnceMenu(UIView *source) {
+    UIViewController *vc = SLParentVC(source) ?: SLParentVC(sSLOctBtn);
+    if (!vc) return;
+    if (vc.presentedViewController) return;
+
+    UIAlertController *sheet =
+        [UIAlertController alertControllerWithTitle:@"发送方式"
+                                            message:nil
+                                     preferredStyle:UIAlertControllerStyleActionSheet];
+    [sheet addAction:[UIAlertAction actionWithTitle:@"普通图片"
+                                              style:UIAlertActionStyleDefault
+                                            handler:nil]];
+    UIView *anchor = source;
+    [sheet addAction:[UIAlertAction actionWithTitle:@"仅看一次（闪图）"
+                                              style:UIAlertActionStyleDestructive
+                                            handler:^(UIAlertAction *a) { SLFireWatchOnce(anchor); }]];
+    [sheet addAction:[UIAlertAction actionWithTitle:@"取消"
+                                              style:UIAlertActionStyleCancel
+                                            handler:nil]];
+    // iPad / 弹层必须给 source，否则直接崩
+    UIPopoverPresentationController *pop = sheet.popoverPresentationController;
+    if (pop) {
+        pop.sourceView = source ?: vc.view;
+        pop.sourceRect = source ? source.bounds
+                                : CGRectMake(vc.view.bounds.size.width / 2,
+                                             vc.view.bounds.size.height / 2, 1, 1);
+        pop.permittedArrowDirections = 0;
+    }
+    [vc presentViewController:sheet animated:YES completion:nil];
+}
+
+// 真正触发一次闪图发送：挂上 pending 标志，然后走抖音自己的发送动作。
+// pending 期间 AWEIMSendMessageContext / IESIMSendMessageModel 的 setter 钩子会把
+// isClickWatchOnce 置 1 —— 抖音内部据此走「仅看一次」拿一次性凭证，消息类型自然变成 91。
+static void SLFireWatchOnce(UIView *source) {
+    UIViewController *vc = SLParentVC(source) ?: SLParentVC(sSLOctBtn);
+    UIView *root = (vc && vc.isViewLoaded) ? vc.view : nil;
+    UIView *bar = root ? SLFindByClass(root, @"AWEIMPhotoPickerToolbarViewV2", 0) : nil;
+
+    UIButton *send = nil;
+    if (bar) send = SLFindButtonWithTitle(bar, @"发送", 0);
+    if (!send && root) send = SLFindButtonWithTitle(root, @"发送", 0);
+
+    if (!bar && !send) {
+        SLLog(@"BTN| 触发失败：页面里既没有工具栏也没有发送按钮");
+        return;
+    }
+
+    sSLOncePending = YES;
+    SLLog(@"BTN| 触发闪图发送 pending=1（工具栏 %@）", bar ? @"有" : @"无");
+
+    @try {
+        if (bar && [bar respondsToSelector:@selector(onSendButtonTapped)]) {
+            ((void (*)(id, SEL))objc_msgSend)(bar, @selector(onSendButtonTapped));
+            SLLog(@"BTN| 已调 -onSendButtonTapped");
+        } else if (send) {
+            [send sendActionsForControlEvents:UIControlEventTouchUpInside];
+            SLLog(@"BTN| 已触发发送按钮");
+        }
+    } @catch (NSException *e) {
+        SLLog(@"BTN| 触发异常 %@", e);
+    }
+
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.5 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        if (sSLOncePending) {
+            sSLOncePending = NO;
+            SLLog(@"BTN| pending 超时清除（这次发送没有走到 context/model 钩子）");
+        }
+    });
+}
 
 static void SLOnceTapped(UIButton *b) {
     SLLog(@"BTN| == 点了闪图按钮 ==");
     UIViewController *vc = SLParentVC(b);
     SLLog(@"BTN| 所在页面 %@", NSStringFromClass([vc class]));
 
-    UIView *bar = vc.isViewLoaded ? SLFindByClass(vc.view, @"AWEIMPhotoPickerToolbarViewV2", 0) : nil;
-    SLLog(@"BTN| 工具栏 %@", bar ? NSStringFromClass([bar class]) : @"(没找到)");
+    UIView *bar = vc.isViewLoaded
+        ? SLFindByClass(vc.view, @"AWEIMPhotoPickerToolbarViewV2", 0) : nil;
+    UIButton *send = bar ? SLFindButtonWithTitle(bar, @"发送", 0) : nil;
+    SLLog(@"BTN| 工具栏 %@ · 发送按钮 %@", bar ? @"找到" : @"没找到", send ? @"找到" : @"没找到");
 
-    // 把工具栏上的按钮全部摊开：如果原生本来就有一个隐藏的闪图/眼睛按钮，这里会露出来
-    int budget = 40;
-    if (bar) SLScanButtons(bar, 0, &budget);
-
-    // 找原生入口：先工具栏、再页面、再工具栏的 delegate/VC
-    NSArray *sels = @[@"watchOnceSendButtonInPickerPressed:",
-                      @"watchOnceSendButtonInPreviewPressed:",
-                      @"sendWatchOnce",
-                      @"sendAsWatchOnce"];
-    NSMutableArray *targets = [NSMutableArray array];
-    if (bar) [targets addObject:bar];
-    if (vc) [targets addObject:vc];
-    if (bar && [bar respondsToSelector:@selector(delegate)]) {
+    // 工具栏的 delegate 就是发图的执行者，方法名只 dump 一次，用来接发送链路
+    if (bar && !sSLBarDumped && [bar respondsToSelector:@selector(delegate)]) {
+        sSLBarDumped = YES;
         id del = nil;
         @try { del = [bar performSelector:@selector(delegate)]; } @catch (NSException *e) { (void)e; }
-        if (del) [targets addObject:del];
-    }
-
-    for (NSString *name in sels) {
-        SEL sel = NSSelectorFromString(name);
-        for (id t in targets) {
-            if (![t respondsToSelector:sel]) continue;
-            SLLog(@"BTN| 调用 -%@ on %@", name, NSStringFromClass([t class]));
-            @try {
-                ((void (*)(id, SEL))objc_msgSend)(t, sel);
-                return;
-            } @catch (NSException *e) {
-                SLLog(@"BTN| 调用失败 %@", e);
-            }
+        if (del) {
+            NSString *dn = NSStringFromClass([del class]);
+            SLLog(@"BTN| 工具栏 delegate = %@", dn);
+            SLDumpMethods([del class], [NSString stringWithFormat:@"delegate(%@)", dn], @[], 80);
         }
     }
 
-    SLLog(@"BTN| 没找到原生闪图入口，已把工具栏按钮写进日志");
+    SLFireWatchOnce(b);
+}
+
+// 把所有坐标都换算到页面根视图坐标系里，再夹到可见范围内 —— 这一步是 v0.7.0 失败的根因：
+// viewDidAppear 时组件布局还没跑，toolbar 与发送按钮的 frame 都是 0，按钮被算到了屏幕外。
+static void SLLayoutOnceButton(UIViewController *vc, BOOL verbose) {
+    if (!vc || !vc.isViewLoaded) return;
+    UIView *root = vc.view;
+    UIButton *b = sSLOctBtn;
+    if (!b) return;
+
+    if (b.superview != root) {
+        [b removeFromSuperview];
+        [root addSubview:b];
+    }
+    [root bringSubviewToFront:b];
+    b.layer.zPosition = 3000;
+    b.hidden = NO;
+
+    UIView *bar = SLFindByClass(root, @"AWEIMPhotoPickerToolbarViewV2", 0);
+    CGRect barRect = CGRectZero;
+    UIButton *send = nil;
+    if (bar) {
+        barRect = [bar convertRect:bar.bounds toView:root];
+        send = SLFindButtonWithTitle(bar, @"发送", 0);
+    }
+    if (!send) send = SLFindButtonWithTitle(root, @"发送", 0);
+
+    CGRect dst = CGRectZero;
+    NSString *how = @"右下角兜底";
+
+    if (send) {
+        CGRect r = [send convertRect:send.bounds toView:root];
+        if (r.size.width > 1 && r.size.height > 1) {
+            dst = CGRectMake(r.origin.x - 48, CGRectGetMidY(r) - 20, 40, 40);
+            how = @"发送键左侧";
+        }
+    }
+    if (CGRectIsEmpty(dst) && barRect.size.height > 1) {
+        dst = CGRectMake(barRect.origin.x + 12, CGRectGetMidY(barRect) - 20, 40, 40);
+        how = @"工具栏左端";
+    }
+    if (CGRectIsEmpty(dst)) {
+        CGSize ss = root.bounds.size;
+        dst = CGRectMake(ss.width - 60, ss.height - 120, 40, 40);
+    }
+
+    // 绝不能跑出屏幕：不在可见范围内就等于没放
+    CGSize ss = root.bounds.size;
+    if (ss.width > 80 && ss.height > 80) {
+        if (dst.origin.x < 8) dst.origin.x = 8;
+        if (dst.origin.y < 8) dst.origin.y = 8;
+        if (CGRectGetMaxX(dst) > ss.width - 8)  dst.origin.x = ss.width - 8 - dst.size.width;
+        if (CGRectGetMaxY(dst) > ss.height - 8) dst.origin.y = ss.height - 8 - dst.size.height;
+    }
+    b.frame = dst;
+
+    if (verbose) {
+        SLLog(@"BTN| 摆位 %@ 方式=%@ 根=%@ 栏=%@ 发送=%@", NSStringFromCGRect(dst), how,
+              NSStringFromCGRect(root.bounds),
+              bar ? NSStringFromCGRect(barRect) : @"无",
+              send ? NSStringFromCGRect([send convertRect:send.bounds toView:root]) : @"无");
+    }
 }
 
 static void SLInstallOnceButton(UIViewController *vc) {
-    if (sSLOctBtn.superview) return;
     if (!vc.isViewLoaded) return;
 
-    UIView *host = SLFindByClass(vc.view, @"AWEIMPhotoPickerToolbarViewV2", 0) ?: vc.view;
-    UIButton *send = SLFindButtonWithTitle(host, @"发送", 0);
-
-    UIButton *b = [UIButton buttonWithType:UIButtonTypeCustom];
-    b.frame = CGRectMake(0, 0, 40, 40);
-    b.backgroundColor = [UIColor colorWithRed:0.47 green:0.33 blue:0.96 alpha:0.92];
-    b.layer.cornerRadius = 20;
-    b.layer.shadowColor = [UIColor colorWithRed:0.47 green:0.33 blue:0.96 alpha:0.5].CGColor;
-    b.layer.shadowRadius = 8;
-    b.layer.shadowOpacity = 1;
-    b.layer.shadowOffset = CGSizeZero;
-    if (@available(iOS 13.0, *)) {
-        UIImage *icon = [UIImage systemImageNamed:@"eye.fill"];
-        if (icon) [b setImage:icon forState:UIControlStateNormal];
+    if (!sSLOctBtn) {
+        UIButton *b = [UIButton buttonWithType:UIButtonTypeCustom];
+        b.frame = CGRectMake(0, 0, 40, 40);
+        b.backgroundColor = [UIColor colorWithRed:0.47 green:0.33 blue:0.96 alpha:0.95];
+        b.layer.cornerRadius = 20;
+        b.layer.shadowColor = [UIColor colorWithRed:0.35 green:0.2 blue:0.9 alpha:0.6].CGColor;
+        b.layer.shadowRadius = 6;
+        b.layer.shadowOpacity = 1;
+        b.layer.shadowOffset = CGSizeZero;
+        [b setTitle:@"闪" forState:UIControlStateNormal];
+        b.titleLabel.font = [UIFont boldSystemFontOfSize:16];
+        [b setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+        if (!sSLOctTarget) sSLOctTarget = [SLOnceTarget new];
+        [b addTarget:sSLOctTarget action:@selector(tap:) forControlEvents:UIControlEventTouchUpInside];
+        sSLOctBtn = b;
     }
-    if (!b.imageView.image) [b setTitle:@"闪" forState:UIControlStateNormal];
-    b.tintColor = [UIColor whiteColor];
-    if (!sSLOctTarget) sSLOctTarget = [SLOnceTarget new];
-    [b addTarget:sSLOctTarget action:@selector(tap:) forControlEvents:UIControlEventTouchUpInside];
 
-    if (send && send.superview == host) {
-        CGRect f = send.frame;
-        b.center = CGPointMake(f.origin.x - 26, CGRectGetMidY(f));
-    } else {
-        b.center = CGPointMake(host.bounds.size.width - 26,
-                               host.bounds.size.height - 26);
+    SLLayoutOnceButton(vc, YES);
+
+    // 组件化布局在 viewDidAppear 之后才完成，多次重排，以最后一次为准（幂等，不会加出第二个）
+    for (NSNumber *d in @[@0.15, @0.45, @1.0, @1.8]) {
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(d.doubleValue * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            if (sSLOctBtn.superview == vc.view) SLLayoutOnceButton(vc, NO);
+        });
     }
-    b.autoresizingMask = UIViewAutoresizingFlexibleLeftMargin | UIViewAutoresizingFlexibleTopMargin;
-    [host addSubview:b];
-    sSLOctBtn = b;
-    SLLog(@"BTN| 闪图按钮已放到 %@（发送按钮 %@）", NSStringFromClass([host class]),
-          send ? @"找到" : @"没找到");
+
+    // 兜底入口：长按工具栏「发送」，直接弹「普通 / 仅看一次」。不依赖按钮摆位。
+    // 用关联标记判断这个按钮是否已经加过，工具栏重建后能自动补上。
+    UIView *bar = SLFindByClass(vc.view, @"AWEIMPhotoPickerToolbarViewV2", 0);
+    UIButton *send = bar ? SLFindButtonWithTitle(bar, @"发送", 0) : nil;
+    static const void *kSLLongPressKey = &kSLLongPressKey;
+    if (send && !objc_getAssociatedObject(send, kSLLongPressKey)) {
+        objc_setAssociatedObject(send, kSLLongPressKey, @1, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        UILongPressGestureRecognizer *lp =
+            [[UILongPressGestureRecognizer alloc] initWithTarget:sSLOctTarget
+                                                          action:@selector(longPress:)];
+        lp.minimumPressDuration = 0.45;
+        [send addGestureRecognizer:lp];
+        SLLog(@"BTN| 已给「发送」加长按菜单（普通 / 仅看一次）");
+    }
 }
 
 // 聊天窗口图片的「发闪图」操作条（这条原生一定能用，作为参照）
@@ -614,6 +748,47 @@ static void h_actionBarLayout(id self, SEL _cmd) {
     } @catch (NSException *e) { (void)e; }
 }
 
+// ---- v0.7.1：点了「闪图」之后，把这次发送标成 watch-once ----
+// AWEIMSendMessageContext.isClickWatchOnce 是抖音自己的字段，读它的地方会去拿一次性凭证。
+// 只在 sSLOncePending 期间改，普通发送完全不受影响。
+static void SLMarkWatchOnce(id ctx, NSString *tag) {
+    if (!ctx) return;
+    @try {
+        SEL s = NSSelectorFromString(@"setIsClickWatchOnce:");
+        if ([ctx respondsToSelector:s]) {
+            ((void (*)(id, SEL, BOOL))objc_msgSend)(ctx, s, YES);
+            SLLog(@"BTN| %@.isClickWatchOnce → 1", tag);
+        } else {
+            SLLog(@"BTN| %@ 没有 setIsClickWatchOnce:", tag);
+        }
+    } @catch (NSException *e) {
+        SLLog(@"BTN| %@ 置位失败 %@", tag, e);
+    }
+}
+
+static void (*o_ctxSendFrom)(id, SEL, id);
+static void h_ctxSendFrom(id self, SEL _cmd, id from) {
+    if (o_ctxSendFrom) o_ctxSendFrom(self, _cmd, from);
+    if (sSLOncePending) SLMarkWatchOnce(self, @"SendMessageContext");
+}
+
+// 比改字段更硬的一层：pending 期间谁读这个值，就给 YES。
+// 抖音内部据此决定走不走「仅看一次」的一次性凭证流程。
+static BOOL (*o_ctxIsClick)(id, SEL);
+static BOOL h_ctxIsClick(id self, SEL _cmd) {
+    BOOL orig = o_ctxIsClick ? o_ctxIsClick(self, _cmd) : NO;
+    if (!sSLOncePending) return orig;
+    static BOOL once = NO;
+    if (!once) { once = YES; SLLog(@"BTN| 读 isClickWatchOnce：原生=%d → 1", orig); }
+    return YES;
+}
+
+static void (*o_modelSetCtx)(id, SEL, id);
+static void h_modelSetCtx(id self, SEL _cmd, id ctx) {
+    if (o_modelSetCtx) o_modelSetCtx(self, _cmd, ctx);
+    if (sSLOncePending) SLMarkWatchOnce(ctx, @"SendMessageModel.sendContext");
+}
+
 #pragma mark - 装配
 
 void SLWatchOnceStart(void) {
@@ -621,7 +796,7 @@ void SLWatchOnceStart(void) {
     if (started) return;
     started = YES;
 
-    SLLog(@"ONCE| ==== 相册闪图 v0.7.0 · 入口=%d · 默认闪图=%d ====",
+    SLLog(@"ONCE| ==== 相册闪图 v0.7.1 · 入口=%d · 默认闪图=%d ====",
           SLWatchOnceEntryOn(), SLWatchOnceForceOn());
 
     // v0.6.0 那两个开关没有生效（钩子从未被调用），设置页已撤掉；
@@ -672,6 +847,17 @@ void SLWatchOnceStart(void) {
     c = objc_getClass("AWEIMContextRecommendUtil");
     SLInstallBool(c, @selector(enableOptWatchOnceStrategy), (IMP)h_optStrategy, (IMP *)&o_optStrategy,
                   @"contextRecommend.enableOptWatchOnceStrategy");
+
+    // v0.7.1：点了闪图按钮后，把这次发送的上下文标成 watch-once（只在 pending 期间生效）
+    c = objc_getClass("AWEIMSendMessageContext");
+    SLInstallBool(c, @selector(isClickWatchOnce), (IMP)h_ctxIsClick, (IMP *)&o_ctxIsClick,
+                  @"context.isClickWatchOnce");
+    SLInstallVoid(c, @selector(setSendFrom:), (IMP)h_ctxSendFrom, (IMP *)&o_ctxSendFrom,
+                  @"context.setSendFrom:");
+
+    c = objc_getClass("IESIMSendMessageModel");
+    SLInstallVoid(c, @selector(setSendContext:), (IMP)h_modelSetCtx, (IMP *)&o_modelSetCtx,
+                  @"model.setSendContext:");
 
     // ---- v0.6.1 定位相册：只观察，不改任何值 ----
     // 三个锚点覆盖三种可能：present（一定能过）、viewDidLoad、viewDidAppear
