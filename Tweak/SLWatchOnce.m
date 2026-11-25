@@ -317,6 +317,141 @@ static void h_barLayout(id self, SEL _cmd) {
     } @catch (NSException *e) { (void)e; }
 }
 
+#pragma mark - v0.6.2 真身：AWEIMPickerViewController + AWEIMPhotoPickerToolbarViewV2
+
+// v0.6.1 的日志给到答案：
+//   PICK| == VC AWEIMPickerViewController  父类 AWEIMComponentViewController
+//   PICK| AWEIMPickerViewController  视图 AWEIMPhotoPickerToolbarViewV2 hidden=0
+// 也就是：私聊相册 = AWEIMPickerViewController，工具栏是 …ToolbarViewV2（V1 那个
+// AWEIMNewPhotoPickerToolbarView 在这条路上根本不存在，所以上一版钩子全是空转）。
+//
+// 这一版做两件事，都不改发送逻辑：
+//   ① 把这两个类的方法名全列出来（VC 只有 22 个，很小）；
+//   ② 给名字里带 send/watch/once/select/confirm/tap… 的无参/单参 void 方法装一个
+//      只打日志的追踪钩子 —— 你点一次发送，日志就会按顺序写出到底走了哪几个方法。
+
+typedef struct {
+    SEL sel;
+    IMP orig;
+    int argc;
+} SLTraceSlot;
+
+static SLTraceSlot sSLSlots[128];
+static int sSLSlotCount = 0;
+static int sSLTraceLines = 0;
+
+static IMP SLTraceOrigIMP(SEL sel) {
+    for (int i = 0; i < sSLSlotCount; i++) {
+        if (sSLSlots[i].sel == sel) return sSLSlots[i].orig;
+    }
+    return NULL;
+}
+
+static void sl_trace0(id self, SEL _cmd) {
+    if (sSLTraceLines < 220) {
+        sSLTraceLines++;
+        SLLog(@"V2| call -%s  (%@)", sel_getName(_cmd), NSStringFromClass([self class]));
+    }
+    IMP o = SLTraceOrigIMP(_cmd);
+    if (o) ((void (*)(id, SEL))o)(self, _cmd);
+}
+
+static void sl_trace1(id self, SEL _cmd, id a1) {
+    if (sSLTraceLines < 220) {
+        sSLTraceLines++;
+        SLLog(@"V2| call -%s  arg=%@", sel_getName(_cmd), NSStringFromClass([a1 class]));
+    }
+    IMP o = SLTraceOrigIMP(_cmd);
+    if (o) ((void (*)(id, SEL, id))o)(self, _cmd, a1);
+}
+
+static void SLTraceClass(Class cls, NSString *tag) {
+    if (!cls) { SLLog(@"V2| 没有类 %@", tag); return; }
+    NSArray *keys = @[@"send", @"Send", @"watch", @"Watch", @"once", @"Once",
+                      @"select", @"Select", @"confirm", @"Confirm", @"commit", @"Commit",
+                      @"done", @"Done", @"tap", @"Tap", @"press", @"Press",
+                      @"finish", @"Finish", @"choose", @"Choose"];
+    unsigned int n = 0;
+    Method *list = class_copyMethodList(cls, &n);
+    int hooked = 0;
+    for (unsigned int i = 0; i < n && sSLSlotCount < 128; i++) {
+        SEL s = method_getName(list[i]);
+        NSString *sn = NSStringFromSelector(s);
+        if ([sn hasPrefix:@"set"]) continue;
+        if (!SLNameHas(sn, keys)) continue;
+
+        char *ret = method_copyReturnType(list[i]);
+        BOOL isVoid = (ret && ret[0] == 'v');
+        if (ret) free(ret);
+        if (!isVoid) continue;
+
+        int argc = 0;
+        for (const char *p = sel_getName(s); *p; p++) if (*p == ':') argc++;
+        if (argc > 1) continue;
+
+        // 单参的必须是对象或整数，浮点/结构体会走寄存器不同位置，硬套签名会把参数传坏
+        if (argc == 1) {
+            char at[8] = {0};
+            method_getArgumentType(list[i], 2, at, sizeof(at));
+            char t = at[0];
+            BOOL ok = (t == '@' || t == '#' || t == ':' || t == 'i' || t == 'I' ||
+                       t == 'q' || t == 'Q' || t == 'B' || t == 'c' || t == 'l');
+            if (!ok) continue;
+        }
+
+        IMP orig = method_getImplementation(list[i]);
+        sSLSlots[sSLSlotCount].sel = s;
+        sSLSlots[sSLSlotCount].orig = orig;
+        sSLSlots[sSLSlotCount].argc = argc;
+        sSLSlotCount++;
+        method_setImplementation(list[i], argc == 0 ? (IMP)sl_trace0 : (IMP)sl_trace1);
+        hooked++;
+    }
+    if (list) free(list);
+    SLLog(@"V2| %@：本类 %u 个方法，追踪 %d 个", tag, n, hooked);
+}
+
+// 工具栏上到底有没有「闪图 / 阅后即焚」按钮：按标题和无障碍文案找，找到就点亮
+static BOOL sSLRevealed = NO;
+static void SLScanWatchControls(UIView *v, NSString *tag) {
+    if (!v) return;
+    for (UIView *sub in v.subviews) {
+        NSString *cls = NSStringFromClass([sub class]);
+        NSString *title = nil;
+        if ([sub isKindOfClass:[UIButton class]]) {
+            title = [(UIButton *)sub titleForState:UIControlStateNormal];
+        }
+        NSString *acc = sub.accessibilityLabel ?: @"";
+        NSString *hay = [NSString stringWithFormat:@"%@ %@", title ?: @"", acc];
+
+        if (SLNameHas(hay, @[@"闪", @"阅后", @"一次性", @"看完"])) {
+            SLLog(@"V2| 命中闪图按钮 %@ title=%@ hidden=%d", cls, title, sub.hidden);
+            if (sub.hidden && !sSLRevealed) {
+                sub.hidden = NO;
+                sSLRevealed = YES;
+                SLLog(@"V2| 已把它放出来（title=%@）", title);
+            }
+        } else if (SLNameHas(cls, @[@"Watch", @"Once"])) {
+            SLLog(@"V2| 闪图相关视图 %@ hidden=%d alpha=%.2f", cls, sub.hidden, sub.alpha);
+        }
+        SLScanWatchControls(sub, tag);
+    }
+}
+
+static void (*o_v2Layout)(id, SEL);
+static void h_v2Layout(id self, SEL _cmd) {
+    o_v2Layout(self, _cmd);
+    static BOOL once = NO;
+    if (once) return;
+    once = YES;
+    @try {
+        SLLog(@"V2| ToolbarViewV2 布局完成，开始找闪图按钮");
+        SLScanWatchControls(self, @"toolbarV2");
+        // 工具栏自己的 ivar 里有没有 watch/once 相关字段（只打名字）
+        SLDumpIvars([self class], @"toolbarV2");
+    } @catch (NSException *e) { (void)e; }
+}
+
 // 聊天窗口图片的「发闪图」操作条（这条原生一定能用，作为参照）
 static void (*o_actionBarLayout)(id, SEL);
 static void h_actionBarLayout(id self, SEL _cmd) {
@@ -337,7 +472,7 @@ void SLWatchOnceStart(void) {
     if (started) return;
     started = YES;
 
-    SLLog(@"ONCE| ==== 相册闪图 v0.6.1 · 入口=%d · 默认闪图=%d ====",
+    SLLog(@"ONCE| ==== 相册闪图 v0.6.2 · 入口=%d · 默认闪图=%d ====",
           SLWatchOnceEntryOn(), SLWatchOnceForceOn());
 
     // v0.6.0 那两个开关没有生效（钩子从未被调用），设置页已撤掉；
@@ -411,6 +546,20 @@ void SLWatchOnceStart(void) {
     SLDumpMethods(objc_getClass("IESIMSendMessageModel"), @"IESIMSendMessageModel", @[], 100);
     SLDumpMethods(objc_getClass("AWEIMSendMessageContext"), @"AWEIMSendMessageContext",
                   @[@"watch", @"Watch", @"send", @"Send", @"image", @"Image", @"model", @"Model"], 60);
+
+    // ---- v0.6.2 真身：私聊相册 = AWEIMPickerViewController，工具栏 = …ToolbarViewV2 ----
+    for (NSString *name in @[@"AWEIMPickerViewController",
+                             @"AWEIMPhotoPickerToolbarViewV2",
+                             @"AWEIMPhotoPickerToolbarView"]) {
+        Class k = objc_getClass(name.UTF8String);
+        if (!k) { SLLog(@"V2| 没有类 %@", name); continue; }
+        SLDumpMethods(k, name, @[], 90);
+        SLTraceClass(k, name);
+    }
+
+    c = objc_getClass("AWEIMPhotoPickerToolbarViewV2");
+    SLInstallVoid(c, @selector(layoutSubviews), (IMP)h_v2Layout, (IMP *)&o_v2Layout,
+                  @"toolbarV2.layoutSubviews");
 
     SLLog(@"ONCE| 装配完成");
 }
