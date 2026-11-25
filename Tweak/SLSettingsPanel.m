@@ -622,17 +622,7 @@ static UIView *SLMakeHeader(NSString *text, CGFloat x, CGFloat width) {
 }
 
 // v0.6.0：闪图两项。钩子在启动时就装好了，这里只改开关值 —— 立刻生效，不用重开抖音。
-- (void)sl_watchOnceEntryChanged:(UISwitch *)sw {
-    SLWatchOnceSetEntry(sw.on);
-    [AWECAUtils showToast:sw.on ? @"相册里可以发闪图了" : @"相册闪图入口已关" duration:1.5];
-}
-
-- (void)sl_watchOnceForceChanged:(UISwitch *)sw {
-    SLWatchOnceSetForce(sw.on);
-    [AWECAUtils showToast:sw.on ? @"相册选图后直接发闪图" : @"相册选图恢复为普通图" duration:1.5];
-}
-
-// v0.6.0：闪图两项。钩子在启动时就装好了，这里只改开关值 —— 立刻生效，不用重开抖音。
+// v0.6.1：设置页入口先撤掉（钩子没人调用，UI 放着是误导），方法留着，定到真入口再接回。
 - (void)sl_watchOnceEntryChanged:(UISwitch *)sw {
     SLWatchOnceSetEntry(sw.on);
     [AWECAUtils showToast:sw.on ? @"相册里可以发闪图了" : @"相册闪图入口已关" duration:1.5];
