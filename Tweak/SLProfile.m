@@ -1588,7 +1588,6 @@ static BOOL SLProfWorksEnabled(void) {
 static NSMutableDictionary *sSLWorkSrc = nil;    // uid -> dataSource（内存兜底，可选）
 static NSHashTable *sSLMyMgrs = nil;             // 我页的作品数据管理器（弱引用，不持有）
 static char kSLPostsUIDKey;
-static BOOL sSLPostsLogged = NO;
 
 static NSString *SLProfObjText(id v) {
     if ([v isKindOfClass:[NSString class]]) return v;
