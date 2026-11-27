@@ -135,13 +135,34 @@ static void SLProfHookGetter(Class cls, SEL sel, IMP imp, IMP *slot, NSString *t
 // 所以不能再用那两个方法当门，改成看「此刻最上面显示的是哪个页面」。
 
 // 从 keyWindow 一路下沉：presented > nav.top > tab.selected
+// 走 UIWindowScene（部署目标 15.0），避免 -windows / -keyWindow 的弃用警告
 static UIViewController *SLProfTopVC(void) {
-    UIApplication *app = [UIApplication sharedApplication];
+    UIWindowScene *scene = nil;
+    for (UIScene *s in [UIApplication sharedApplication].connectedScenes) {
+        if ([s isKindOfClass:[UIWindowScene class]] &&
+            s.activationState == UISceneActivationStateForegroundActive) {
+            scene = (UIWindowScene *)s;
+            break;
+        }
+    }
+    if (!scene) {
+        for (UIScene *s in [UIApplication sharedApplication].connectedScenes) {
+            if ([s isKindOfClass:[UIWindowScene class]]) { scene = (UIWindowScene *)s; break; }
+        }
+    }
+    if (!scene) return nil;
+
     UIWindow *win = nil;
-    for (UIWindow *w in app.windows) {
+    for (UIWindow *w in scene.windows) {
         if (w.isKeyWindow) { win = w; break; }
     }
-    if (!win) win = app.keyWindow;
+    if (!win) {
+        for (UIWindow *w in scene.windows) {
+            if (!w.isHidden) { win = w; break; }
+        }
+    }
+    if (!win) return nil;
+
     UIViewController *vc = win.rootViewController;
     for (int i = 0; i < 16 && vc; i++) {
         UIViewController *next = nil;
