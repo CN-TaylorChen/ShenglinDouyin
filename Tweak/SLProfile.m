@@ -13,6 +13,7 @@
 #import "SLProfile.h"
 #import "SLLog.h"
 #import "SLGlass.h"
+#import "AWECAUtils.h"
 
 #import <objc/runtime.h>
 #import <objc/message.h>
@@ -65,7 +66,7 @@ void SLProfileClearAll(void) {
     NSUserDefaults *d = [NSUserDefaults standardUserDefaults];
     for (NSString *k in @[SLProfKeyNickname, SLProfKeyUID, SLProfKeySignature,
                           SLProfKeyAweme, SLProfKeyFollowing, SLProfKeyFollower,
-                          SLProfKeyLike, SLProfKeyFriend]) {
+                          SLProfKeyLike, SLProfKeyFriend, SLProfKeyCover]) {
         [d removeObjectForKey:k];
     }
     SLLog(@"PROF| 已清空全部预设值");
@@ -103,15 +104,27 @@ static BOOL SLProfNumber(NSString *key, long long *out) {
 //
 // 走不了「解析链接去联网抓」这条路（那需要 X-Gorgon 签名 / 自建服务端），
 // 但完全可以换个方向：你点开谁的主页，谁的资料就已经完整躺在内存里了。
-// 所以在别人主页（kind == -1）期间，顺手把 AWEUserModel 的那几个字段抄下来，
-// 落盘成「快照」，设置页里点一下就能整套套用到自己头上。
-// 零网络、零签名，成功率 100%，代价只是要先点开对方主页一次。
+// 所以在别人主页（kind == -1）期间，顺手把字段抄下来落盘成「快照」，
+// 设置页点一下、或者在对方主页按 JOKER，就能整套套到自己头上。
+//
+// v0.8.6 修的四个坑：
+//   1) 同一字段原来「只记第一次读到的值」。而列表页传进详情页的 model 数字全是 0，
+//      详情接口回来再读也不覆盖 —— 所以套用后粉丝/关注全是 0。改成「非 0 覆盖 0」。
+//   2) 获赞 / 互关 / 朋友这些数字不走 AWEUserModel，走统计组件的 displayCountForItem:，
+//      只抓 model 永远抓不到。现在组件层也记账（SLCapNoteValue）。
+//   3) 落盘原来把可变字典直接塞 NSUserDefaults 且从不同步，重装杀进程就丢。
+//      现在 copy 一份 + 主动 synchronize。
+//   4) userID 返回 "0" 的空 model 也被当人存下来（日志里的 `?（0）`）。现在直接丢。
+//   另外同一 uid 改成「逐字段合并」，残片不会再覆盖掉完整记录。
 
 #define SLProfKeySnaps @"SLProf.snaps"
+#define SLProfKeyCover @"SLProf.coverURL"     // 主页背景图（封面）URL
 
 static BOOL sSLCapOn  = NO;
 static NSMutableDictionary *sSLCapCur   = nil;   // 正在看的这个人的字段
 static NSMutableDictionary *sSLCapStore = nil;   // uid -> dict，持久化
+static NSString *sSLCapLastKey = nil;            // 最近一次落盘的 uid（JOKER 用）
+static NSTimeInterval sSLCapLastLogAt = 0;
 
 static NSMutableDictionary *SLCapStore(void) {
     if (sSLCapStore) return sSLCapStore;
@@ -121,7 +134,47 @@ static NSMutableDictionary *SLCapStore(void) {
 }
 
 static void SLCapPersist(void) {
-    [[NSUserDefaults standardUserDefaults] setObject:SLCapStore() forKey:SLProfKeySnaps];
+    NSUserDefaults *d = [NSUserDefaults standardUserDefaults];
+    [d setObject:[SLCapStore() copy] forKey:SLProfKeySnaps];   // 传不可变副本
+    [d synchronize];   // 这个进程随时会被重装杀掉，不主动落盘就会丢
+}
+
+// 把任意值按「1.2万 / 1.3亿 / 纯数字」解析成整数；解析不出（昵称这种）返回 NO
+static BOOL SLProfNumberFromValue(id v, long long *out) {
+    if ([v isKindOfClass:[NSNumber class]]) { *out = [v longLongValue]; return YES; }
+    if (![v isKindOfClass:[NSString class]]) return NO;
+    NSString *s = [(NSString *)v stringByTrimmingCharactersInSet:
+                   [NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    if (!s.length) return NO;
+    if ([s hasSuffix:@"万"] || [s hasSuffix:@"w"] || [s hasSuffix:@"W"]) {
+        *out = (long long)([[s substringToIndex:s.length - 1] doubleValue] * 10000.0);
+        return YES;
+    }
+    if ([s hasSuffix:@"亿"]) {
+        *out = (long long)([[s substringToIndex:s.length - 1] doubleValue] * 100000000.0);
+        return YES;
+    }
+    NSString *digits = [[s componentsSeparatedByCharactersInSet:
+        [[NSCharacterSet decimalDigitCharacterSet] invertedSet]] componentsJoinedByString:@""];
+    if (!digits.length) return NO;
+    *out = [digits longLongValue];
+    return YES;
+}
+
+// 新值是不是比旧值更值得留：数字只认「大于 0 且变了」，字符串不许用 0/空把好值顶掉
+static BOOL SLCapBetter(id oldV, id newV) {
+    if (!newV) return NO;
+    if (!oldV) return YES;
+    NSString *os = [oldV description] ?: @"";
+    NSString *ns = [newV description] ?: @"";
+    if (!ns.length) return NO;
+    long long on = 0, nn = 0;
+    BOOL oldNum = SLProfNumberFromValue(oldV, &on);
+    BOOL newNum = SLProfNumberFromValue(newV, &nn);
+    if (oldNum && newNum) return nn > 0 && nn != on;
+    if ([ns isEqualToString:os]) return NO;
+    if ([ns isEqualToString:@"0"] && ![os isEqualToString:@"0"]) return NO;   // 别拿 0 覆盖真值
+    return YES;
 }
 
 static void SLCapBegin(void) {
@@ -129,23 +182,31 @@ static void SLCapBegin(void) {
     sSLCapCur = nil;
 }
 
-// 把手上这份落盘（不改变 sSLCapOn）
+// 把手上这份合并进 store（不改变 sSLCapOn）
 static void SLCapFlush(void) {
     NSMutableDictionary *cap = sSLCapCur;
     sSLCapCur = nil;
     if (!cap) return;
 
-    NSString *key = cap[@"uid"];
-    if (!key.length) key = cap[@"sec"];
-    if (!key.length) return;
+    id keyObj = cap[@"uid"];
+    if (![keyObj isKindOfClass:[NSString class]] || ![(NSString *)keyObj length]) keyObj = cap[@"sec"];
+    if (![keyObj isKindOfClass:[NSString class]] || ![(NSString *)keyObj length]) return;
+    NSString *key = keyObj;
+    // 空 model：userID 是 "0"、或者根本没有资料字段，都不该占一个位置
+    if ([key isEqualToString:@"0"] || [key isEqualToString:@"(null)"]) return;
+    if (cap.count < 3) return;      // 只有 uid + 一个字段的残片
 
-    id nickObj = cap[@"nickname"];
-    NSString *nickStr = [nickObj isKindOfClass:[NSString class]] ? nickObj : nil;
-    if (!nickStr.length && cap.count < 3) return;   // 啥都没抓到，不留垃圾
-
-    cap[@"ts"] = @([[NSDate date] timeIntervalSince1970]);
     NSMutableDictionary *store = SLCapStore();
-    store[key] = cap;
+    NSMutableDictionary *merged = store[key] ? [store[key] mutableCopy] : [NSMutableDictionary dictionary];
+    for (NSString *k in cap) {
+        if ([k isEqualToString:@"ts"]) continue;
+        id nv = cap[k];
+        id ov = merged[k];
+        if (!ov || SLCapBetter(ov, nv)) merged[k] = nv;
+    }
+    merged[@"ts"] = @([[NSDate date] timeIntervalSince1970]);
+    store[key] = merged;
+    sSLCapLastKey = key;
 
     // 最多留 30 个，超了按时间丢最旧的
     if (store.count > 30) {
@@ -157,7 +218,16 @@ static void SLCapFlush(void) {
         for (NSUInteger i = 0; i + 30 < sorted.count; i++) [store removeObjectForKey:sorted[i]];
     }
     SLCapPersist();
-    SLLog(@"SNAP| 已抓取 %@（%@）", nickStr.length ? nickStr : @"?", key);
+
+    // 同一个人的字段是慢慢补全的，刷屏没意义：每次落盘最多 1 行，2 秒内不重复
+    NSTimeInterval now = [NSDate date].timeIntervalSince1970;
+    if (now - sSLCapLastLogAt > 2.0) {
+        sSLCapLastLogAt = now;
+        id nickObj = merged[@"nickname"];
+        NSString *nick = [nickObj isKindOfClass:[NSString class]] ? nickObj : nil;
+        SLLog(@"SNAP| 已抓取 %@（%@）· 字段 %lu", nick.length ? nick : @"?", key,
+              (unsigned long)merged.count);
+    }
 }
 
 static void SLCapFinish(void) {
@@ -165,33 +235,63 @@ static void SLCapFinish(void) {
     SLCapFlush();
 }
 
-// 只在别人主页那几秒记账；同一个人只记第一次读到的值（原始值，不受伪装影响）
+// 组件层（获赞 / 互关 / 作品…）没有 model 可问，直接往当前这条记录里追加
+static void SLCapNoteValue(NSString *field, id value) {
+    if (!sSLCapOn || !field || !value) return;
+    if (![value isKindOfClass:[NSString class]] && ![value isKindOfClass:[NSNumber class]]) return;
+    if (![value description].length) return;
+
+    if (!sSLCapCur) {
+        // 组件比 model 的 getter 先跑到时，接着上一条记录补
+        if (!sSLCapLastKey) return;
+        NSDictionary *old = SLCapStore()[sSLCapLastKey];
+        if (!old) return;
+        sSLCapCur = [old mutableCopy];
+        [sSLCapCur removeObjectForKey:@"ts"];
+    }
+    id ov = sSLCapCur[field];
+    if (!ov || SLCapBetter(ov, value)) sSLCapCur[field] = value;
+}
+
+// 只在别人主页那几秒记账；用 model 的 uid 建条目
 // 连续滑到另一个人时（kind 一直是 -1）会先把手上的存掉再开新的
 static void SLCapNote(id model, NSString *field, id value) {
     if (!sSLCapOn || !field || !value) return;
     if (![value isKindOfClass:[NSString class]] && ![value isKindOfClass:[NSNumber class]]) return;
 
-    NSString *uid = SLProfCallObj(model, @"userID");
-    NSString *sec = SLProfCallObj(model, @"secUserID");
+    id uidObj = SLProfCallObj(model, @"userID");
+    id secObj = SLProfCallObj(model, @"secUserID");
+    NSString *uid = [uidObj isKindOfClass:[NSString class]] ? uidObj : nil;
+    NSString *sec = [secObj isKindOfClass:[NSString class]] ? secObj : nil;
+    if (!uid.length && !sec.length) return;
+    if ([uid isEqualToString:@"0"]) uid = nil;      // 空 model，等真身
     if (!uid.length && !sec.length) return;
     NSString *newKey = uid.length ? uid : sec;
 
     if (sSLCapCur) {
-        NSString *curKey = sSLCapCur[@"uid"] ?: sSLCapCur[@"sec"];
-        if (curKey && ![curKey isEqualToString:newKey]) SLCapFlush();
+        id curObj = sSLCapCur[@"uid"] ?: sSLCapCur[@"sec"];
+        if ([curObj isKindOfClass:[NSString class]] && ![curObj isEqualToString:newKey]) SLCapFlush();
     }
     if (!sSLCapCur) {
         sSLCapCur = [NSMutableDictionary dictionary];
         if (uid.length) sSLCapCur[@"uid"] = uid;
         if (sec.length) sSLCapCur[@"sec"] = sec;
     }
-    if (!sSLCapCur[field]) sSLCapCur[field] = value;
+    id ov = sSLCapCur[field];
+    if (!ov || SLCapBetter(ov, value)) sSLCapCur[field] = value;
 }
 
 // 快照按时间倒序，给设置页用
 static NSArray<NSDictionary *> *SLSnapList(void) {
     NSMutableDictionary *store = SLCapStore();
-    return [store.allValues sortedArrayUsingComparator:^NSComparisonResult(NSDictionary *a, NSDictionary *b) {
+    [(NSMutableDictionary *)store removeObjectForKey:@"0"];   // 老版本留下的空条目
+    NSMutableArray *out = [NSMutableArray array];
+    for (NSDictionary *s in store.allValues) {
+        if (![s isKindOfClass:[NSDictionary class]]) continue;
+        if (s.count < 3) continue;
+        [out addObject:s];
+    }
+    return [out sortedArrayUsingComparator:^NSComparisonResult(NSDictionary *a, NSDictionary *b) {
         double ta = [a[@"ts"] doubleValue], tb = [b[@"ts"] doubleValue];
         return ta > tb ? NSOrderedAscending : (ta < tb ? NSOrderedDescending : NSOrderedSame);
     }];
@@ -204,7 +304,7 @@ static NSString *SLSnapText(NSDictionary *s, NSString *k) {
     return str.length ? str : nil;
 }
 
-// 把一份快照整套写进预设
+// 把一份快照整套写进预设（只写抓到了的字段，缺的不去动原有值）
 static void SLApplySnap(NSDictionary *s) {
     SLProfSetStr(SLSnapText(s, @"nickname"),  SLProfKeyNickname);
     SLProfSetStr(SLSnapText(s, @"uniqueID"),  SLProfKeyUID);
@@ -214,8 +314,19 @@ static void SLApplySnap(NSDictionary *s) {
     SLProfSetStr(SLSnapText(s, @"follower"),  SLProfKeyFollower);
     SLProfSetStr(SLSnapText(s, @"like"),      SLProfKeyLike);
     SLProfSetStr(SLSnapText(s, @"friend"),    SLProfKeyFriend);
+    SLProfSetStr(SLSnapText(s, @"cover"),     SLProfKeyCover);
     [[NSUserDefaults standardUserDefaults] setBool:YES forKey:SLProfKeyEnabled];
     SLLog(@"SNAP| 套用 %@ 的整套资料", SLSnapText(s, @"nickname") ?: @"?");
+}
+
+// JOKER 用：把「当前正在看的这个人」的最新一份立刻拿到手
+static NSDictionary *SLCapLive(void) {
+    SLCapFlush();                       // 手上还有没落盘的先落盘
+    if (sSLCapLastKey) {
+        NSDictionary *s = SLCapStore()[sSLCapLastKey];
+        if (s) return s;
+    }
+    return SLSnapList().firstObject;    // 兜底用最近看过的那个人
 }
 
 #pragma mark - 钩子基座
@@ -561,26 +672,204 @@ static BOOL h_shouldShowUniqueID(id self, SEL _cmd) {
 
 #pragma mark - 统计数字（组件层）
 //
-// 获赞 / 互关 不走 AWEUserModel 的 getter，是各自组件算好文本再交给 cell 的：
+// 获赞 / 互关 不走 AWEUserModel 的 getter，是各自组件算好再交给 cell 的：
 //   AWEProfileSocialStatisticPraiseComponent  -displayCountForItem:  （获赞）
 //   AWEProfileSocialStatisticMutualComponent  -displayCountForItem:  （互关）
 //   AWEProfileSocialStatisticFriendComponent  -displayCountForItem:  （朋友）
-// 直接在返回值上换成我们自己的数字，显示什么就是什么。
+//   ...Play / Fans / Follow 同理（作品 / 粉丝 / 关注）
+//
+// v0.8.5 挂上去却完全没生效，根因是返回值判断写错了：
+//   if (v && ![v isKindOfClass:[NSString class]]) return v;
+// 这个方法返的其实是 NSNumber，于是每次都在这里原样吐回去，静默失败。
+// 现在 NSString / NSNumber / nil 三种都接，只在奇怪类型（富文本之类）上放行。
 
-#define SL_PROF_COUNT_HOOK(NAME, KEY, TAG)                                 \
+#define SL_PROF_COUNT_HOOK(NAME, KEY, TAG, FIELD)                          \
     static id (*o_##NAME)(id, SEL, id);                                    \
     static id h_##NAME(id self, SEL _cmd, id item) {                       \
         id v = o_##NAME ? o_##NAME(self, _cmd, item) : nil;                \
-        if (!SLProfGate()) return v;                                       \
-        if (v && ![v isKindOfClass:[NSString class]]) return v;            \
+        if (!SLProfGate()) { SLCapNoteValue(FIELD, v); return v; }         \
         long long n = 0;                                                   \
         if (!SLProfNumber(KEY, &n)) return v;                              \
+        if (sSLProfHits < 20) { sSLProfHits++;                             \
+            SLLog(@"PROF| 替换 %@ → %lld", TAG, n); }                      \
+        if (v && ![v isKindOfClass:[NSString class]] &&                    \
+            ![v isKindOfClass:[NSNumber class]]) return v;                 \
+        if ([v isKindOfClass:[NSNumber class]]) return @(n);               \
         return SLProfFormatCount(n);                                       \
     }
 
-SL_PROF_COUNT_HOOK(praiseText, SLProfKeyLike, @"praise")
-SL_PROF_COUNT_HOOK(mutualText, SLProfKeyFriend, @"mutual")
-SL_PROF_COUNT_HOOK(friendText, SLProfKeyFriend, @"friend")
+SL_PROF_COUNT_HOOK(praiseText, SLProfKeyLike,      @"praise",   @"like")
+SL_PROF_COUNT_HOOK(mutualText, SLProfKeyFriend,    @"mutual",   @"friend")
+SL_PROF_COUNT_HOOK(friendText, SLProfKeyFriend,    @"friend",   @"friend")
+SL_PROF_COUNT_HOOK(playText,   SLProfKeyAweme,     @"play",     @"aweme")
+SL_PROF_COUNT_HOOK(fansText,   SLProfKeyFollower,  @"fans",     @"follower")
+SL_PROF_COUNT_HOOK(followText, SLProfKeyFollowing, @"follow",   @"following")
+
+#pragma mark - 主页背景图（封面）
+//
+// 「我」页顶部那张大图由 AWEProfileBannerBGCoverView 画，数据最终从
+//   -configWithURLList:lightColorList:darkColorList:
+// 进去。别人主页那一下把第一个 URL 抄进快照；回自己主页再把它塞回去。
+// 不构造业务模型对象，只换 URL 列表，版本一改也不会崩。
+
+static void (*o_coverConfig)(id, SEL, id, id, id);
+
+static NSString *SLProfURLString(id x) {
+    if ([x isKindOfClass:[NSURL class]]) return [(NSURL *)x absoluteString];
+    if ([x isKindOfClass:[NSString class]]) return x;
+    return nil;
+}
+
+static NSString *SLProfFirstURL(id list) {
+    if (![list isKindOfClass:[NSArray class]]) return nil;
+    for (id x in (NSArray *)list) {
+        NSString *s = SLProfURLString(x);
+        if (s.length) return s;
+    }
+    return nil;
+}
+
+static void h_coverConfig(id self, SEL _cmd, id urls, id light, id dark) {
+    if (!SLProfGate()) {
+        // 只在他人主页记，别把自己主页的封面写进别人那条
+        if (SLProfPageKind() == -1) {
+            NSString *u = SLProfFirstURL(urls);
+            if (u.length) SLCapNoteValue(@"cover", u);
+        }
+        if (o_coverConfig) o_coverConfig(self, _cmd, urls, light, dark);
+        return;
+    }
+
+    NSString *mine = SLProfStr(SLProfKeyCover);
+    if (!mine.length || ![urls isKindOfClass:[NSArray class]] || ![(NSArray *)urls count]) {
+        if (o_coverConfig) o_coverConfig(self, _cmd, urls, light, dark);
+        return;
+    }
+    id first = [(NSArray *)urls firstObject];
+    id neu = nil;
+    if ([first isKindOfClass:[NSURL class]]) neu = [NSURL URLWithString:mine];
+    else if ([first isKindOfClass:[NSString class]]) neu = mine;
+    if (!neu) {
+        if (o_coverConfig) o_coverConfig(self, _cmd, urls, light, dark);
+        return;
+    }
+    // 颜色列表跟着截成 1 个，长度不一致容易越界
+    id nl = ([light isKindOfClass:[NSArray class]] && [(NSArray *)light count])
+            ? @[[(NSArray *)light firstObject]] : light;
+    id nd = ([dark isKindOfClass:[NSArray class]] && [(NSArray *)dark count])
+            ? @[[(NSArray *)dark firstObject]] : dark;
+    if (o_coverConfig) o_coverConfig(self, _cmd, @[neu], nl, nd);
+}
+
+#pragma mark - JOKER（别人主页上一键整套套用）
+//
+// 那颗球只在他人主页出现：点一下 = 抓到的这个人整套写进预设 + 打开总开关，
+// 顺手弹个 toast 告诉你套的是谁。不点也行，设置页那条列表照样能用。
+
+#define SLJokerTag 0x5A0B1E
+
+static NSString *sSLJokerUID = nil;   // 当前这个详情页是谁
+
+@interface SLJokerTarget : NSObject
++ (instancetype)shared;
+- (void)tap:(UIButton *)b;
+@end
+
+@implementation SLJokerTarget
++ (instancetype)shared {
+    static SLJokerTarget *s; static dispatch_once_t once;
+    dispatch_once(&once, ^{ s = [[SLJokerTarget alloc] init]; });
+    return s;
+}
+
+- (void)tap:(UIButton *)b {
+    NSDictionary *snap = nil;
+    if (sSLJokerUID.length) snap = SLCapStore()[sSLJokerUID];
+    if (!snap) snap = SLCapLive();
+    if (!snap) {
+        [AWECAUtils showToast:@"还没抓到这个人，滑一下再点"];
+        return;
+    }
+
+    SLApplySnap(snap);
+    NSString *nick = SLSnapText(snap, @"nickname") ?: @"对方";
+    [AWECAUtils showToast:[NSString stringWithFormat:@"已套用 %@ · 回我页查看", nick]];
+
+    // 按一下变对勾，1.2 秒后恢复
+    UIButton *btn = b;
+    UILabel *lab = (UILabel *)[btn viewWithTag:SLJokerTag + 1];
+    NSString *old = lab.text;
+    lab.text = @"✓";
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.2 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{ lab.text = old; });
+}
+@end
+
+static UIButton *SLJokerMake(void) {
+    UIButton *b = [UIButton buttonWithType:UIButtonTypeCustom];
+    b.tag = SLJokerTag;
+    b.frame = CGRectMake(0, 0, 54, 54);
+    b.backgroundColor = [UIColor clearColor];
+
+    UIVisualEffectView *blur = [[UIVisualEffectView alloc] initWithEffect:
+        [UIBlurEffect effectWithStyle:UIBlurEffectStyleSystemUltraThinMaterialDark]];
+    blur.frame = b.bounds;
+    blur.userInteractionEnabled = NO;
+    blur.layer.cornerRadius = 27;
+    blur.layer.cornerCurve = kCACornerCurveContinuous;
+    blur.layer.borderWidth = 0.6;
+    blur.layer.borderColor = [UIColor colorWithWhite:1 alpha:0.30].CGColor;
+    blur.clipsToBounds = YES;
+    [b addSubview:blur];
+
+    UILabel *lab = [[UILabel alloc] initWithFrame:b.bounds];
+    lab.tag = SLJokerTag + 1;
+    lab.text = @"J";
+    lab.textColor = [UIColor whiteColor];
+    lab.font = [UIFont systemFontOfSize:21 weight:UIFontWeightHeavy];
+    lab.textAlignment = NSTextAlignmentCenter;
+    lab.userInteractionEnabled = NO;
+    [b addSubview:lab];
+
+    b.layer.shadowColor = [UIColor blackColor].CGColor;
+    b.layer.shadowOpacity = 0.22;
+    b.layer.shadowRadius = 8;
+    b.layer.shadowOffset = CGSizeMake(0, 3);
+
+    [b addTarget:[SLJokerTarget shared] action:@selector(tap:) forControlEvents:UIControlEventTouchUpInside];
+    return b;
+}
+
+static void SLJokerMount(UIViewController *vc) {
+    if (!vc || !vc.isViewLoaded) return;
+    UIView *host = vc.view;
+    if (!host.window) return;
+    if ([host viewWithTag:SLJokerTag]) return;
+
+    UIButton *b = SLJokerMake();
+    b.autoresizingMask = UIViewAutoresizingFlexibleLeftMargin | UIViewAutoresizingFlexibleTopMargin;
+    CGSize sz = host.bounds.size;
+    b.frame = CGRectMake(sz.width - 54 - 14, sz.height - 54 - 96, 54, 54);
+    [host addSubview:b];
+
+    SLLog(@"JOKER| 已挂到 %@", NSStringFromClass([vc class]));
+}
+
+static void (*o_detailAppear)(id, SEL, BOOL);
+static void h_detailAppear(id self, SEL _cmd, BOOL animated) {
+    if (o_detailAppear) o_detailAppear(self, _cmd, animated);
+    __weak UIViewController *wvc = self;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.35 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        UIViewController *vc = wvc;
+        if (!vc) return;
+        id um = SLProfCallObj(vc, @"userModel");
+        id uid = um ? SLProfCallObj(um, @"userID") : nil;
+        if ([uid isKindOfClass:[NSString class]] && [(NSString *)uid length])
+            sSLJokerUID = uid;
+        SLJokerMount(vc);
+    });
+}
 
 #pragma mark - 容器进退（第二道门）
 //
@@ -668,7 +957,7 @@ void SLProfileStart(void) {
     Class idComp = objc_getClass("AWEProfileHeaderIdContentComponent_NEWAPI");
     SLProfHookGetter(idComp, @selector(idStr), (IMP)h_headerIDStr, (IMP *)&o_headerIDStr, @"header.idStr");
 
-    // 获赞 / 互关 / 朋友：数字由各自的统计组件算成文本，截这里才改得动
+    // 获赞 / 互关 / 朋友 / 作品 / 粉丝 / 关注：数字由各自的统计组件算，截这里才改得动
     SLProfHookOneObj(objc_getClass("AWEProfileSocialStatisticPraiseComponent"),
                      NSSelectorFromString(@"displayCountForItem:"),
                      (IMP)h_praiseText, (IMP *)&o_praiseText, @"praise.displayCount");
@@ -678,13 +967,48 @@ void SLProfileStart(void) {
     SLProfHookOneObj(objc_getClass("AWEProfileSocialStatisticFriendComponent"),
                      NSSelectorFromString(@"displayCountForItem:"),
                      (IMP)h_friendText, (IMP *)&o_friendText, @"friend.displayCount");
+    SLProfHookOneObj(objc_getClass("AWEProfileSocialStatisticPlayComponent"),
+                     NSSelectorFromString(@"displayCountForItem:"),
+                     (IMP)h_playText, (IMP *)&o_playText, @"play.displayCount");
+    SLProfHookOneObj(objc_getClass("AWEProfileSocialStatisticFansComponent"),
+                     NSSelectorFromString(@"displayCountForItem:"),
+                     (IMP)h_fansText, (IMP *)&o_fansText, @"fans.displayCount");
+    SLProfHookOneObj(objc_getClass("AWEProfileSocialStatisticFollowComponent"),
+                     NSSelectorFromString(@"displayCountForItem:"),
+                     (IMP)h_followText, (IMP *)&o_followText, @"follow.displayCount");
+
+    // 主页背景图：别人主页抓 URL，自己主页换回去
+    {
+        Class cover = objc_getClass("AWEProfileBannerBGCoverView");
+        Method m = cover ? SLProfExact(cover, NSSelectorFromString(@"configWithURLList:lightColorList:darkColorList:")) : NULL;
+        if (m && method_getNumberOfArguments(m) == 5) {
+            o_coverConfig = (void (*)(id, SEL, id, id, id))method_getImplementation(m);
+            method_setImplementation(m, (IMP)h_coverConfig);
+            SLLog(@"PROF| 已挂 cover.configURLList @ AWEProfileBannerBGCoverView");
+        } else {
+            SLLog(@"PROF| 跳过 cover.configURLList：类或方法不存在");
+        }
+    }
+
+    // 别人主页：挂 viewDidAppear:，把 JOKER 球放上去
+    {
+        Class detail = objc_getClass("AWEUserDetailViewControllerV2");
+        Method m = detail ? SLProfExact(detail, @selector(viewDidAppear:)) : NULL;
+        if (m) {
+            o_detailAppear = (void (*)(id, SEL, BOOL))method_getImplementation(m);
+            method_setImplementation(m, (IMP)h_detailAppear);
+            SLLog(@"PROF| 已挂 viewDidAppear: @ AWEUserDetailViewControllerV2（JOKER）");
+        } else {
+            SLLog(@"PROF| 跳过 JOKER：AWEUserDetailViewControllerV2 无 viewDidAppear:");
+        }
+    }
 
     // 「我」页容器：挂 appear / disappear 当第二道门，并留下现场日志
     SLProfHookPageLifecycle(objc_getClass("AWEProfileTabContainerViewController"));
     SLProfHookPageLifecycle(objc_getClass("AWEProfileMergedTabContainerViewController"));
     SLProfHookPageLifecycle(objc_getClass("AWEProfileBaseContainerViewController"));
 
-    SLLog(@"PROF| ==== 主页伪装 v0.8.5 · 开=%d · 已填 %ld 项 · 快照 %lu 个 ====",
+    SLLog(@"PROF| ==== 主页伪装 v0.8.6 · 开=%d · 已填 %ld 项 · 快照 %lu 个 ====",
           SLProfileEnabled(), (long)SLProfileFilledCount(), (unsigned long)SLSnapList().count);
 
     UIViewController *top = SLProfTopVC();
@@ -920,12 +1244,15 @@ void SLProfileStart(void) {
     NSDictionary *s = snaps[ip.row];
     NSString *nick = SLSnapText(s, @"nickname") ?: @"(无昵称)";
     NSMutableArray *sub = [NSMutableArray array];
+    NSString *v = nil;
+    if ((v = SLSnapText(s, @"follower")))  [sub addObject:[NSString stringWithFormat:@"粉 %@", v]];
+    if ((v = SLSnapText(s, @"following"))) [sub addObject:[NSString stringWithFormat:@"关 %@", v]];
+    if ((v = SLSnapText(s, @"aweme")))     [sub addObject:[NSString stringWithFormat:@"作 %@", v]];
+    if ((v = SLSnapText(s, @"like")))      [sub addObject:[NSString stringWithFormat:@"赞 %@", v]];
+    if ((v = SLSnapText(s, @"friend")))    [sub addObject:[NSString stringWithFormat:@"互 %@", v]];
+    if (SLSnapText(s, @"cover"))           [sub addObject:@"带背景"];
     NSString *uid = SLSnapText(s, @"uniqueID");
-    if (uid.length) [sub addObject:[NSString stringWithFormat:@"抖音号 %@", uid]];
-    NSString *fans = SLSnapText(s, @"follower");
-    if (fans.length) [sub addObject:[NSString stringWithFormat:@"粉丝 %@", fans]];
-    NSString *aw = SLSnapText(s, @"aweme");
-    if (aw.length) [sub addObject:[NSString stringWithFormat:@"作品 %@", aw]];
+    if (uid.length) [sub addObject:[NSString stringWithFormat:@"号 %@", uid]];
 
     cell.textLabel.text = nick;
     cell.detailTextLabel.text = sub.count ? [sub componentsJoinedByString:@" · "] : nil;
