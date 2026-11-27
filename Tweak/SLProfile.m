@@ -129,7 +129,7 @@ static void SLProfHookGetter(Class cls, SEL sel, IMP imp, IMP *slot, NSString *t
 
 #pragma mark - 页面判定
 //
-// 调 41.2.0 真机日志证实：AWEProfileTabContainerViewController 的
+// 调 39.9.0 真机日志证实：AWEProfileTabContainerViewController 的
 // -setIsCurrentUser: 与 AWEUserHomeViewControllerV2 的 -isCurrentUserProfilePage
 // 在进「我」页时都没被调用（selector 存在，但没人调，八成是 init 里直接写 ivar）。
 // 所以不能再用那两个方法当门，改成看「此刻最上面显示的是哪个页面」。
