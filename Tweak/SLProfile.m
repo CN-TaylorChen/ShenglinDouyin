@@ -65,6 +65,7 @@ static int  sSLProfHits     = 0;
 static int  sSLProfMissLogged = 0;  // 门未开的诊断日志，最多打几条
 
 static id SLProfCallObj(id obj, NSString *selName);   // 定义在「页面判定」段，快照要用
+static BOOL SLProfGate(void);                         // 定义在「页面判定」段，套用快照时要用
 static void SLProfForceCover(void);                   // 定义在「封面」段，套用后用
 static NSString *sSLWorkWant = nil;                   // 要模拟谁（每个账号各自一份，落盘）
 static NSString *sSLProfMyUID = nil;                  // 当前登录账号的 uid（在「我」页读到）
@@ -1375,7 +1376,7 @@ static UIView *SLProfBiggestCollection(UIView *root) {
 static void SLProfCollectVCs(UIViewController *vc, NSMutableArray *out) {
     if (!vc || out.count > 200) return;
     [out addObject:vc];
-    for (UIViewController *c in vc.children) SLProfCollectVCs(c, out);
+    for (UIViewController *c in vc.childViewControllers) SLProfCollectVCs(c, out);
     if ([vc isKindOfClass:[UINavigationController class]]) {
         for (UIViewController *c in ((UINavigationController *)vc).viewControllers) SLProfCollectVCs(c, out);
     }
