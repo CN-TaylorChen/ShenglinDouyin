@@ -25,9 +25,10 @@
 #define SLProfKeyFollowing @"SLProf.following"
 #define SLProfKeyFollower  @"SLProf.follower"
 
-static BOOL sSLProfOnMePage = NO;   // 「我」页可见期间为 YES
+static volatile BOOL sSLProfOnMePage = NO;   // 「我」页可见期间为 YES
 static BOOL sSLProfStarted  = NO;
 static int  sSLProfHits     = 0;
+static int  sSLProfMissLogged = 0;  // 门未开的诊断日志，最多打几条
 
 #pragma mark - 配置
 
@@ -126,25 +127,85 @@ static void SLProfHookGetter(Class cls, SEL sel, IMP imp, IMP *slot, NSString *t
     SLLog(@"PROF| 已挂 %@ @ %@", tag, NSStringFromClass(cls));
 }
 
-// 返回 void、单 BOOL 参数
-static void SLProfHookBoolSetter(Class cls, SEL sel, IMP imp, IMP *slot, NSString *tag) {
-    if (!cls) { SLLog(@"PROF| 跳过 %@：类不存在", tag); return; }
-    Method m = SLProfExact(cls, sel);
-    if (!m) { SLLog(@"PROF| 跳过 %@：%@ 未实现该 selector", tag, NSStringFromClass(cls)); return; }
-    char *ret = method_copyReturnType(m);
-    BOOL isVoid = (ret && ret[0] == 'v');
-    if (ret) free(ret);
-    if (!isVoid) { SLLog(@"PROF| 跳过 %@：返回值不是 void", tag); return; }
-    if (method_getNumberOfArguments(m) != 3) {
-        SLLog(@"PROF| 跳过 %@：参数个数不是 1", tag);
-        return;
+#pragma mark - 页面判定
+//
+// 调 41.2.0 真机日志证实：AWEProfileTabContainerViewController 的
+// -setIsCurrentUser: 与 AWEUserHomeViewControllerV2 的 -isCurrentUserProfilePage
+// 在进「我」页时都没被调用（selector 存在，但没人调，八成是 init 里直接写 ivar）。
+// 所以不能再用那两个方法当门，改成看「此刻最上面显示的是哪个页面」。
+
+// 从 keyWindow 一路下沉：presented > nav.top > tab.selected
+static UIViewController *SLProfTopVC(void) {
+    UIApplication *app = [UIApplication sharedApplication];
+    UIWindow *win = nil;
+    for (UIWindow *w in app.windows) {
+        if (w.isKeyWindow) { win = w; break; }
     }
-    char at[8] = {0};
-    method_getArgumentType(m, 2, at, sizeof(at));
-    if (at[0] != 'B' && at[0] != 'c') { SLLog(@"PROF| 跳过 %@：参数不是 BOOL", tag); return; }
-    *slot = method_getImplementation(m);
-    method_setImplementation(m, imp);
-    SLLog(@"PROF| 已挂 %@ @ %@", tag, NSStringFromClass(cls));
+    if (!win) win = app.keyWindow;
+    UIViewController *vc = win.rootViewController;
+    for (int i = 0; i < 16 && vc; i++) {
+        UIViewController *next = nil;
+        if (vc.presentedViewController) next = vc.presentedViewController;
+        else if ([vc isKindOfClass:[UINavigationController class]])
+            next = [(UINavigationController *)vc topViewController];
+        else if ([vc isKindOfClass:[UITabBarController class]])
+            next = [(UITabBarController *)vc selectedViewController];
+        if (!next || next == vc) break;
+        vc = next;
+    }
+    return vc;
+}
+
+// 顺着 parent 链往上找：先撞见 UserHome（他人主页）判 -1，
+// 先撞见 Profile 判 1。这样「我」页里 push 了别人主页时也不会串。
+static int SLProfPageKindSlow(void) {
+    UIViewController *vc = SLProfTopVC();
+    if (!vc) return 0;
+    UIViewController *p = vc;
+    for (int i = 0; i < 10 && p; i++) {
+        NSString *cn = NSStringFromClass([p class]);
+        if (cn.length) {
+            if ([cn rangeOfString:@"UserHome"].location != NSNotFound) return -1;
+            if ([cn rangeOfString:@"Profile"].location != NSNotFound) return 1;
+        }
+        p = p.parentViewController;
+    }
+    return 0;
+}
+
+static int            sSLProfKindVal   = 0;
+static NSTimeInterval sSLProfGateUntil = 0;
+
+// 0.15s 缓存：getter 一屏几十次调用，不能每次都爬一遍视图树
+static int SLProfPageKind(void) {
+    if (![NSThread isMainThread]) return 0;
+    NSTimeInterval now = [NSProcessInfo processInfo].systemUptime;
+    if (now < sSLProfGateUntil) return sSLProfKindVal;
+    sSLProfKindVal = SLProfPageKindSlow();
+    sSLProfGateUntil = now + 0.15;
+    return sSLProfKindVal;
+}
+
+static BOOL SLProfGate(void) {
+    if (!SLProfileEnabled()) return NO;
+    if (![NSThread isMainThread]) return sSLProfOnMePage;
+    int kind = SLProfPageKind();
+    if (kind < 0) {                       // 明确站在别人主页上，强制退出，防止串页
+        sSLProfOnMePage = NO;
+        return NO;
+    }
+    if (kind > 0) return YES;
+    return sSLProfOnMePage;               // 页面认不出来时，退回容器 appear 的记录
+}
+
+// 门没开时打一条现场，用来确认 getter 到底有没有在渲染「我」页时被调用，
+// 以及「我」页真正的顶层类名是什么（只打前 8 条，不刷屏）
+static void SLProfNoteMiss(NSString *tag) {
+    if (sSLProfMissLogged >= 8) return;
+    sSLProfMissLogged++;
+    UIViewController *vc = SLProfTopVC();
+    SLLog(@"PROF| %@ 被调但不在「我」页（顶层=%@）", tag,
+          vc ? NSStringFromClass([vc class]) : @"nil");
 }
 
 #pragma mark - 字符串字段
@@ -153,7 +214,7 @@ static void SLProfHookBoolSetter(Class cls, SEL sel, IMP imp, IMP *slot, NSStrin
     static id (*o_##NAME)(id, SEL);                                       \
     static id h_##NAME(id self, SEL _cmd) {                               \
         id v = o_##NAME ? o_##NAME(self, _cmd) : nil;                     \
-        if (!sSLProfOnMePage || !SLProfileEnabled()) return v;            \
+        if (!SLProfGate()) { SLProfNoteMiss(TAG); return v; }             \
         NSString *f = SLProfStr(KEY);                                     \
         if (!f.length) return v;                                          \
         if (sSLProfHits < 12) { sSLProfHits++;                            \
@@ -171,7 +232,7 @@ SL_PROF_STR_HOOK(uniqueID, SLProfKeyUID, @"uniqueIDForShow")
     static id (*o_##NAME)(id, SEL);                                       \
     static id h_##NAME(id self, SEL _cmd) {                               \
         id v = o_##NAME ? o_##NAME(self, _cmd) : nil;                     \
-        if (!sSLProfOnMePage || !SLProfileEnabled()) return v;            \
+        if (!SLProfGate()) { SLProfNoteMiss(TAG); return v; }             \
         long long n = 0;                                                  \
         if (!SLProfNumber(KEY, &n)) return v;                             \
         if (sSLProfHits < 12) { sSLProfHits++;                            \
@@ -187,40 +248,64 @@ SL_PROF_NUM_HOOK(followerCount, SLProfKeyFollower, @"followerCount")
 static id (*o_followerCountStr)(id, SEL);
 static id h_followerCountStr(id self, SEL _cmd) {
     id v = o_followerCountStr ? o_followerCountStr(self, _cmd) : nil;
-    if (!sSLProfOnMePage || !SLProfileEnabled()) return v;
+    if (!SLProfGate()) return v;
     long long n = 0;
     if (!SLProfNumber(SLProfKeyFollower, &n)) return v;
     return SLProfFormatCount(n);
 }
 
-#pragma mark - 页面开关
+#pragma mark - 容器进退（第二道门）
+//
+// 主判据是上面那个按可见页面判断的实时逻辑。这里再把「我」页容器的
+// appear / disappear 挂上：万一以后版本类名不再是 Profile 开头，这条还能兜住，
+// 而且日志里能直接看到容器有没有真的出现。
 
-// 「我」页容器被赋值 isCurrentUser=YES 时进入伪装态；
-// 页面消失时退出，评论区 / 私信 / 他人主页都不会被串。
-static void (*o_setIsCurrentUser)(id, SEL, BOOL);
-static void h_setIsCurrentUser(id self, SEL _cmd, BOOL v) {
-    if (v) {
-        if (!sSLProfOnMePage) SLLog(@"PROF| 进入本人主页");
-        sSLProfOnMePage = YES;
-    }
-    if (o_setIsCurrentUser) o_setIsCurrentUser(self, _cmd, v);
+typedef struct { Class cls; SEL sel; IMP orig; } SLProfSlot;
+static SLProfSlot sSLProfSlots[8];
+static int sSLProfSlotCount = 0;
+
+static IMP SLProfFindOrig(id self, SEL sel) {
+    Class c = object_getClass(self);
+    for (int i = 0; i < sSLProfSlotCount; i++)
+        if (sSLProfSlots[i].sel == sel && sSLProfSlots[i].cls == c) return sSLProfSlots[i].orig;
+    for (int i = 0; i < sSLProfSlotCount; i++)
+        if (sSLProfSlots[i].sel == sel) return sSLProfSlots[i].orig;
+    return NULL;
 }
 
-static void (*o_profWillDisappear)(id, SEL, BOOL);
-static void h_profWillDisappear(id self, SEL _cmd, BOOL animated) {
-    if (sSLProfOnMePage) {
-        sSLProfOnMePage = NO;
-        SLLog(@"PROF| 离开本人主页，恢复原样");
-    }
-    if (o_profWillDisappear) o_profWillDisappear(self, _cmd, animated);
+static void h_profEnterPage(id self, SEL _cmd, BOOL animated) {
+    if (!sSLProfOnMePage) SLLog(@"PROF| 进入本人主页（%@）", NSStringFromClass([self class]));
+    sSLProfOnMePage = YES;
+    sSLProfGateUntil = 0;
+    IMP o = SLProfFindOrig(self, _cmd);
+    if (o) ((void (*)(id, SEL, BOOL))o)(self, _cmd, animated);
 }
 
-// 41.x 变体：他人主页 VC 上自报是否本人页，容器类改名时的兜底
-static BOOL (*o_isCurrentUserProfilePage)(id, SEL);
-static BOOL h_isCurrentUserProfilePage(id self, SEL _cmd) {
-    BOOL v = o_isCurrentUserProfilePage ? o_isCurrentUserProfilePage(self, _cmd) : NO;
-    if (v) sSLProfOnMePage = YES;
-    return v;
+static void h_profLeavePage(id self, SEL _cmd, BOOL animated) {
+    if (sSLProfOnMePage) SLLog(@"PROF| 离开本人主页，恢复原样");
+    sSLProfOnMePage = NO;
+    sSLProfGateUntil = 0;
+    IMP o = SLProfFindOrig(self, _cmd);
+    if (o) ((void (*)(id, SEL, BOOL))o)(self, _cmd, animated);
+}
+
+static void SLProfHookPageLifecycle(Class cls) {
+    if (!cls) return;
+    NSString *name = NSStringFromClass(cls);
+    Method a = SLProfExact(cls, @selector(viewDidAppear:));
+    if (a) {
+        if (sSLProfSlotCount < 8)
+            sSLProfSlots[sSLProfSlotCount++] = (SLProfSlot){ cls, @selector(viewDidAppear:), method_getImplementation(a) };
+        method_setImplementation(a, (IMP)h_profEnterPage);
+        SLLog(@"PROF| 已挂 viewDidAppear: @ %@", name);
+    }
+    Method d = SLProfExact(cls, @selector(viewWillDisappear:));
+    if (d) {
+        if (sSLProfSlotCount < 8)
+            sSLProfSlots[sSLProfSlotCount++] = (SLProfSlot){ cls, @selector(viewWillDisappear:), method_getImplementation(d) };
+        method_setImplementation(d, (IMP)h_profLeavePage);
+        SLLog(@"PROF| 已挂 viewWillDisappear: @ %@", name);
+    }
 }
 
 #pragma mark - 装配
@@ -243,29 +328,16 @@ void SLProfileStart(void) {
     SLProfHookGetter(user, NSSelectorFromString(@"followerCountStr"),
                      (IMP)h_followerCountStr, (IMP *)&o_followerCountStr, @"followerCountStr");
 
-    Class tab = objc_getClass("AWEProfileTabContainerViewController");
-    SLProfHookBoolSetter(tab, NSSelectorFromString(@"setIsCurrentUser:"),
-                         (IMP)h_setIsCurrentUser, (IMP *)&o_setIsCurrentUser, @"setIsCurrentUser:");
-    SLProfHookBoolSetter(tab, @selector(viewWillDisappear:),
-                         (IMP)h_profWillDisappear, (IMP *)&o_profWillDisappear, @"viewWillDisappear:");
+    // 「我」页容器：挂 appear / disappear 当第二道门，并留下现场日志
+    SLProfHookPageLifecycle(objc_getClass("AWEProfileTabContainerViewController"));
+    SLProfHookPageLifecycle(objc_getClass("AWEProfileMergedTabContainerViewController"));
+    SLProfHookPageLifecycle(objc_getClass("AWEProfileBaseContainerViewController"));
 
-    Class home = objc_getClass("AWEUserHomeViewControllerV2");
-    if (home) {
-        Method m = SLProfExact(home, NSSelectorFromString(@"isCurrentUserProfilePage"));
-        if (m) {
-            char *ret = method_copyReturnType(m);
-            BOOL isBool = (ret && (ret[0] == 'B' || ret[0] == 'c'));
-            if (ret) free(ret);
-            if (isBool) {
-                o_isCurrentUserProfilePage = (BOOL (*)(id, SEL))method_getImplementation(m);
-                method_setImplementation(m, (IMP)h_isCurrentUserProfilePage);
-                SLLog(@"PROF| 已挂 isCurrentUserProfilePage @ AWEUserHomeViewControllerV2");
-            }
-        }
-    }
-
-    SLLog(@"PROF| ==== 主页伪装 v0.8.1 · 开=%d · 已填 %ld 项 ====",
+    SLLog(@"PROF| ==== 主页伪装 v0.8.2 · 开=%d · 已填 %ld 项 ====",
           SLProfileEnabled(), (long)SLProfileFilledCount());
+
+    UIViewController *top = SLProfTopVC();
+    SLLog(@"PROF| 启动时顶层页面 = %@", top ? NSStringFromClass([top class]) : @"nil");
 }
 
 #pragma mark - 编辑器
