@@ -24,6 +24,8 @@
 #define SLProfKeyAweme     @"SLProf.aweme"
 #define SLProfKeyFollowing @"SLProf.following"
 #define SLProfKeyFollower  @"SLProf.follower"
+#define SLProfKeyLike      @"SLProf.like"       // 获赞
+#define SLProfKeyFriend    @"SLProf.friend"     // 互关
 
 static volatile BOOL sSLProfOnMePage = NO;   // 「我」页可见期间为 YES
 static BOOL sSLProfStarted  = NO;
@@ -50,7 +52,8 @@ BOOL SLProfileEnabled(void) {
 
 NSInteger SLProfileFilledCount(void) {
     NSArray *keys = @[SLProfKeyNickname, SLProfKeyUID, SLProfKeySignature,
-                      SLProfKeyAweme, SLProfKeyFollowing, SLProfKeyFollower];
+                      SLProfKeyAweme, SLProfKeyFollowing, SLProfKeyFollower,
+                      SLProfKeyLike, SLProfKeyFriend];
     NSInteger n = 0;
     for (NSString *k in keys) if (SLProfStr(k)) n++;
     return n;
@@ -59,7 +62,8 @@ NSInteger SLProfileFilledCount(void) {
 void SLProfileClearAll(void) {
     NSUserDefaults *d = [NSUserDefaults standardUserDefaults];
     for (NSString *k in @[SLProfKeyNickname, SLProfKeyUID, SLProfKeySignature,
-                          SLProfKeyAweme, SLProfKeyFollowing, SLProfKeyFollower]) {
+                          SLProfKeyAweme, SLProfKeyFollowing, SLProfKeyFollower,
+                          SLProfKeyLike, SLProfKeyFriend]) {
         [d removeObjectForKey:k];
     }
     SLLog(@"PROF| 已清空全部预设值");
@@ -118,6 +122,24 @@ static void SLProfHookGetter(Class cls, SEL sel, IMP imp, IMP *slot, NSString *t
     BOOL isObj = (ret && ret[0] == '@');
     if (ret) free(ret);
     if (!isObj) { SLLog(@"PROF| 跳过 %@：返回值不是对象", tag); return; }
+    if (method_getNumberOfArguments(m) != 2) {
+        SLLog(@"PROF| 跳过 %@：参数个数不是 0", tag);
+        return;
+    }
+    *slot = method_getImplementation(m);
+    method_setImplementation(m, imp);
+    SLLog(@"PROF| 已挂 %@ @ %@", tag, NSStringFromClass(cls));
+}
+
+// 返回 BOOL、无参数
+static void SLProfHookBoolGetter(Class cls, SEL sel, IMP imp, IMP *slot, NSString *tag) {
+    if (!cls) { SLLog(@"PROF| 跳过 %@：类不存在", tag); return; }
+    Method m = SLProfExact(cls, sel);
+    if (!m) { SLLog(@"PROF| 跳过 %@：%@ 未实现该 selector", tag, NSStringFromClass(cls)); return; }
+    char *ret = method_copyReturnType(m);
+    BOOL isBool = (ret && (ret[0] == 'B' || ret[0] == 'c'));
+    if (ret) free(ret);
+    if (!isBool) { SLLog(@"PROF| 跳过 %@：返回值不是 BOOL", tag); return; }
     if (method_getNumberOfArguments(m) != 2) {
         SLLog(@"PROF| 跳过 %@：参数个数不是 0", tag);
         return;
@@ -318,6 +340,8 @@ SL_PROF_STR_HOOK(uniqueID, SLProfKeyUID, @"uniqueIDForShow")
 SL_PROF_NUM_HOOK(awemeCount, SLProfKeyAweme, @"awemeCount")
 SL_PROF_NUM_HOOK(followingCount, SLProfKeyFollowing, @"followingCount")
 SL_PROF_NUM_HOOK(followerCount, SLProfKeyFollower, @"followerCount")
+SL_PROF_NUM_HOOK(favoritingCount, SLProfKeyLike, @"favoritingCount")
+SL_PROF_NUM_HOOK(friendCount, SLProfKeyFriend, @"friendCount")
 
 // 粉丝数字还有一份字符串版本，喂给不自己格式化的 cell
 static id (*o_followerCountStr)(id, SEL);
@@ -327,6 +351,39 @@ static id h_followerCountStr(id self, SEL _cmd) {
     long long n = 0;
     if (!SLProfNumber(SLProfKeyFollower, &n)) return v;
     return SLProfFormatCount(n);
+}
+
+// 获赞的字符串版本（totalFavoriteStr），同理
+static id (*o_totalFavoriteStr)(id, SEL);
+static id h_totalFavoriteStr(id self, SEL _cmd) {
+    id v = o_totalFavoriteStr ? o_totalFavoriteStr(self, _cmd) : nil;
+    if (!SLProfGate()) return v;
+    long long n = 0;
+    if (!SLProfNumber(SLProfKeyLike, &n)) return v;
+    return SLProfFormatCount(n);
+}
+
+#pragma mark - 抖音号（header 组件层）
+//
+// 真机日志里 uniqueIDForShow 明明被替换了，页面上「抖音号」还是原值 ——
+// 说明这行字不是现读 model，而是 header 的 id 组件自己拼的：
+//   AWEProfileHeaderIdContentComponent_NEWAPI  -idPrefixStr（"抖音号："）+ -idStr
+// -idStr 是计算属性（该类没有 setIdStr:），所以直接截它最稳。
+
+static id (*o_headerIDStr)(id, SEL);
+static id h_headerIDStr(id self, SEL _cmd) {
+    id v = o_headerIDStr ? o_headerIDStr(self, _cmd) : nil;
+    NSString *f = SLProfStr(SLProfKeyUID);
+    if (!f.length || !SLProfGate()) return v;
+    return f;
+}
+
+// 账号没设抖音号时 APP 会显示短 ID，这个开关打开才会走「抖音号：」那一行
+static BOOL (*o_shouldShowUniqueID)(id, SEL);
+static BOOL h_shouldShowUniqueID(id self, SEL _cmd) {
+    BOOL v = o_shouldShowUniqueID ? o_shouldShowUniqueID(self, _cmd) : NO;
+    if (SLProfGate() && SLProfStr(SLProfKeyUID).length) return YES;
+    return v;
 }
 
 #pragma mark - 容器进退（第二道门）
@@ -402,13 +459,25 @@ void SLProfileStart(void) {
                      (IMP)h_followerCount, (IMP *)&o_followerCount, @"followerCount");
     SLProfHookGetter(user, NSSelectorFromString(@"followerCountStr"),
                      (IMP)h_followerCountStr, (IMP *)&o_followerCountStr, @"followerCountStr");
+    SLProfHookGetter(user, NSSelectorFromString(@"favoritingCount"),
+                     (IMP)h_favoritingCount, (IMP *)&o_favoritingCount, @"favoritingCount");
+    SLProfHookGetter(user, NSSelectorFromString(@"friendCount"),
+                     (IMP)h_friendCount, (IMP *)&o_friendCount, @"friendCount");
+    SLProfHookGetter(user, NSSelectorFromString(@"totalFavoriteStr"),
+                     (IMP)h_totalFavoriteStr, (IMP *)&o_totalFavoriteStr, @"totalFavoriteStr");
+    SLProfHookBoolGetter(user, NSSelectorFromString(@"shouldShowUniqueID"),
+                         (IMP)h_shouldShowUniqueID, (IMP *)&o_shouldShowUniqueID, @"shouldShowUniqueID");
+
+    // header 里那行「抖音号：xxx」由 id 组件自己拼，不读 model 的 getter
+    Class idComp = objc_getClass("AWEProfileHeaderIdContentComponent_NEWAPI");
+    SLProfHookGetter(idComp, @selector(idStr), (IMP)h_headerIDStr, (IMP *)&o_headerIDStr, @"header.idStr");
 
     // 「我」页容器：挂 appear / disappear 当第二道门，并留下现场日志
     SLProfHookPageLifecycle(objc_getClass("AWEProfileTabContainerViewController"));
     SLProfHookPageLifecycle(objc_getClass("AWEProfileMergedTabContainerViewController"));
     SLProfHookPageLifecycle(objc_getClass("AWEProfileBaseContainerViewController"));
 
-    SLLog(@"PROF| ==== 主页伪装 v0.8.3 · 开=%d · 已填 %ld 项 ====",
+    SLLog(@"PROF| ==== 主页伪装 v0.8.4 · 开=%d · 已填 %ld 项 ====",
           SLProfileEnabled(), (long)SLProfileFilledCount());
 
     UIViewController *top = SLProfTopVC();
@@ -447,7 +516,7 @@ void SLProfileStart(void) {
     (void)tv;
     if (s == 0) return 1;
     if (s == 1) return 4;
-    return 3;
+    return 5;
 }
 
 - (NSString *)tableView:(UITableView *)tv titleForHeaderInSection:(NSInteger)s {
@@ -497,8 +566,9 @@ void SLProfileStart(void) {
         return cell;
     }
 
-    NSArray *titles = @[@"作品", @"关注", @"粉丝"];
-    NSString *key = @[SLProfKeyAweme, SLProfKeyFollowing, SLProfKeyFollower][ip.row];
+    NSArray *titles = @[@"作品", @"关注", @"粉丝", @"获赞", @"互关"];
+    NSString *key = @[SLProfKeyAweme, SLProfKeyFollowing, SLProfKeyFollower,
+                      SLProfKeyLike, SLProfKeyFriend][ip.row];
     cell.textLabel.text = titles[ip.row];
     NSString *v = SLProfStr(key);
     cell.detailTextLabel.text = v.length ? v : @"未设置";
@@ -527,7 +597,9 @@ void SLProfileStart(void) {
     } else {
         if (ip.row == 0) { title = @"作品数"; key = SLProfKeyAweme; kb = UIKeyboardTypeNumberPad; }
         else if (ip.row == 1) { title = @"关注数"; key = SLProfKeyFollowing; kb = UIKeyboardTypeNumberPad; }
-        else { title = @"粉丝数"; key = SLProfKeyFollower; kb = UIKeyboardTypeNumberPad; }
+        else if (ip.row == 2) { title = @"粉丝数"; key = SLProfKeyFollower; kb = UIKeyboardTypeNumberPad; }
+        else if (ip.row == 3) { title = @"获赞数"; key = SLProfKeyLike; kb = UIKeyboardTypeNumberPad; }
+        else { title = @"互关数"; key = SLProfKeyFriend; kb = UIKeyboardTypeNumberPad; }
     }
     if (!key) return;
 
