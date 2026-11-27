@@ -16,6 +16,7 @@ ShenglinDouyin_FILES = Tweak/Tweak.x \
 	Tweak/SLLog.m \
 	Tweak/SLLogViewController.m \
 	Tweak/SLWatchOnce.m \
+	Tweak/SLProfile.m \
 	Tweak/SLBallCommand.m \
 	Tweak/SLAPIBackup.m \
 	Tweak/SLTrimController.m \

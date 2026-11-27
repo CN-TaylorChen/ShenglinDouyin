@@ -11,6 +11,7 @@
 #import "SLEntry.h"
 #import "SLLog.h"
 #import "SLWatchOnce.h"
+#import "SLProfile.h"
 #import "SLBallCommand.h"
 #import "SLVoicePack.h"
 #import <objc/runtime.h>
@@ -898,6 +899,10 @@ static void setupAudioIconElementHook(void) {
         // v0.6.0 相册闪图：只放开原生入口的 getter，不伪造消息、不碰图片消息类
         @try { SLWatchOnceStart(); } @catch (NSException *e) {
             SLLog(@"相册闪图装配失败: %@", e);
+        }
+        // v0.8.1 本机主页伪装：只在「我」页可见期间替换展示字段
+        @try { SLProfileStart(); } @catch (NSException *e) {
+            SLLog(@"主页伪装装配失败: %@", e);
         }
     }
 }

@@ -26,6 +26,7 @@
 #import "AWECADownloadManager.h"
 #import "SLTTSComposeController.h"
 #import "SLWatchOnce.h"
+#import "SLProfile.h"
 
 // v0.4.71：语速/音量改用右侧「数值 + 细轨滑块」，行高仍 44pt、跟开关同一列。
 // v0.4.72：系统 thumb 是 30pt 白圆，配 3pt 细轨太重、看着像浮在线上；
@@ -68,7 +69,7 @@ static UIImage *SLThinSliderThumb(void) {
 
 #define kSLEnabledKey @"SLEnhanceEnabled"
 // 与 control 的 Version 保持一致（0.5.0）。原来写死 1.0.0，设置页标题栏一直显示旧号。
-#define SLVersion @"0.8.0"
+#define SLVersion @"0.8.1"
 
 // v0.4.52：单元格玻璃色搬到 SLGlass（全站二级页共用同一个数），这里不再重复定义。
 
@@ -236,21 +237,22 @@ static UIView *SLMakeHeader(NSString *text, CGFloat x, CGFloat width) {
 
 - (NSInteger)numberOfSectionsInTableView:(UITableView *)tv {
     (void)tv;
-    // 抖音版：音色与合成（含音频来源两项）/ 其它。口令整组与本地音频入口已删。
-    return 2;
+    // 抖音版：音色与合成 / 主页外观 / 其它。运行日志固定在最后一组最后一行。
+    return 3;
 }
 
 - (NSInteger)tableView:(UITableView *)tv numberOfRowsInSection:(NSInteger)section {
     (void)tv;
     // 音色与合成：评论开关 + 私聊开关 + 引擎 + 音色 + 情绪 + 语速 + 音量 + 音调 + 文本转语音 + 语音包
     if (section == 0) return 10;
-    if (section == 1) return 3;   // 其它：悬浮球图标 + API 凭证 + 运行日志
+    if (section == 1) return 1;   // 主页外观：主页伪装
+    if (section == 2) return 3;   // 其它：悬浮球图标 + API 凭证 + 运行日志
     return 0;
 }
 
 - (NSString *)sl_headerForSection:(NSInteger)section {
-    if (section < 0 || section > 1) return @"";
-    return @[@"音色与合成", @"其它"][section];
+    if (section < 0 || section > 2) return @"";
+    return @[@"音色与合成", @"主页外观", @"其它"][section];
 }
 
 - (UIView *)tableView:(UITableView *)tv viewForHeaderInSection:(NSInteger)section {
@@ -392,7 +394,21 @@ static UIView *SLMakeHeader(NSString *text, CGFloat x, CGFloat width) {
         return cell;
     }
 
-    if (ip.section == 1) {                     // 其它
+    if (ip.section == 1) {                     // 主页外观
+        cell.textLabel.text = @"主页伪装";
+        NSInteger filled = SLProfileFilledCount();
+        if (!SLProfileEnabled()) {
+            cell.detailTextLabel.text = @"关闭";
+        } else {
+            cell.detailTextLabel.text = filled
+                ? [NSString stringWithFormat:@"已开 · %ld 项", (long)filled]
+                : @"已开 · 未填";
+        }
+        cell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
+        return cell;
+    }
+
+    if (ip.section == 2) {                     // 其它
         if (ip.row == 0) {
             cell.textLabel.text = @"悬浮球图标";
             cell.detailTextLabel.text = SLFloatIconSummary();
@@ -452,7 +468,12 @@ static UIView *SLMakeHeader(NSString *text, CGFloat x, CGFloat width) {
         return;                                                  // 0/1 是两个开关，2 是分段控件
     }
 
-    if (ip.section == 1) {                                  // 其它
+    if (ip.section == 1) {                                  // 主页外观
+        [self.navigationController pushViewController:[[SLProfileEditorController alloc] init] animated:YES];
+        return;
+    }
+
+    if (ip.section == 2) {                                  // 其它
         if (ip.row == 0) {                                  // 悬浮球图标
             [self.navigationController pushViewController:[[SLFloatIconController alloc] init] animated:YES];
             return;

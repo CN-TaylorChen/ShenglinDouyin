@@ -115,36 +115,6 @@ static void SLInstallVoid(Class cls, SEL sel, IMP imp, IMP *origSlot, NSString *
     SLInstall(cls, sel, imp, origSlot, tag);
 }
 
-// 参数签名校验：'@' = 对象，'i' = 整数（NSInteger / NSUInteger / enum 都算），'B' = BOOL。
-// 参数类型不明就挂钩 = 把实参传坏，这类错误在运行时只表现为「发消息闪退」，所以必须先验。
-static BOOL SLArgsAre(Method m, const char *types) {
-    unsigned int n = method_getNumberOfArguments(m);
-    size_t len = strlen(types);
-    if (n != len + 2) return NO;
-    for (size_t i = 0; i < len; i++) {
-        char buf[16] = {0};
-        method_getArgumentType(m, (unsigned int)(i + 2), buf, sizeof(buf));
-        char t = buf[0], want = types[i];
-        if (want == '@') { if (t != '@') return NO; }
-        else if (want == 'i') {
-            if (t != 'q' && t != 'i' && t != 'I' && t != 'Q' && t != 'l' && t != 'L') return NO;
-        }
-        else if (want == 'B') { if (t != 'B' && t != 'c') return NO; }
-        else if (t != want) return NO;
-    }
-    return YES;
-}
-
-static void SLInstallVoidTyped(Class cls, SEL sel, const char *types,
-                               IMP imp, IMP *origSlot, NSString *tag) {
-    if (!cls) { SLLog(@"ONCE| 跳过 %@：类不存在", tag); return; }
-    Method m = SLExactMethod(cls, sel);
-    if (!m) { SLLog(@"ONCE| 跳过 %@：%@ 未实现该 selector", tag, NSStringFromClass(cls)); return; }
-    if (!SLReturnTypeIs(m, 'v')) { SLLog(@"ONCE| 跳过 %@：返回不是 void", tag); return; }
-    if (!SLArgsAre(m, types)) { SLLog(@"ONCE| 跳过 %@：参数签名不匹配", tag); return; }
-    SLInstall(cls, sel, imp, origSlot, tag);
-}
-
 #pragma mark - 门 1：disableSendWatchOnce → 一律 NO
 
 #define SL_ONCE_ALLOW_HOOK(NAME, TAG)                       \
@@ -566,7 +536,6 @@ static void SLShowOnceMenu(UIView *source);
 
 // UIButton 不持有 target，得自己留一个，否则点一下就野指针
 static SLOnceTarget *sSLOctTarget = nil;
-static BOOL sSLOncePending = NO;    // 点了「闪图」之后、这次发送结束之前为 YES
 static BOOL sSLBarDumped   = NO;    // delegate 方法名只 dump 一次
 
 // 长按「发送」时的选择菜单：普通 / 仅看一次。这是不依赖任何布局的兜底入口。
@@ -601,9 +570,9 @@ static void SLShowOnceMenu(UIView *source) {
     [vc presentViewController:sheet animated:YES completion:nil];
 }
 
-// 真正触发一次闪图发送：挂上 pending 标志，然后走抖音自己的发送动作。
-// pending 期间 AWEIMSendMessageContext / IESIMSendMessageModel 的 setter 钩子会把
-// isClickWatchOnce 置 1 —— 抖音内部据此走「仅看一次」拿一次性凭证，消息类型自然变成 91。
+// 真正触发一次闪图发送。
+// 走的是工具栏 delegate 自己的闪图入口，不需要碰发送上下文 —— 实测
+// AWEIMSendMessageContext 在相册发图路径上一次都没被读过，v0.8.1 已把那几个钩子删掉。
 static void SLFireWatchOnce(UIView *source) {
     UIViewController *vc = SLParentVC(source) ?: SLParentVC(sSLOctBtn);
     UIView *root = (vc && vc.isViewLoaded) ? vc.view : nil;
@@ -618,8 +587,7 @@ static void SLFireWatchOnce(UIView *source) {
         return;
     }
 
-    sSLOncePending = YES;
-    SLLog(@"BTN| 触发闪图发送 pending=1");
+    SLLog(@"BTN| 触发闪图发送");
 
     // v0.7.2：日志证明工具栏 delegate = AWEIMMessageListGalleryEntryComponent，
     // 它身上就有 watchOnceSendButtonInPickerPressed: / sendAsWatchOnce / sendAsNormal。
@@ -684,14 +652,6 @@ static void SLFireWatchOnce(UIView *source) {
                 ((void (*)(id, SEL, BOOL))objc_msgSend)(del, @selector(setSendAsNormal:), YES);
             SLLog(@"BTN| delegate 已复位（sendAsWatchOnce=0 / sendAsNormal=1）");
         } @catch (NSException *e) { (void)e; }
-    });
-
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.5 * NSEC_PER_SEC)),
-                   dispatch_get_main_queue(), ^{
-        if (sSLOncePending) {
-            sSLOncePending = NO;
-            SLLog(@"BTN| pending 超时清除（这次发送没有走到 context/model 钩子）");
-        }
     });
 }
 
@@ -839,55 +799,6 @@ static void h_actionBarLayout(id self, SEL _cmd) {
     } @catch (NSException *e) { (void)e; }
 }
 
-// ---- v0.7.1：点了「闪图」之后，把这次发送标成 watch-once ----
-// AWEIMSendMessageContext.isClickWatchOnce 是抖音自己的字段，读它的地方会去拿一次性凭证。
-// 只在 sSLOncePending 期间改，普通发送完全不受影响。
-static void SLMarkWatchOnce(id ctx, NSString *tag) {
-    if (!ctx) return;
-    @try {
-        SEL s = NSSelectorFromString(@"setIsClickWatchOnce:");
-        if ([ctx respondsToSelector:s]) {
-            ((void (*)(id, SEL, BOOL))objc_msgSend)(ctx, s, YES);
-            SLLog(@"BTN| %@.isClickWatchOnce → 1", tag);
-        } else {
-            SLLog(@"BTN| %@ 没有 setIsClickWatchOnce:", tag);
-        }
-    } @catch (NSException *e) {
-        SLLog(@"BTN| %@ 置位失败 %@", tag, e);
-    }
-}
-
-static void (*o_ctxSendFrom)(id, SEL, id);
-static void h_ctxSendFrom(id self, SEL _cmd, id from) {
-    if (o_ctxSendFrom) o_ctxSendFrom(self, _cmd, from);
-    if (sSLOncePending) SLMarkWatchOnce(self, @"SendMessageContext");
-}
-
-// 比改字段更硬的一层：pending 期间谁读这个值，就给 YES。
-// 抖音内部据此决定走不走「仅看一次」的一次性凭证流程。
-static BOOL (*o_ctxIsClick)(id, SEL);
-static BOOL h_ctxIsClick(id self, SEL _cmd) {
-    BOOL orig = o_ctxIsClick ? o_ctxIsClick(self, _cmd) : NO;
-    if (!sSLOncePending) return orig;
-    static BOOL once = NO;
-    if (!once) { once = YES; SLLog(@"BTN| 读 isClickWatchOnce：原生=%d → 1", orig); }
-    return YES;
-}
-
-static void (*o_modelSetCtx)(id, SEL, id);
-static void h_modelSetCtx(id self, SEL _cmd, id ctx) {
-    if (o_modelSetCtx) o_modelSetCtx(self, _cmd, ctx);
-    if (sSLOncePending) SLMarkWatchOnce(ctx, @"SendMessageModel.sendContext");
-}
-
-// v0.8.0：发文字的入口只留一行日志。万一还崩，这行就是「崩在发送之前 / 之后」的分界线，
-// 一次就能定位，不用再来回试。
-static void (*o_sendText)(id, SEL, id);
-static void h_sendText(id self, SEL _cmd, id arg) {
-    SLLog(@"TXT| 发送文字 pending=%d", sSLOncePending);
-    if (o_sendText) o_sendText(self, _cmd, arg);
-}
-
 #pragma mark - 装配
 
 void SLWatchOnceStart(void) {
@@ -895,7 +806,7 @@ void SLWatchOnceStart(void) {
     if (started) return;
     started = YES;
 
-    SLLog(@"ONCE| ==== 相册闪图 v0.8.0 · 入口=%d · 默认闪图=%d ====",
+    SLLog(@"ONCE| ==== 相册闪图 v0.8.1 · 入口=%d · 默认闪图=%d ====",
           SLWatchOnceEntryOn(), SLWatchOnceForceOn());
 
     // v0.6.0 那两个开关没有生效（钩子从未被调用），设置页已撤掉；
@@ -946,25 +857,6 @@ void SLWatchOnceStart(void) {
     c = objc_getClass("AWEIMContextRecommendUtil");
     SLInstallBool(c, @selector(enableOptWatchOnceStrategy), (IMP)h_optStrategy, (IMP *)&o_optStrategy,
                   @"contextRecommend.enableOptWatchOnceStrategy");
-
-    // v0.7.1：点了闪图按钮后，把这次发送的上下文标成 watch-once（只在 pending 期间生效）
-    c = objc_getClass("AWEIMSendMessageContext");
-    SLInstallBool(c, @selector(isClickWatchOnce), (IMP)h_ctxIsClick, (IMP *)&o_ctxIsClick,
-                  @"context.isClickWatchOnce");
-    // v0.8.0：setSendFrom: 的参数类型不知道（枚举/结构体都可能，猜错就把实参传坏），
-    // 只有确认是对象才挂。它在 0.7.x 的日志里一次都没被调用过，删了也不影响闪图。
-    SLInstallVoidTyped(c, @selector(setSendFrom:), "@", (IMP)h_ctxSendFrom, (IMP *)&o_ctxSendFrom,
-                       @"context.setSendFrom:");
-
-    c = objc_getClass("IESIMSendMessageModel");
-    SLInstallVoid(c, @selector(setSendContext:), (IMP)h_modelSetCtx, (IMP *)&o_modelSetCtx,
-                  @"model.setSendContext:");
-
-    // 发文字的入口：只打日志（参数必须确认是对象，否则不挂）
-    c = objc_getClass("IESIMInputViewController");
-    SLInstallVoidTyped(c, @selector(sendTextViewTextMessage:), "@",
-                       (IMP)h_sendText, (IMP *)&o_sendText,
-                       @"input.sendTextViewTextMessage:");
 
     // ---- v0.6.1 定位相册：只观察，不改任何值 ----
     // 三个锚点覆盖三种可能：present（一定能过）、viewDidLoad、viewDidAppear
