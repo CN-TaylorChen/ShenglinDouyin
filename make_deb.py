@@ -95,15 +95,20 @@ def main():
     ap.add_argument("--plist", required=True)
     ap.add_argument("--dylib-name", required=True, help="安装后的 dylib 文件名(含后缀)")
     ap.add_argument("--out", required=True)
+    ap.add_argument("--rootless", action="store_true",
+                    help="按 rootless 布局打包（文件落到 /var/jb/...，供 Dopamine / palera1n 用）")
     args = ap.parse_args()
 
-    base = "Library/MobileSubstrate/DynamicLibraries"
+    # rootful: /Library/MobileSubstrate/DynamicLibraries
+    # rootless: /var/jb/Library/MobileSubstrate/DynamicLibraries
+    base = "var/jb/Library/MobileSubstrate/DynamicLibraries" if args.rootless \
+        else "Library/MobileSubstrate/DynamicLibraries"
     entries = [
         (f"{base}/{args.dylib_name}", args.dylib, 0o755),
         (f"{base}/{os.path.splitext(args.dylib_name)[0]}.plist", args.plist, 0o644),
     ]
     path = build_deb(args.control, entries, args.out)
-    print(f"[OK] {path}  ({os.path.getsize(path)} bytes)")
+    print(f"[OK] {path}  ({os.path.getsize(path)} bytes, base={base})")
 
 
 if __name__ == "__main__":

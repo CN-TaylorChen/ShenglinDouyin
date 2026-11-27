@@ -57,13 +57,46 @@ jobs:
           THEOS: ${{ github.workspace }}/theos
         run: make
 
-      - name: Package deb
+      - name: Sign dylib (ldid)
+        env:
+          THEOS: ${{ github.workspace }}/theos
+        run: |
+          set -e
+          LDID=""
+          for c in "$THEOS/bin/ldid" "$THEOS/bin/ldid_macosx_arm64" \
+                   "$THEOS/bin/ldid_macosx_x86_64" \
+                   "$HOME/theos/bin/ldid" "$HOME/theos/bin/ldid_macosx_arm64"; do
+            if [ -x "$c" ]; then LDID="$c"; break; fi
+          done
+          if [ -z "$LDID" ]; then
+            if command -v ldid >/dev/null 2>&1; then
+              LDID="$(command -v ldid)"
+            else
+              brew install ldid || true
+              LDID="$(command -v ldid || true)"
+            fi
+          fi
+          if [ -z "$LDID" ]; then
+            echo "ldid not available, shipping unsigned dylib"
+            exit 0
+          fi
+          echo "using $LDID"
+          "$LDID" -S ShenglinDouyin.dylib
+          echo "--- codesign ---"
+          codesign -dv ShenglinDouyin.dylib 2>&1 | head -8 || true
+
+      - name: Package deb (rootless)
         run: |
           VER=$(grep '^Version:' control | awk '{print $2}' | tr -d '\r')
           python3 make_deb.py --control control \
             --dylib ShenglinDouyin.dylib --plist ShenglinDouyin.plist \
-            --dylib-name ShenglinDouyin.dylib \
+            --dylib-name ShenglinDouyin.dylib --rootless \
             --out "ShenglinDouyin-v${VER}.deb"
+          # 顺手打一份 rootful 的，老设备也能装
+          python3 make_deb.py --control control \
+            --dylib ShenglinDouyin.dylib --plist ShenglinDouyin.plist \
+            --dylib-name ShenglinDouyin.dylib \
+            --out "ShenglinDouyin-v${VER}-rootful.deb"
 
       - name: Resolve artifact name (声临-v<版本>)
         id: art

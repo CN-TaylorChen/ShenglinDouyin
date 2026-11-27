@@ -9,6 +9,14 @@
 //  这些 getter 返回的都是 id（数字也是 NSNumber），所以钩子统一按对象转发。
 //  只在「我」页可见期间生效，页面消失立刻还原，评论 / 私信 / 列表都不受影响。
 //
+//  v0.8.7：
+//    · 别人主页左上角「伪装主页」胶囊（贴返回按钮），一点整套套用，不再用悬浮球
+//    · 修「点下去数据不全」：先落盘 → 再从当前 userModel 现场抄 → 合并后写回
+//    · 修「背景图复制不过来」：封面 URL 改从 model.profileCover 取，
+//      并记住「我」页那次配置参数，回我页时强制重刷一次封面视图
+//    · 作品九宫格 + 每条的播放量：把对方主页那份作品 dataSource 在内存里留住，
+//      回我页时换上去（设置页可关）
+//
 
 #import "SLProfile.h"
 #import "SLLog.h"
@@ -35,6 +43,8 @@ static int  sSLProfHits     = 0;
 static int  sSLProfMissLogged = 0;  // 门未开的诊断日志，最多打几条
 
 static id SLProfCallObj(id obj, NSString *selName);   // 定义在「页面判定」段，快照要用
+static void SLProfForceCover(void);                   // 定义在「封面」段，套用后用
+static NSString *sSLWorkWant = nil;                   // 要模拟谁的作品列表（内存内，重启失效）
 
 #pragma mark - 配置
 
@@ -124,7 +134,8 @@ static BOOL SLProfNumber(NSString *key, long long *out) {
 static BOOL sSLCapOn  = NO;
 static NSMutableDictionary *sSLCapCur   = nil;   // 正在看的这个人的字段
 static NSMutableDictionary *sSLCapStore = nil;   // uid -> dict，持久化
-static NSString *sSLCapLastKey = nil;            // 最近一次落盘的 uid（JOKER 用）
+static NSMutableDictionary *sSLCapPend  = nil;   // 还不知道是谁的字段（组件先于 model 跑到）
+static NSString *sSLCapLastKey = nil;            // 最近一次落盘的 uid
 static NSTimeInterval sSLCapLastLogAt = 0;
 
 static NSMutableDictionary *SLCapStore(void) {
@@ -178,13 +189,26 @@ static BOOL SLCapBetter(id oldV, id newV) {
     return YES;
 }
 
+// 把「还没认领」的字段并进当前这条记录
+static void SLCapAbsorbPend(void) {
+    if (!sSLCapPend || !sSLCapCur) return;
+    for (NSString *k in sSLCapPend) {
+        id nv = sSLCapPend[k];
+        id ov = sSLCapCur[k];
+        if (!ov || SLCapBetter(ov, nv)) sSLCapCur[k] = nv;
+    }
+    sSLCapPend = nil;
+}
+
 static void SLCapBegin(void) {
     sSLCapOn = YES;
     sSLCapCur = nil;
+    sSLCapPend = nil;      // 换人，上一屏挂起的作废
 }
 
 // 把手上这份合并进 store（不改变 sSLCapOn）
 static void SLCapFlush(void) {
+    SLCapAbsorbPend();
     NSMutableDictionary *cap = sSLCapCur;
     sSLCapCur = nil;
     if (!cap) return;
@@ -236,22 +260,23 @@ static void SLCapFinish(void) {
     SLCapFlush();
 }
 
-// 组件层（获赞 / 互关 / 作品…）没有 model 可问，直接往当前这条记录里追加
+// 组件层（获赞 / 互关 / 封面…）没有 model 可问，直接往当前这条记录里追加。
+// 组件往往比 model 的 getter 先跑到，这时还不知道这一屏是谁的 —— 先挂起（sSLCapPend），
+// 等 SLCapNote 拿到 uid 再整包认领。v0.8.6 之前是「接着上一条记录补」，
+// 结果封面被记到了上一个人的名下，套用时就永远拿不到背景图。
 static void SLCapNoteValue(NSString *field, id value) {
     if (!sSLCapOn || !field || !value) return;
     if (![value isKindOfClass:[NSString class]] && ![value isKindOfClass:[NSNumber class]]) return;
     if (![value description].length) return;
 
-    if (!sSLCapCur) {
-        // 组件比 model 的 getter 先跑到时，接着上一条记录补
-        if (!sSLCapLastKey) return;
-        NSDictionary *old = SLCapStore()[sSLCapLastKey];
-        if (!old) return;
-        sSLCapCur = [old mutableCopy];
-        [sSLCapCur removeObjectForKey:@"ts"];
+    if (sSLCapCur) {
+        id ov = sSLCapCur[field];
+        if (!ov || SLCapBetter(ov, value)) sSLCapCur[field] = value;
+        return;
     }
-    id ov = sSLCapCur[field];
-    if (!ov || SLCapBetter(ov, value)) sSLCapCur[field] = value;
+    if (!sSLCapPend) sSLCapPend = [NSMutableDictionary dictionary];
+    id ov = sSLCapPend[field];
+    if (!ov || SLCapBetter(ov, value)) sSLCapPend[field] = value;
 }
 
 // 只在别人主页那几秒记账；用 model 的 uid 建条目
@@ -277,6 +302,7 @@ static void SLCapNote(id model, NSString *field, id value) {
         sSLCapCur = [NSMutableDictionary dictionary];
         if (uid.length) sSLCapCur[@"uid"] = uid;
         if (sec.length) sSLCapCur[@"sec"] = sec;
+        SLCapAbsorbPend();       // 这一屏的封面 / 数字终于知道是谁的了
     }
     id ov = sSLCapCur[field];
     if (!ov || SLCapBetter(ov, value)) sSLCapCur[field] = value;
@@ -317,17 +343,10 @@ static void SLApplySnap(NSDictionary *s) {
     SLProfSetStr(SLSnapText(s, @"friend"),    SLProfKeyFriend);
     SLProfSetStr(SLSnapText(s, @"cover"),     SLProfKeyCover);
     [[NSUserDefaults standardUserDefaults] setBool:YES forKey:SLProfKeyEnabled];
+    NSString *uid = SLSnapText(s, @"uid");
+    if (uid.length) sSLWorkWant = uid;          // 作品列表要换成这个人的
     SLLog(@"SNAP| 套用 %@ 的整套资料", SLSnapText(s, @"nickname") ?: @"?");
-}
-
-// JOKER 用：把「当前正在看的这个人」的最新一份立刻拿到手
-static NSDictionary *SLCapLive(void) {
-    SLCapFlush();                       // 手上还有没落盘的先落盘
-    if (sSLCapLastKey) {
-        NSDictionary *s = SLCapStore()[sSLCapLastKey];
-        if (s) return s;
-    }
-    return SLSnapList().firstObject;    // 兜底用最近看过的那个人
+    SLProfForceCover();                         // 若此刻正停在「我」页，立刻换背景
 }
 
 #pragma mark - 钩子基座
@@ -730,6 +749,10 @@ static NSString *SLProfFirstURL(id list) {
     return nil;
 }
 
+static NSArray *sCoverLastURLs  = nil;   // 「我」页最近一次下发的参数，强制刷新时原样回传
+static NSArray *sCoverLastLight = nil;
+static NSArray *sCoverLastDark  = nil;
+
 static void h_coverConfig(id self, SEL _cmd, id urls, id light, id dark) {
     if (!SLProfGate()) {
         // 只在他人主页记，别把自己主页的封面写进别人那条
@@ -740,6 +763,11 @@ static void h_coverConfig(id self, SEL _cmd, id urls, id light, id dark) {
         if (o_coverConfig) o_coverConfig(self, _cmd, urls, light, dark);
         return;
     }
+
+    // 记下「我」页这组参数：以后强制刷新时要用同一套颜色，长度对上才不会越界
+    if ([urls isKindOfClass:[NSArray class]])  sCoverLastURLs  = [(NSArray *)urls copy];
+    if ([light isKindOfClass:[NSArray class]]) sCoverLastLight = [(NSArray *)light copy];
+    if ([dark isKindOfClass:[NSArray class]])  sCoverLastDark  = [(NSArray *)dark copy];
 
     NSString *mine = SLProfStr(SLProfKeyCover);
     if (!mine.length || ![urls isKindOfClass:[NSArray class]] || ![(NSArray *)urls count]) {
@@ -762,103 +790,397 @@ static void h_coverConfig(id self, SEL _cmd, id urls, id light, id dark) {
     static BOOL sCoverLogged = NO;
     if (!sCoverLogged) {
         sCoverLogged = YES;
-        SLLog(@"PROF| 替换封面 → %@", mine);
+        SLLog(@"COVER| 替换封面 → %@", mine);
     }
     if (o_coverConfig) o_coverConfig(self, _cmd, @[neu], nl, nd);
 }
 
-#pragma mark - JOKER（别人主页上一键整套套用）
+// 封面视图只在页面初次配置时被调一次。如果那次调用发生在「我」页还没被识别出来之前
+// （门还没开），替换就被漏掉了，之后也不会再重来 —— 这就是背景图一直换不掉的原因。
+// 这里主动在窗口里把封面视图找出来，用刚才记下的那组参数再喂一遍。
+static void SLProfFindCoverViews(UIView *root, NSMutableArray *out) {
+    if (!root || !out) return;
+    if ([NSStringFromClass([root class]) isEqualToString:@"AWEProfileBannerBGCoverView"]) {
+        [out addObject:root];
+        return;
+    }
+    for (UIView *v in root.subviews) SLProfFindCoverViews(v, out);
+}
+
+static void SLProfForceCover(void) {
+    if (!o_coverConfig || !SLProfileEnabled()) return;
+    NSString *mine = SLProfStr(SLProfKeyCover);
+    if (!mine.length) return;
+
+    NSMutableArray *views = [NSMutableArray array];
+    for (UIScene *s in [UIApplication sharedApplication].connectedScenes) {
+        if (![s isKindOfClass:[UIWindowScene class]]) continue;
+        for (UIWindow *w in ((UIWindowScene *)s).windows) SLProfFindCoverViews(w, views);
+    }
+    if (!views.count) { SLLog(@"COVER| 没找到封面视图，跳过"); return; }
+
+    id first = sCoverLastURLs.firstObject;
+    id neu = [first isKindOfClass:[NSURL class]] ? [NSURL URLWithString:mine] : mine;
+    if (!neu) return;
+
+    SEL sel = NSSelectorFromString(@"configWithURLList:lightColorList:darkColorList:");
+    NSUInteger n = 0;
+    for (UIView *v in views) {
+        o_coverConfig(v, sel, @[neu], sCoverLastLight ?: @[], sCoverLastDark ?: @[]);
+        [v setNeedsLayout];
+        n++;
+    }
+    SLLog(@"COVER| 已强制刷新 %lu 处封面", (unsigned long)n);
+}
+
+#pragma mark - 作品列表 + 播放量
 //
-// 那颗球只在他人主页出现：点一下 = 抓到的这个人整套写进预设 + 打开总开关，
-// 顺手弹个 toast 告诉你套的是谁。不点也行，设置页那条列表照样能用。
+// 主页那个九宫格（以及每张封面右下角的播放量）不走 AWEUserModel 的任何 getter，
+// 它是 AWEUserPostsDataManager 持有一份 dataSource（作品数组），由 cell 自己渲染。
+// 想「模拟对方的作品」，唯一的办法就是把那份 dataSource 换成对方的。
+//
+// 不需要联网：你点开对方主页时，对方那份 dataSource 已经完整躺在内存里了。
+// 这里把它按 uid 强引用住，等我回自己主页时交给我的 data manager 用。
+// 只在内存里，重启即失效 —— 与快照本身的设计一致。
 
-#define SLJokerTag 0x5A0B1E
+#define SLProfKeyWorks  @"SLProf.works"
 
-static NSString *sSLJokerUID = nil;   // 当前这个详情页是谁
+static BOOL SLProfWorksEnabled(void) {
+    id v = [[NSUserDefaults standardUserDefaults] objectForKey:SLProfKeyWorks];
+    return v ? [v boolValue] : YES;      // 默认开
+}
 
-@interface SLJokerTarget : NSObject
+static NSMutableDictionary *sSLWorkSrc = nil;   // uid -> dataSource（强引用）
+static char kSLPostsUIDKey;
+
+// 每个 data manager 建出来时就知道它属于谁，挂到自己身上带走
+static id (*o_postsInit)(id, SEL, id, id);
+static id h_postsInit(id self, SEL _cmd, id uid, id sec) {
+    id r = o_postsInit ? o_postsInit(self, _cmd, uid, sec) : nil;
+    if ([uid isKindOfClass:[NSString class]] && [(NSString *)uid length]) {
+        objc_setAssociatedObject(self, &kSLPostsUIDKey, uid, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    }
+    return r;
+}
+
+static void (*o_postsSetDS)(id, SEL, id);
+static void h_postsSetDS(id self, SEL _cmd, id ds) {
+    NSString *uid = objc_getAssociatedObject(self, &kSLPostsUIDKey);
+    if (uid.length && ds && (SLProfPageKind() == -1 || sSLCapOn)) {
+        if (!sSLWorkSrc) sSLWorkSrc = [NSMutableDictionary dictionary];
+        sSLWorkSrc[uid] = ds;                       // 强引用：列表对象跟 model 一起留着
+        NSUInteger n = [ds respondsToSelector:@selector(count)] ? [(NSArray *)ds count] : 0;
+        SLLog(@"WORKS| 记住 %@ 的作品列表（%@，%lu 条）", uid,
+              NSStringFromClass([ds class]), (unsigned long)n);
+    }
+    if (o_postsSetDS) o_postsSetDS(self, _cmd, ds);
+}
+
+static id (*o_postsDS)(id, SEL);
+static id h_postsDS(id self, SEL _cmd) {
+    id orig = o_postsDS ? o_postsDS(self, _cmd) : nil;
+    if (!sSLWorkWant.length || !SLProfWorksEnabled()) return orig;
+    if (!SLProfGate()) return orig;                 // 只在「我」页换，别人主页不动
+    NSString *uid = objc_getAssociatedObject(self, &kSLPostsUIDKey);
+    if (![uid isKindOfClass:[NSString class]] || ![uid isEqualToString:sSLWorkWant]) return orig;
+    id cached = sSLWorkSrc[uid];
+    if (!cached) return orig;
+    // 类型不一致就别硬塞，宁可显示自己的
+    if (orig && [cached class] != [orig class]) return orig;
+
+    static BOOL sWorksLogged = NO;
+    if (!sWorksLogged) {
+        sWorksLogged = YES;
+        NSUInteger n = [cached respondsToSelector:@selector(count)] ? [(NSArray *)cached count] : 0;
+        SLLog(@"WORKS| 已把「我」页作品列表换成 %@ 的（%lu 条）", uid, (unsigned long)n);
+    }
+    return cached;
+}
+
+#pragma mark - 「伪装主页」（别人主页左上角那颗胶囊）
+//
+// 挂在 AWEProfileNavigationContainerView 里、贴着返回按钮右边，滚动时跟着导航栏一起淡出。
+// 点一下 = 把这个人的整套资料写进预设 + 打开总开关。
+//
+// v0.8.7 修的关键问题：点下去数据不全。
+// 原来是「先读 store[uid]」，而 store 里那份很可能是先前在关注/粉丝列表里瞥一眼留下的
+// 残片（只有 uid + 昵称），真正完整的还在内存里的 sSLCapCur 里没落盘。
+// 现在：先 SLCapFlush 落盘，再从当前页面的 userModel 现场抄一遍，最后合并。
+
+#define SLFakeTag 0x5A0B20
+
+static __weak UIViewController *sSLFakeVC = nil;
+static NSString *sSLFakeUID = nil;
+
+static NSString *SLFakeNumText(id v) {
+    if ([v isKindOfClass:[NSNumber class]]) return [NSString stringWithFormat:@"%lld", [v longLongValue]];
+    if (![v isKindOfClass:[NSString class]]) return nil;
+    NSString *s = [(NSString *)v stringByTrimmingCharactersInSet:
+                   [NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    if (!s.length || [s isEqualToString:@"0"] || [s isEqualToString:@"(null)"]) return nil;
+    return s;
+}
+
+// 现场从 model 抄一份：点下去那一刻详情接口早回来了，数字都是真的
+static NSDictionary *SLFakeHarvest(id model) {
+    NSMutableDictionary *out = [NSMutableDictionary dictionary];
+    if (!model) return out;
+    NSArray *pairs = @[@"uid:userID", @"sec:secUserID", @"nickname:nickname",
+                       @"signature:signature", @"uniqueID:uniqueIDForShow",
+                       @"aweme:awemeCount", @"following:followingCount", @"follower:followerCount",
+                       @"like:favoritingCount", @"friend:friendCount"];
+    for (NSString *p in pairs) {
+        NSArray *kv = [p componentsSeparatedByString:@":"];
+        if (kv.count != 2) continue;
+        id v = SLProfCallObj(model, kv[1]);
+        NSString *t = SLFakeNumText(v);
+        if (t.length) out[(NSString *)kv[0]] = t;
+    }
+
+    // 背景图：model 里就有真身，不用等封面视图被调
+    //   AWEUserModel.profileCover -> AWEProfileCoverInfoModel.coverList
+    //     -> 每项 AWEProfileCoverURLModel.urlModel -> AWEURLModel.urlList
+    id cover = SLProfCallObj(model, @"profileCover");
+    if (cover) {
+        id list = SLProfCallObj(cover, @"coverList");
+        if ([list isKindOfClass:[NSArray class]]) {
+            for (id item in (NSArray *)list) {
+                id um2 = SLProfCallObj(item, @"urlModel");
+                id urls = um2 ? SLProfCallObj(um2, @"urlList") : nil;
+                NSString *u = SLProfFirstURL(urls);
+                if (u.length) { out[@"cover"] = u; break; }
+            }
+        }
+    }
+    return out;
+}
+
+static void SLFakeMerge(NSMutableDictionary *into, NSDictionary *from) {
+    if (!into || !from) return;
+    for (NSString *k in from) {
+        if ([k isEqualToString:@"ts"]) continue;
+        id nv = from[k];
+        id ov = into[k];
+        if (!ov || SLCapBetter(ov, nv)) into[k] = nv;
+    }
+}
+
+// 把现场抄到的字段并进快照库（不覆盖更好的值），列表里也能立刻看到
+static void SLFakeStore(NSString *uid, NSDictionary *fields) {
+    if (!uid.length || !fields.count) return;
+    NSMutableDictionary *store = SLCapStore();
+    id old = store[uid];
+    NSMutableDictionary *merged = [old isKindOfClass:[NSDictionary class]]
+        ? [old mutableCopy] : [NSMutableDictionary dictionary];
+    SLFakeMerge(merged, fields);
+    if (merged.count < 2) return;
+    merged[@"uid"] = uid;
+    merged[@"ts"] = @([[NSDate date] timeIntervalSince1970]);
+    store[uid] = merged;
+    SLCapPersist();
+}
+
+static NSDictionary *SLFakeSnapshot(UIViewController *vc) {
+    SLCapFlush();                              // 先把内存里那份落盘，别再读旧残片
+
+    NSString *uid = sSLFakeUID;
+    id um = vc ? SLProfCallObj(vc, @"userModel") : nil;
+    if (!uid.length) uid = SLFakeNumText(um ? SLProfCallObj(um, @"userID") : nil);
+    if (!uid.length && sSLCapLastKey.length) uid = sSLCapLastKey;
+
+    NSMutableDictionary *snap = [NSMutableDictionary dictionary];
+    if (uid.length) {
+        NSDictionary *old = SLCapStore()[uid];
+        if ([old isKindOfClass:[NSDictionary class]]) [snap addEntriesFromDictionary:old];
+    }
+    SLFakeMerge(snap, SLFakeHarvest(um));      // model 现场值最权威，压在上面
+    if (sSLCapPend.count) SLFakeMerge(snap, sSLCapPend);
+    if (snap.count < 2) return nil;
+
+    if (uid.length) SLFakeStore(uid, snap);     // 列表里也能看到这份完整的
+    return snap;
+}
+
+@interface SLFakeTarget : NSObject
 + (instancetype)shared;
 - (void)tap:(UIButton *)b;
 @end
 
-@implementation SLJokerTarget
+@implementation SLFakeTarget
 + (instancetype)shared {
-    static SLJokerTarget *s; static dispatch_once_t once;
-    dispatch_once(&once, ^{ s = [[SLJokerTarget alloc] init]; });
+    static SLFakeTarget *s; static dispatch_once_t once;
+    dispatch_once(&once, ^{ s = [[SLFakeTarget alloc] init]; });
     return s;
 }
 
 - (void)tap:(UIButton *)b {
-    NSDictionary *snap = nil;
-    if (sSLJokerUID.length) snap = SLCapStore()[sSLJokerUID];
-    if (!snap) snap = SLCapLive();
+    NSDictionary *snap = SLFakeSnapshot(sSLFakeVC);
     if (!snap) {
-        [AWECAUtils showToast:@"还没抓到这个人，滑一下再点"];
+        [AWECAUtils showToast:@"还没抓到这个人，等一下再点"];
         return;
     }
 
     SLApplySnap(snap);
+    sSLWorkWant = SLSnapText(snap, @"uid") ?: sSLFakeUID;
+
     NSString *nick = SLSnapText(snap, @"nickname") ?: @"对方";
+    SLLog(@"FAKE| 套用 %@ · 字段 %lu · 作品源 %@", nick, (unsigned long)snap.count,
+          sSLWorkWant.length ? (sSLWorkSrc[sSLWorkWant] ? @"有" : @"无") : @"无");
     [AWECAUtils showToast:[NSString stringWithFormat:@"已套用 %@ · 回我页查看", nick]];
 
     // 按一下变对勾，1.2 秒后恢复
-    UIButton *btn = b;
-    UILabel *lab = (UILabel *)[btn viewWithTag:SLJokerTag + 1];
+    UILabel *lab = (UILabel *)[b viewWithTag:SLFakeTag + 1];
     NSString *old = lab.text;
     lab.text = @"✓";
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.2 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{ lab.text = old; });
+
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.3 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{ SLProfForceCover(); });
 }
 @end
 
-static UIButton *SLJokerMake(void) {
+static UIButton *SLFakeMake(void) {
+    NSString *text = @"伪装主页";
+    UIFont *font = [UIFont systemFontOfSize:12.5 weight:UIFontWeightSemibold];
+    UIImage *icon = [[UIImage systemImageNamed:@"theatermasks.fill"]
+                     imageWithRenderingMode:UIImageRenderingModeAlwaysTemplate];
+    if (!icon) {
+        icon = [[UIImage systemImageNamed:@"theatermasks"]
+                imageWithRenderingMode:UIImageRenderingModeAlwaysTemplate];
+    }
+    CGFloat iconW = icon ? 15.0 : 0.0;
+    CGFloat gap = icon ? 4.0 : 0.0;
+    CGSize ts = [text sizeWithAttributes:@{NSFontAttributeName: font}];
+    CGFloat w = 10.0 + iconW + gap + ceil(ts.width) + 10.0;
+    CGFloat h = 30.0;
+
     UIButton *b = [UIButton buttonWithType:UIButtonTypeCustom];
-    b.tag = SLJokerTag;
-    b.frame = CGRectMake(0, 0, 54, 54);
+    b.tag = SLFakeTag;
+    b.frame = CGRectMake(0, 0, w, h);
     b.backgroundColor = [UIColor clearColor];
 
     UIVisualEffectView *blur = [[UIVisualEffectView alloc] initWithEffect:
         [UIBlurEffect effectWithStyle:UIBlurEffectStyleSystemUltraThinMaterialDark]];
     blur.frame = b.bounds;
+    blur.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
     blur.userInteractionEnabled = NO;
-    blur.layer.cornerRadius = 27;
+    blur.layer.cornerRadius = h / 2.0;
     blur.layer.cornerCurve = kCACornerCurveContinuous;
-    blur.layer.borderWidth = 0.6;
-    blur.layer.borderColor = [UIColor colorWithWhite:1 alpha:0.30].CGColor;
+    blur.layer.borderWidth = 0.5;
+    blur.layer.borderColor = [UIColor colorWithWhite:1 alpha:0.22].CGColor;
     blur.clipsToBounds = YES;
     [b addSubview:blur];
 
-    UILabel *lab = [[UILabel alloc] initWithFrame:b.bounds];
-    lab.tag = SLJokerTag + 1;
-    lab.text = @"J";
+    CGFloat x = 10.0;
+    if (icon) {
+        UIImageView *iv = [[UIImageView alloc] initWithImage:icon];
+        iv.frame = CGRectMake(x, (h - iconW) / 2.0, iconW, iconW);
+        iv.contentMode = UIViewContentModeScaleAspectFit;
+        iv.tintColor = [UIColor whiteColor];
+        iv.userInteractionEnabled = NO;
+        [b addSubview:iv];
+        x += iconW + gap;
+    }
+    UILabel *lab = [[UILabel alloc] initWithFrame:CGRectMake(x, 0, w - x - 10.0, h)];
+    lab.tag = SLFakeTag + 1;
+    lab.text = text;
     lab.textColor = [UIColor whiteColor];
-    lab.font = [UIFont systemFontOfSize:21 weight:UIFontWeightHeavy];
-    lab.textAlignment = NSTextAlignmentCenter;
+    lab.font = font;
     lab.userInteractionEnabled = NO;
     [b addSubview:lab];
 
-    b.layer.shadowColor = [UIColor blackColor].CGColor;
-    b.layer.shadowOpacity = 0.22;
-    b.layer.shadowRadius = 8;
-    b.layer.shadowOffset = CGSizeMake(0, 3);
-
-    [b addTarget:[SLJokerTarget shared] action:@selector(tap:) forControlEvents:UIControlEventTouchUpInside];
+    [b addTarget:[SLFakeTarget shared] action:@selector(tap:) forControlEvents:UIControlEventTouchUpInside];
     return b;
 }
 
-static void SLJokerMount(UIViewController *vc) {
+static UIView *SLProfFindNavContainer(UIView *root) {
+    if (!root) return nil;
+    if ([NSStringFromClass([root class]) isEqualToString:@"AWEProfileNavigationContainerView"]) return root;
+    for (UIView *v in root.subviews) {
+        UIView *r = SLProfFindNavContainer(v);
+        if (r) return r;
+    }
+    return nil;
+}
+
+// 找导航容器里最靠左的那颗可点控件（就是返回按钮）
+static UIView *SLProfFindLeftControl(UIView *root, UIView *host) {
+    UIView *best = nil;
+    CGFloat bestX = CGFLOAT_MAX;
+    for (UIView *v in root.subviews) {
+        if (v.tag == SLFakeTag) continue;
+        CGRect r = [v convertRect:v.bounds toView:host];
+        BOOL clickable = ([v isKindOfClass:[UIButton class]] || [v isKindOfClass:[UIControl class]]);
+        if (clickable && !v.hidden && r.size.width >= 18 && r.size.width <= 130 && r.size.height >= 18) {
+            if (r.origin.x < bestX) { bestX = r.origin.x; best = v; }
+        }
+        UIView *deep = SLProfFindLeftControl(v, host);
+        if (deep) {
+            CGRect dr = [deep convertRect:deep.bounds toView:host];
+            if (dr.origin.x < bestX) { bestX = dr.origin.x; best = deep; }
+        }
+    }
+    return best;
+}
+
+static void SLFakeRelayout(void) {
+    for (UIScene *s in [UIApplication sharedApplication].connectedScenes) {
+        if (![s isKindOfClass:[UIWindowScene class]]) continue;
+        for (UIWindow *w in ((UIWindowScene *)s).windows) {
+            UIButton *pill = (UIButton *)[w viewWithTag:SLFakeTag];
+            if (!pill || !pill.superview) continue;
+            UIView *host = pill.superview;
+            UIView *nav = SLProfFindNavContainer(host);
+            UIView *anchor = nav ? SLProfFindLeftControl(nav, host) : nil;
+            if (!anchor) continue;
+            CGRect ar = [anchor convertRect:anchor.bounds toView:host];
+            if (ar.size.height <= 0 || ar.size.width <= 0) continue;
+            pill.frame = CGRectMake(CGRectGetMaxX(ar) + 8.0,
+                                    CGRectGetMidY(ar) - pill.frame.size.height / 2.0,
+                                    pill.frame.size.width, pill.frame.size.height);
+        }
+    }
+}
+
+static void SLFakeMount(UIViewController *vc) {
     if (!vc || !vc.isViewLoaded) return;
     UIView *host = vc.view;
     if (!host.window) return;
-    if ([host viewWithTag:SLJokerTag]) return;
+    if ([host viewWithTag:SLFakeTag]) return;
 
-    UIButton *b = SLJokerMake();
-    b.autoresizingMask = UIViewAutoresizingFlexibleLeftMargin | UIViewAutoresizingFlexibleTopMargin;
-    CGSize sz = host.bounds.size;
-    b.frame = CGRectMake(sz.width - 54 - 14, sz.height - 54 - 96, 54, 54);
-    [host addSubview:b];
+    // 挂在页面根视图上（导航容器重写了 hitTest:，塞进去可能点不到），
+    // 但位置跟着返回按钮走。
+    UIButton *pill = SLFakeMake();
+    [host addSubview:pill];
 
-    SLLog(@"JOKER| 已挂到 %@", NSStringFromClass([vc class]));
+    UIView *nav = SLProfFindNavContainer(host);
+    UIView *anchor = nav ? SLProfFindLeftControl(nav, host) : nil;
+    if (anchor) {
+        CGRect ar = [anchor convertRect:anchor.bounds toView:host];
+        pill.frame = CGRectMake(CGRectGetMaxX(ar) + 8.0, CGRectGetMidY(ar) - 15.0,
+                                pill.frame.size.width, 30.0);
+    } else {
+        pill.frame = CGRectMake(52.0, host.safeAreaInsets.top + 6.0,
+                                pill.frame.size.width, 30.0);
+    }
+
+    SLLog(@"FAKE| 已挂「伪装主页」（anchor=%@ frame=%@）",
+          anchor ? NSStringFromClass([anchor class]) : @"nil",
+          NSStringFromCGRect(pill.frame));
+
+    // 导航栏这一刻通常还没布局完，稍后再对一次位
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{ SLFakeRelayout(); });
+}
+
+// 导航栏滚动淡出时，自己那颗按钮跟着一起淡
+static void (*o_navAlpha)(id, SEL, double, BOOL);
+static void h_navAlpha(id self, SEL _cmd, double alpha, BOOL force) {
+    if (o_navAlpha) o_navAlpha(self, _cmd, alpha, force);
+    UIView *nav = (UIView *)self;
+    UIView *pill = [nav.window viewWithTag:SLFakeTag];
+    if (pill) pill.alpha = alpha;
 }
 
 static void (*o_detailAppear)(id, SEL, BOOL);
@@ -870,10 +1192,27 @@ static void h_detailAppear(id self, SEL _cmd, BOOL animated) {
         UIViewController *vc = wvc;
         if (!vc) return;
         id um = SLProfCallObj(vc, @"userModel");
-        id uid = um ? SLProfCallObj(um, @"userID") : nil;
-        if ([uid isKindOfClass:[NSString class]] && [(NSString *)uid length])
-            sSLJokerUID = uid;
-        SLJokerMount(vc);
+        NSString *uid = SLFakeNumText(um ? SLProfCallObj(um, @"userID") : nil);
+        sSLFakeUID = uid.length ? uid : nil;   // 取不到就清空，绝不沿用上一个人的
+        sSLFakeVC = vc;
+        if (uid.length) SLFakeStore(uid, SLFakeHarvest(um));
+        SLFakeMount(vc);
+
+        // 详情接口回来得晚，1.5 秒后再抄一遍，数字/背景图才齐
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            UIViewController *v2 = wvc;
+            if (!v2) return;
+            NSString *u2 = sSLFakeUID;
+            if (!u2.length) return;
+            id m2 = SLProfCallObj(v2, @"userModel");
+            if (!m2) return;
+            NSDictionary *hv = SLFakeHarvest(m2);
+            if (hv.count) {
+                SLFakeStore(u2, hv);
+                SLLog(@"FAKE| 补抓 %@：%@ 项（%@）", u2, @(hv.count), hv[@"cover"] ? @"含背景" : @"无背景");
+            }
+        });
     });
 }
 
@@ -996,16 +1335,53 @@ void SLProfileStart(void) {
         }
     }
 
-    // 别人主页：挂 viewDidAppear:，把 JOKER 球放上去
+    // 别人主页：挂 viewDidAppear:，把「伪装主页」胶囊挂上去
     {
         Class detail = objc_getClass("AWEUserDetailViewControllerV2");
         Method m = detail ? SLProfExact(detail, @selector(viewDidAppear:)) : NULL;
         if (m) {
             o_detailAppear = (void (*)(id, SEL, BOOL))method_getImplementation(m);
             method_setImplementation(m, (IMP)h_detailAppear);
-            SLLog(@"PROF| 已挂 viewDidAppear: @ AWEUserDetailViewControllerV2（JOKER）");
+            SLLog(@"PROF| 已挂 viewDidAppear: @ AWEUserDetailViewControllerV2（伪装主页）");
         } else {
-            SLLog(@"PROF| 跳过 JOKER：AWEUserDetailViewControllerV2 无 viewDidAppear:");
+            SLLog(@"PROF| 跳过伪装主页：AWEUserDetailViewControllerV2 无 viewDidAppear:");
+        }
+        // 导航栏淡出时把我们的按钮一起带走
+        Class nav = objc_getClass("AWEProfileNavigationContainerView");
+        Method nm = nav ? SLProfExact(nav, NSSelectorFromString(@"updateWithAlpha:force:")) : NULL;
+        if (nm && method_getNumberOfArguments(nm) == 4) {
+            o_navAlpha = (void (*)(id, SEL, double, BOOL))method_getImplementation(nm);
+            method_setImplementation(nm, (IMP)h_navAlpha);
+            SLLog(@"PROF| 已挂 nav.updateWithAlpha:force:");
+        } else {
+            SLLog(@"PROF| 跳过 nav.opacity：没有 updateWithAlpha:force:");
+        }
+    }
+
+    // 作品列表（含每条封面的播放量）：别人主页记住 dataSource，我页换成他的
+    {
+        Class posts = objc_getClass("AWEUserPostsDataManager");
+        if (posts) {
+            // 记下这个 data manager 属于谁
+            Method im = SLProfExact(posts, NSSelectorFromString(@"initWithUserID:secUserID:"));
+            if (im && method_getNumberOfArguments(im) == 4) {
+                o_postsInit = (id (*)(id, SEL, id, id))method_getImplementation(im);
+                method_setImplementation(im, (IMP)h_postsInit);
+                SLLog(@"PROF| 已挂 posts.initWithUserID:secUserID:");
+            }
+            Method sd = SLProfExact(posts, NSSelectorFromString(@"setDataSource:"));
+            if (sd && method_getNumberOfArguments(sd) == 3) {
+                o_postsSetDS = (void (*)(id, SEL, id))method_getImplementation(sd);
+                method_setImplementation(sd, (IMP)h_postsSetDS);
+                SLLog(@"PROF| 已挂 posts.setDataSource:");
+            }
+            Method gd = SLProfExact(posts, NSSelectorFromString(@"dataSource"));
+            if (gd) {
+                SLProfHookGetter(posts, NSSelectorFromString(@"dataSource"),
+                                 (IMP)h_postsDS, (IMP *)&o_postsDS, @"posts.dataSource");
+            }
+        } else {
+            SLLog(@"PROF| 跳过作品列表：AWEUserPostsDataManager 不存在");
         }
     }
 
@@ -1014,7 +1390,7 @@ void SLProfileStart(void) {
     SLProfHookPageLifecycle(objc_getClass("AWEProfileMergedTabContainerViewController"));
     SLProfHookPageLifecycle(objc_getClass("AWEProfileBaseContainerViewController"));
 
-    SLLog(@"PROF| ==== 主页伪装 v0.8.6 · 开=%d · 已填 %ld 项 · 快照 %lu 个 ====",
+    SLLog(@"PROF| ==== 主页伪装 v0.8.7 · 开=%d · 已填 %ld 项 · 快照 %lu 个 ====",
           SLProfileEnabled(), (long)SLProfileFilledCount(), (unsigned long)SLSnapList().count);
 
     UIViewController *top = SLProfTopVC();
@@ -1054,7 +1430,7 @@ void SLProfileStart(void) {
 
 - (NSInteger)tableView:(UITableView *)tv numberOfRowsInSection:(NSInteger)s {
     (void)tv;
-    if (s == 0) return 1;
+    if (s == 0) return 2;
     if (s == 1) return 4;
     if (s == 2) return 5;
     return 1;
@@ -1082,10 +1458,16 @@ void SLProfileStart(void) {
     cell.selectionStyle = UITableViewCellSelectionStyleDefault;
 
     if (ip.section == 0) {
-        cell.textLabel.text = @"启用";
         UISwitch *sw = [[UISwitch alloc] initWithFrame:CGRectZero];
-        sw.on = SLProfileEnabled();
+        sw.tag = ip.row;
+        sw.on = (ip.row == 0) ? SLProfileEnabled() : SLProfWorksEnabled();
         [sw addTarget:self action:@selector(sl_toggle:) forControlEvents:UIControlEventValueChanged];
+        cell.textLabel.text = (ip.row == 0) ? @"启用" : @"模拟作品与播放量";
+        if (ip.row == 1) {
+            cell.detailTextLabel.text = @"需先看过对方主页";
+            cell.detailTextLabel.font = [UIFont systemFontOfSize:12];
+            cell.detailTextLabel.textColor = [UIColor tertiaryLabelColor];
+        }
         cell.accessoryView = sw;
         cell.selectionStyle = UITableViewCellSelectionStyleNone;
         return cell;
@@ -1131,6 +1513,11 @@ void SLProfileStart(void) {
 }
 
 - (void)sl_toggle:(UISwitch *)sw {
+    if (sw.tag == 1) {
+        [[NSUserDefaults standardUserDefaults] setBool:sw.on forKey:SLProfKeyWorks];
+        SLLog(@"PROF| 模拟作品与播放量 = %d", sw.on);
+        return;
+    }
     [[NSUserDefaults standardUserDefaults] setBool:sw.on forKey:SLProfKeyEnabled];
     SLLog(@"PROF| 总开关 = %d", sw.on);
 }
@@ -1188,7 +1575,7 @@ void SLProfileStart(void) {
 - (UISwipeActionsConfiguration *)tableView:(UITableView *)tv
     trailingSwipeActionsConfigurationForRowAtIndexPath:(NSIndexPath *)ip {
     (void)tv;
-    if (ip.section != 0) return nil;
+    if (ip.section != 0 || ip.row != 0) return nil;
     UIContextualAction *a = [UIContextualAction contextualActionWithStyle:UIContextualActionStyleDestructive
                                                                    title:@"清空"
                                                                  handler:^(UIContextualAction *act,
