@@ -142,6 +142,7 @@ static id sSLMyModel = nil;                            // 「我」页那个 mod
 static NSTimeInterval sSLWorksKickAt = 0;              // 上次踢作品的时间（失败时限流）
 static BOOL sSLWasOnMe = NO;                           // 上一拍是否停在「我」页
 static int  sSLTickCount = 0;                          // 巡检计数
+static int  sSLOffTicks = 0;                           // 连续几拍不在我页
 static void SLProfTick(void);                          // 定义在「驻留巡检」段
 
 #pragma mark - 配置（按账号分家）
@@ -2799,6 +2800,13 @@ static void SLProfTick(void) {
     if (!SLProfileEnabled()) { sSLWasOnMe = NO; return; }
 
     int kind = SLProfPageKind();
+    // 「我页出现过」这个闩只有严格门会放下；离开后如果没人再走严格门，它会一直开着，
+    // 于是在别的 tab 上也继续替换。连续三拍看不见我页就自己收掉（页面切换那 1~2 拍不算）。
+    if (kind == 0 && !sSLProfTopIsOurs) {
+        if (++sSLOffTicks >= 3) sSLProfOnMePage = NO;
+    } else {
+        sSLOffTicks = 0;
+    }
     BOOL onMe = (kind == 1) || (sSLProfKindVal == 1) || sSLProfOnMePage;
     if (!onMe || !SLProfGateLoose()) {
         if (sSLWasOnMe) { sSLWasOnMe = NO; SLLog(@"PROF| 我页不在，巡检待机"); }
