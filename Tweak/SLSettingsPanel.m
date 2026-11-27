@@ -69,7 +69,7 @@ static UIImage *SLThinSliderThumb(void) {
 
 #define kSLEnabledKey @"SLEnhanceEnabled"
 // 与 control 的 Version 保持一致（0.5.0）。原来写死 1.0.0，设置页标题栏一直显示旧号。
-#define SLVersion @"0.9.1"
+#define SLVersion @"0.9.2"
 
 // v0.4.52：单元格玻璃色搬到 SLGlass（全站二级页共用同一个数），这里不再重复定义。
 

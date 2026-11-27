@@ -57,6 +57,32 @@
 //    · 过亿的获赞：在 header 统计 cell 的 updateXxxCount: 再兜一层（最后一环）
 //    · 换号后打一行「本账号预设」，一眼能看出这个号到底存了什么
 //
+//  v0.9.2：这一版只干一件事 —— 让「应用」这件事不依赖某个 callback 恰好触发
+//
+//    真机日志里最要命的一条：整场都没有 `PROF| 进入本人主页`。
+//    也就是说 AWEProfileTabContainerViewController / Merged 的 viewDidAppear:
+//    在 39.9.0 这次根本没被调到（页面早就在，或者换了容器），
+//    于是挂在它后面的那串「0.55s / 1.45s / 2.35s 补三遍」一次都没跑：
+//    背景图没人补、年龄地区没人改、私密入口没人收、作品也没人去踢。
+//    v0.9.1 加的那些功能其实都挂上了，就是没人按开关。
+//
+//    · 新增 0.8s 的驻留巡检（只在「我」页且总开关打开时干活）：
+//      封面复贴 / 年龄·地区·学校 / 私密入口 / 头像 / 作品重拉，按需补齐。
+//      每条都有「已经对了就不再动」的短路，空转成本约等于一次 subviews 遍历
+//    · 背景图改成按账号落一张原图（acct-cover-<我的uid>）：
+//      抖音的封面 URL 带签名会过期，重启后旧 URL 下不动 → 背景就没了；
+//      点「伪装主页」时就把原图存下来，之后永远从本地这张贴
+//    · 年龄 / 地区：不再只认 genderAndAgeButton 这几个名字。
+//      拿「我」自己的 model 读真实文本（男 / 女 / 22岁 / 广东 …），
+//      在 cell 里按**文本内容**比对替换，改名了也照样对得上
+//    · 过亿的获赞：displayCountForItem: 到一定量级返回的是富文本（NSAttributedString），
+//      旧代码遇到非 NSString/NSNumber 一律原样放行 —— 所以一亿以上永远同步不过来。
+//      现在按原富文本的字体颜色重建一份
+//    · 隐藏私密作品：门从「必须正停在我页」放宽到「我页出现过」，
+//      面板里一拨开关就立刻生效；「私密」那个小标签也一起收掉
+//    · 换号：清掉上个号缓存的我 model / 封面图 / 已应用标记，
+//      巡检下一拍就按新号的预设重来；作品那边也不再因为「已刷过」而跳过
+//
 
 #import "SLProfile.h"
 #import "SLLog.h"
@@ -104,6 +130,7 @@ static NSMutableDictionary *sSLCoverObjs = nil;       // uid -> 对方真实 cov
 static NSMutableDictionary *sSLFakeUsers = nil;       // uid -> 对方真实 AWEUserModel（头像用）
 static void SLProfResetPainted(void);                 // 还原被我们直接改过图的视图
 static void SLApplySnapExtras(NSDictionary *snap);    // 定义在「性别 / 地区」段，套用快照时要用
+static void SLProfCoverPrefetch(void);                // 定义在「封面」段，套用后先把原图存一份
 static int sSLWorksGen = 0;                           // 每次套用 +1（作品列表重拉用）
 static int sSLWorksReloaded = -1;                     // 已经为哪一代重拉过
 static int sSLWorksRetry = 0;                         // 作品一次没拉对，允许再补两次
@@ -111,6 +138,11 @@ static int sSLPostsMgrLog = 0;                        // 作品管理器记录�
 static NSString *sSLCoverWantURL = nil;               // 当前应该显示的封面 URL
 static UIImage  *sSLCoverWantImg = nil;               // 下好之后的那张图
 static int sSLCoverMissLog = 0;                        // 「没找到封面视图」的日志上限
+static id sSLMyModel = nil;                            // 「我」页那个 model（读真实文本做比对）
+static NSTimeInterval sSLWorksKickAt = 0;              // 上次踢作品的时间（失败时限流）
+static BOOL sSLWasOnMe = NO;                           // 上一拍是否停在「我」页
+static int  sSLTickCount = 0;                          // 巡检计数
+static void SLProfTick(void);                          // 定义在「驻留巡检」段
 
 #pragma mark - 配置（按账号分家）
 //
@@ -495,6 +527,7 @@ static void SLApplySnap(NSDictionary *s) {
     sSLWorksRetry = 0;
     SLLog(@"SNAP| 套用 %@ 的整套资料（账号 %@）", SLSnapText(s, @"nickname") ?: @"?", sSLCurAcct ?: @"?");
     if (SLProfGate()) SLProfForceCover();               // 若此刻正停在「我」页，立刻换背景
+    SLProfCoverPrefetch();                              // 顺手把原图存到本机（封面的 URL 会过期）
 }
 
 #pragma mark - 钩子基座
@@ -706,6 +739,9 @@ static void SLProfSetAcct(NSString *uid) {
     sSLCoverWantURL = nil;
     sSLCoverWantImg = nil;
     sSLCoverMissLog = 0;
+    sSLMyModel = nil;               // 换号了，上一个号的真实资料不能拿来比对
+    sSLWasOnMe = NO;                // 巡检下一拍按新号重来
+    sSLWorksKickAt = 0;
 
     SLLog(@"PROF| 已切到账号 %@（预设按账号独立，互不清空）", uid);
     SLLog(@"PROF| 本账号预设：昵称=%@ 赞=%@ 背景=%@ 头像=%@ 作品源=%@",
@@ -714,6 +750,10 @@ static void SLProfSetAcct(NSString *uid) {
           SLProfStr(SLProfKeyCover) ?: @"无",
           SLProfStr(SLProfKeyAvatar) ?: @"无",
           sSLWorkWant ?: @"无");
+
+    // 换号后马上按新号补一轮，不用等用户离开再回来
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{ SLProfTick(); });
 }
 
 // 在「我」页记下当前登录账号的 uid
@@ -724,6 +764,7 @@ static void SLProfNoteMyUID(UIViewController *vc) {
     if ([uid isKindOfClass:[NSString class]]) s = uid;
     else if ([uid isKindOfClass:[NSNumber class]]) s = [uid stringValue];
     if (s.length && ![s isEqualToString:@"0"]) {
+        if (um && sSLMyModel != um) sSLMyModel = um;   // 真实资料留一份（年龄/地区按文本比对要用）
         sSLProfMyUID = s;
         SLProfSetAcct(s);
     }
@@ -860,6 +901,10 @@ static BOOL SLProfGate(void) {
 static BOOL SLProfGateLoose(void) {
     if ([NSThread isMainThread]) SLProfPageKind();   // 顺带把账号认出来
     if (!SLProfileEnabled()) return NO;
+    // 明确站在别人主页上：立刻收手。
+    // 原来只看「我页出现过」的闩，滑到别人主页后闩还开着 ——
+    // 别人的作品会被按伪装对象再换一次，切回自己号时数据就串了。
+    if (sSLProfKindVal == -1) { sSLProfOnMePage = NO; return NO; }
     return sSLProfOnMePage || sSLProfKindVal == 1;
 }
 
@@ -968,6 +1013,19 @@ static BOOL h_shouldShowUniqueID(id self, SEL _cmd) {
 // 这个方法返的其实是 NSNumber，于是每次都在这里原样吐回去，静默失败。
 // 现在 NSString / NSNumber / nil 三种都接，只在奇怪类型（富文本之类）上放行。
 
+// 过亿的数字抖音会用富文本（数字和「亿」字号/颜色不一样）——
+// 原来遇到非 NSString/NSNumber 就原样放行，所以一亿以上永远同步不过来。
+// 这里按原富文本第一段的属性重建一份同款。
+static id SLProfAttrCount(id v, long long n) {
+    NSString *s = SLProfFormatCount(n);
+    NSMutableAttributedString *m = [[NSMutableAttributedString alloc] initWithString:s];
+    if ([v isKindOfClass:[NSAttributedString class]] && [(NSAttributedString *)v length]) {
+        NSDictionary *attrs = [(NSAttributedString *)v attributesAtIndex:0 effectiveRange:NULL];
+        if (attrs.count) [m setAttributes:attrs range:NSMakeRange(0, s.length)];
+    }
+    return m;
+}
+
 #define SL_PROF_COUNT_HOOK(NAME, KEY, TAG, FIELD)                          \
     static id (*o_##NAME)(id, SEL, id);                                    \
     static id h_##NAME(id self, SEL _cmd, id item) {                       \
@@ -977,6 +1035,8 @@ static BOOL h_shouldShowUniqueID(id self, SEL _cmd) {
         if (!SLProfNumber(KEY, &n)) return v;                              \
         if (sSLProfHits < 20) { sSLProfHits++;                             \
             SLLog(@"PROF| 替换 %@ → %lld", TAG, n); }                      \
+        if ([v isKindOfClass:[NSAttributedString class]])                  \
+            return SLProfAttrCount(v, n);                                  \
         if (v && ![v isKindOfClass:[NSString class]] &&                    \
             ![v isKindOfClass:[NSNumber class]]) return v;                 \
         if ([v isKindOfClass:[NSString class]]) return SLProfFormatCount(n); \
@@ -1019,6 +1079,7 @@ static void SLProfHookOneObjVoid(Class cls, NSString *selName, IMP imp, IMP *slo
         if (SLProfGateLoose() && SLProfNumber(KEY, &n) && n > 0) {          \
             if ([v isKindOfClass:[NSNumber class]]) nv = @(n);              \
             else if ([v isKindOfClass:[NSString class]]) nv = SLProfFormatCount(n); \
+            else if ([v isKindOfClass:[NSAttributedString class]]) nv = SLProfAttrCount(v, n); \
             else if (v) {                                                   \
                 static BOOL sTypeLogged = NO;                               \
                 if (!sTypeLogged) { sTypeLogged = YES;                      \
@@ -1132,24 +1193,139 @@ static void SLProfSetBtnText(id btn, NSString *text) {
 }
 
 static NSString *SLProfAgeGenderText(void) {
-    NSString *t = SLProfStr(SLProfKeyGenderTxt);
-    if (t.length) return t;
     long long g = 0, a = 0;
     BOOL hasG = SLProfNumber(SLProfKeyGender, &g);
     BOOL hasA = SLProfNumber(SLProfKeyAge, &a);
+    // 两个都有就拼成一整条（抖音那排就是「女 · 22岁」）
+    if (hasG && g > 0 && hasA && a > 0)
+        return [NSString stringWithFormat:@"%@ · %lld岁", (g == 2 ? @"女" : @"男"), a];
+    NSString *t = SLProfStr(SLProfKeyGenderTxt);
+    if (t.length) return t;
     if (hasA && a > 0) return [NSString stringWithFormat:@"%lld岁", a];
     if (hasG && g > 0) return (g == 2) ? @"女" : @"男";
     return nil;
 }
 
+// 读「我」自己 model 的**真实**值（绕过我们自己的钩子，直接调原实现）
+static NSString *SLProfRealStr(id model, id (*orig)(id, SEL), NSString *selName) {
+    if (!model || !orig) return nil;
+    id v = orig(model, NSSelectorFromString(selName));
+    if ([v isKindOfClass:[NSString class]] && [(NSString *)v length]) return v;
+    return nil;
+}
+
+// 「男 · 22岁」这种组合文本，抖音不一定会给 genderDisplayString，自己拼一份
+static NSString *SLProfRealCombo(id model) {
+    if (!model) return nil;
+    NSInteger g = o_gender ? o_gender(model, @selector(gender)) : 0;
+    NSInteger a = o_userAge ? o_userAge(model, NSSelectorFromString(@"userAge")) : 0;
+    NSString *sx = (g == 2) ? @"女" : (g == 1 ? @"男" : nil);
+    if (sx.length && a > 0) return [NSString stringWithFormat:@"%@ · %ld岁", sx, (long)a];
+    if (a > 0) return [NSString stringWithFormat:@"%ld岁", (long)a];
+    return sx;
+}
+
+// 「真实文本 → 要显示的文本」。cell 是拿模型现拼的标题，我们不知道它拼成什么样，
+// 但知道**我自己的**真实值长什么样：按内容比对，比按 ivar 名字找稳得多。
+static NSDictionary *SLProfRealTextMap(void) {
+    NSMutableDictionary *m = [NSMutableDictionary dictionary];
+    NSString *ageTxt = SLProfAgeGenderText();
+    if (ageTxt.length) {
+        NSString *rt = SLProfRealStr(sSLMyModel, o_genderText, @"genderDisplayString");
+        if (rt.length) m[rt] = ageTxt;
+        NSString *combo = SLProfRealCombo(sSLMyModel);
+        if (combo.length) m[combo] = ageTxt;
+        NSInteger g = o_gender ? o_gender(sSLMyModel, @selector(gender)) : 0;
+        if (g == 2) m[@"女"] = ageTxt;
+        else if (g == 1) m[@"男"] = ageTxt;
+    }
+
+    NSString *loc = SLExtraStr(@"city") ?: SLExtraStr(@"location");
+    NSString *ip  = SLExtraStr(@"ipLocation");
+    NSString *sch = SLExtraStr(@"schoolName");
+    NSArray *pairs = @[@[@"city", loc ?: @""], @[@"province", loc ?: @""],
+                       @[@"district", loc ?: @""], @[@"location", loc ?: @""],
+                       @[@"ipLocation", ip ?: @""], @[@"schoolName", sch ?: @""]];
+    id (*origs[6])(id, SEL) = { o_city, o_province, o_district, o_location, o_ipLocation, o_schoolName };
+    NSArray *sels = @[@"city", @"province", @"district", @"location", @"ipLocation", @"schoolName"];
+    for (NSUInteger i = 0; i < pairs.count; i++) {
+        NSString *want = pairs[i][1];
+        if (!want.length) continue;
+        NSString *real = SLProfRealStr(sSLMyModel, origs[i], sels[i]);
+        if (real.length && ![real isEqualToString:want]) m[real] = want;
+    }
+    return m;
+}
+
+static NSString *SLProfTextOfView(UIView *v) {
+    if ([v isKindOfClass:[UILabel class]]) return ((UILabel *)v).text;
+    if ([v isKindOfClass:[UIButton class]])
+        return [((UIButton *)v) titleForState:UIControlStateNormal];
+    return nil;
+}
+
+static BOOL SLProfSetTextOfView(UIView *v, NSString *text) {
+    if (!text.length) return NO;
+    if ([v isKindOfClass:[UILabel class]]) {
+        UILabel *l = (UILabel *)v;
+        if ([l.text isEqualToString:text]) return NO;
+        l.text = text;
+        return YES;
+    }
+    if ([v isKindOfClass:[UIButton class]]) {
+        UIButton *b = (UIButton *)v;
+        if ([[b titleForState:UIControlStateNormal] isEqualToString:text]) return NO;
+        [b setAttributedTitle:nil forState:UIControlStateNormal];
+        [b setTitle:text forState:UIControlStateNormal];
+        return YES;
+    }
+    return NO;
+}
+
+// 在 cell 里按文本内容替换（含「IP属地：广东」这种带前缀的写法）
+static BOOL SLProfApplyTextMap(UIView *root, NSDictionary *map, NSString *ageTxt) {
+    if (!root) return NO;
+    BOOL hit = NO;
+    for (UIView *v in [root.subviews copy]) {
+        NSString *t = SLProfTextOfView(v);
+        if (t.length) {
+            NSString *nv = map[t];
+            if (!nv.length && ageTxt.length && [t containsString:@"岁"]) nv = ageTxt;
+            if (!nv.length) {
+                for (NSString *k in map) {
+                    if (k.length >= 2 && [t containsString:k]) {
+                        nv = [t stringByReplacingOccurrencesOfString:k withString:map[k]];
+                        break;
+                    }
+                }
+            }
+            if (nv.length && ![nv isEqualToString:t] && SLProfSetTextOfView(v, nv)) hit = YES;
+        }
+        if (SLProfApplyTextMap(v, map, ageTxt)) hit = YES;
+    }
+    return hit;
+}
+
 static void SLProfApplyAgeLocation(id cell) {
     if (!SLProfGateLoose()) return;
     if (sSLProfKindVal != 1 && !sSLProfOnMePage) return;
-    SLProfSetBtnText(SLProfCallObj(cell, @"genderAndAgeButton"), SLProfAgeGenderText());
+
+    NSString *ageTxt = SLProfAgeGenderText();
+    // 先按老名字改（38/39 早期版本就是这几个 ivar，最快最准）
+    SLProfSetBtnText(SLProfCallObj(cell, @"genderAndAgeButton"), ageTxt);
     NSString *loc = SLExtraStr(@"city") ?: SLExtraStr(@"location");
     SLProfSetBtnText(SLProfCallObj(cell, @"locationBtn"), loc);
     SLProfSetBtnText(SLProfCallObj(cell, @"ipLocationBtn"), SLExtraStr(@"ipLocation"));
     SLProfSetBtnText(SLProfCallObj(cell, @"schoolBtn"), SLExtraStr(@"schoolName"));
+
+    // 再按内容改：版本换了控件名 / 换成纯 label 也照样对得上
+    if (![cell isKindOfClass:[UIView class]]) return;
+    NSDictionary *map = SLProfRealTextMap();
+    if (!map.count && !ageTxt.length) return;
+    if (SLProfApplyTextMap(cell, map, ageTxt)) {
+        static BOOL sLogged = NO;
+        if (!sLogged) { sLogged = YES; SLLog(@"PROF| 已按文本改写年龄 / 地区 / 学校"); }
+    }
 }
 
 static void (*o_ageLocConfig)(id, SEL, id);
@@ -1161,8 +1337,9 @@ static void h_ageLocConfig(id self, SEL _cmd, id ctx) {
 // cell 往往比「认出我页」先配好，进页后再按类名找一遍补上
 static void SLProfFindAgeLocCells(UIView *root, NSMutableArray *out) {
     if (!root || out.count > 20) return;
-    if ([NSStringFromClass([root class]) isEqualToString:
-         @"AWEProfileHeaderAgeAndLocationCollectionViewCell"]) {
+    NSString *cn = NSStringFromClass([root class]);
+    // 类名换过几次（AgeAndLocation / AgeLocation），按关键词认
+    if ([cn containsString:@"AgeAndLocation"] || [cn containsString:@"AgeLocation"]) {
         [out addObject:root];
         return;
     }
@@ -1177,6 +1354,16 @@ static void SLProfApplyAgeLocationNow(void) {
         for (UIWindow *w in [((UIWindowScene *)sce).windows copy]) SLProfFindAgeLocCells(w, cells);
     }
     for (id c in [cells copy]) SLProfApplyAgeLocation(c);
+
+    static BOOL sLogged = NO;
+    if (!sLogged && cells.count) {
+        sLogged = YES;
+        SLLog(@"PROF| 年龄地区 cell %lu 个 · 性别=%@ 年龄=%@ 地区=%@ IP=%@ 学校=%@",
+              (unsigned long)cells.count,
+              SLProfStr(SLProfKeyGender) ?: @"无", SLProfStr(SLProfKeyAge) ?: @"无",
+              SLExtraStr(@"city") ?: @"无", SLExtraStr(@"ipLocation") ?: @"无",
+              SLExtraStr(@"schoolName") ?: @"无");
+    }
 }
 
 #pragma mark - 图片下载 / 直接改图（可还原）
@@ -1414,10 +1601,72 @@ static void SLProfCoverCachePut(NSString *url, UIImage *img) {
     if (d.length) [d writeToFile:[dir stringByAppendingPathComponent:k] atomically:YES];
 }
 
-// 把一张现成的图按抖音自己的入口装进封面视图，再兜底贴一次 imageView
-static void SLProfPutCoverOn(id view, UIImage *img) {
-    if (!view || !img) return;
-    if (sSLCoverBusy) return;
+// 按账号再存一张原图。
+// 抖音的封面 URL 是带签名的，过期之后同一个链接就下不动了 —— 而重启后我们手上只有这个
+// URL，于是「背景图重启就失效」。点「伪装主页」那一刻顺手把图存成本地文件，之后只认它。
+static NSString *SLProfCoverAcctPath(void) {
+    if (!sSLCurAcct.length) return nil;
+    NSString *dir = SLProfCacheDir();
+    if (!dir.length) return nil;
+    return [dir stringByAppendingPathComponent:
+            [NSString stringWithFormat:@"acct-cover-%@.jpg", sSLCurAcct]];
+}
+
+static NSString *sSLCoverAcctKey = nil;    // 本地原图对应的账号路径
+static UIImage  *sSLCoverAcctImg = nil;    // 本地原图（内存里留一份，别每拍都读盘）
+
+static UIImage *SLProfCoverAcctImage(void) {
+    NSString *p = SLProfCoverAcctPath();
+    if (!p.length) return nil;
+    if (sSLCoverAcctImg && [sSLCoverAcctKey isEqualToString:p]) return sSLCoverAcctImg;
+    NSData *d = [NSData dataWithContentsOfFile:p];
+    if (!d.length) return nil;
+    UIImage *img = [UIImage imageWithData:d];
+    if (img) { sSLCoverAcctKey = [p copy]; sSLCoverAcctImg = img; }
+    return img;
+}
+
+static void SLProfCoverPersistAcct(NSString *uid, UIImage *img) {
+    if (!uid.length || !img) return;
+    if (!sSLCurAcct.length || ![uid isEqualToString:sSLCurAcct]) return;   // 只存当前账号的
+    NSString *p = SLProfCoverAcctPath();
+    if (!p.length) return;
+    sSLCoverAcctKey = [p copy];
+    sSLCoverAcctImg = img;
+    NSData *d = UIImageJPEGRepresentation(img, 0.92);
+    if (d.length && [d writeToFile:p atomically:YES])
+        SLLog(@"COVER| 已把封面原图存到本机（账号 %@ · %luKB）",
+              uid, (unsigned long)(d.length / 1024));
+}
+
+// 本地还没有这张原图时，按当前账号的封面 URL 下一份存下来
+static void SLProfCoverPrefetch(void) {
+    NSString *url = SLProfStr(SLProfKeyCover);
+    if (!url.length) return;
+    if (SLProfCoverAcctImage()) return;
+    UIImage *hit = SLProfCoverCached(url);
+    if (hit) { SLProfCoverPersistAcct(sSLCurAcct, hit); return; }
+    // 巡检每拍都会进来：URL 过期时别每 0.8s 就重下一遍
+    static NSTimeInterval sLastTry = 0;
+    NSTimeInterval now = [NSProcessInfo processInfo].systemUptime;
+    if (now - sLastTry < 10.0) return;
+    sLastTry = now;
+    NSString *uid = [sSLCurAcct copy];
+    SLProfLoadImage(url, ^(UIImage *img) {
+        if (!img) return;
+        SLProfCoverCachePut(url, img);
+        SLProfCoverPersistAcct(uid, img);
+    });
+}
+
+// 把一张现成的图按抖音自己的入口装进封面视图，再兜底贴一次 imageView。
+// 返回 YES 表示这次真的换了图（巡检靠它决定要不要打日志）。
+static BOOL SLProfPutCoverOn(id view, UIImage *img) {
+    if (!view || !img) return NO;
+    if (sSLCoverBusy) return NO;
+    // 已经是这张了就不折腾（巡检每 0.8s 一次，没必要反复重建封面）
+    id cur = SLProfCallObj(view, @"imageView");
+    if ([cur isKindOfClass:[UIImageView class]] && ((UIImageView *)cur).image == img) return NO;
     sSLCoverBusy = YES;
     @try {
         if (o_coverImage) o_coverImage(view, NSSelectorFromString(@"configWithImage:"), img);
@@ -1432,13 +1681,14 @@ static void SLProfPutCoverOn(id view, UIImage *img) {
         v.clipsToBounds = YES;
     }
     sSLCoverBusy = NO;
+    return YES;
 }
 
 static void SLProfApplyCoverImage(id view) {
     NSString *url = SLProfStr(SLProfKeyCover);
     if (!view || !url.length) return;
     sSLCoverWantURL = url;
-    UIImage *hit = SLProfCoverCached(url);
+    UIImage *hit = SLProfCoverAcctImage() ?: SLProfCoverCached(url);
     if (hit) {
         sSLCoverWantImg = hit;
         SLProfPutCoverOn(view, hit);
@@ -1447,6 +1697,7 @@ static void SLProfApplyCoverImage(id view) {
     SLProfLoadImage(url, ^(UIImage *img) {
         if (!img) return;
         SLProfCoverCachePut(url, img);
+        SLProfCoverPersistAcct(sSLCurAcct, img);
         if (![sSLCoverWantURL isEqualToString:url]) return;   // 期间又换人了
         sSLCoverWantImg = img;
         SLProfPutCoverOn(view, img);
@@ -1533,7 +1784,7 @@ static void SLProfFindCoverViews(UIView *root, NSMutableArray *out) {
 }
 
 static void SLProfForceCover(void) {
-    if (!SLProfileEnabled()) return;
+    if (!SLProfileEnabled() || !SLProfGateLoose()) return;   // 别人主页上绝不改背景
     NSString *url = SLProfStr(SLProfKeyCover);
     if (!url.length) {
         sSLCoverWantURL = nil;
@@ -1541,14 +1792,14 @@ static void SLProfForceCover(void) {
         return;
     }
 
-    // 先把图拿到手：内存/磁盘里有就同步贴，没有就先下着（下完缓存，下一帧就贴上）
+    // 先把图拿到手：本机存过的那张最优先（URL 过期也照样有），其次内存/磁盘缓存
     sSLCoverWantURL = url;
-    UIImage *cached = SLProfCoverCached(url);
-    if (cached) sSLCoverWantImg = cached;
-    else {
-        SLProfLoadImage(url, ^(UIImage *img) {
-            if (img) SLProfCoverCachePut(url, img);
-        });
+    UIImage *cached = SLProfCoverAcctImage() ?: SLProfCoverCached(url);
+    if (cached) {
+        sSLCoverWantImg = cached;
+        SLProfCoverPersistAcct(sSLCurAcct, cached);     // 顺手补一份本地原图
+    } else {
+        SLProfCoverPrefetch();                          // 内部限流，下好后下一拍就贴
     }
 
     NSMutableArray *views = [NSMutableArray array];
@@ -1561,12 +1812,17 @@ static void SLProfForceCover(void) {
         return;
     }
 
-    for (UIView *v in [views copy]) {
-        SLProfApplyCoverImage(v);
-        if (sSLCoverWantImg) SLProfPutCoverOn(v, sSLCoverWantImg);
-        [v setNeedsLayout];
+    NSUInteger changed = 0;
+    if (sSLCoverWantImg) {
+        for (UIView *v in [views copy]) {
+            if (SLProfPutCoverOn(v, sSLCoverWantImg)) changed++;
+            [v setNeedsLayout];
+        }
+        if (changed) SLLog(@"COVER| 已重贴 %lu 处封面", (unsigned long)changed);
+    } else {
+        // 图还没下好：先让每个封面视图都发起下载，回调到了会自动贴上
+        for (UIView *v in [views copy]) SLProfApplyCoverImage(v);
     }
-    SLLog(@"COVER| 已重贴 %lu 处封面", (unsigned long)views.count);
 }
 
 #pragma mark - 作品列表 + 播放量（按对方的 id 联网拉）
@@ -1716,16 +1972,17 @@ static id h_postsParams(id self, SEL _cmd) {
 // 另外「隐藏私密作品」也在这里过滤 —— 页面每屏都从 dataSource 取。
 static id h_postsDS(id self, SEL _cmd) {
     id orig = o_postsDS ? o_postsDS(self, _cmd) : nil;
-    if (!sSLWorkWant.length || !SLProfWorksEnabled()) return orig;
-    if (!SLProfGateLoose()) return orig;
-    if (!SLProfPostsIsMine(self)) return orig;
+    if (!SLProfileEnabled() || !SLProfGateLoose()) return orig;
 
     id use = orig;
-    id cached = sSLWorkSrc[sSLWorkWant];
-    // 接口回来是空数组（或者类型不同）时，用本次运行里记下的那份顶上
-    if (cached && (!orig ||
-        ([cached isKindOfClass:[NSArray class]] && [orig isKindOfClass:[NSArray class]])))
-        use = cached;
+    if (sSLWorkWant.length && SLProfWorksEnabled() && SLProfPostsIsMine(self)) {
+        id cached = sSLWorkSrc[sSLWorkWant];
+        // 只在接口还没回来（nil / 空数组）时用它顶一下。
+        // 原来只要两边都是数组就用缓存 —— 服务器新拉的那份（播放量是新的）反而被旧快照盖掉，
+        // 看着就是「播放量没同步」。
+        BOOL empty = !orig || ([orig isKindOfClass:[NSArray class]] && [(NSArray *)orig count] == 0);
+        if (cached && empty) use = cached;
+    }
 
     if (!SLProfHidePrivateOn()) return use;
     if (![use isKindOfClass:[NSArray class]]) return use;
@@ -1781,9 +2038,18 @@ static NSArray *SLProfWorksVCs(void) {
             SLProfCollectVCs(w.rootViewController, vcs);
     }
     NSMutableArray *out = [NSMutableArray array];
-    for (UIViewController *vc in vcs)
-        if ([NSStringFromClass([vc class]) isEqualToString:@"AWEPostWorkViewControllerV2"])
+    for (UIViewController *vc in vcs) {
+        if ([NSStringFromClass([vc class]) containsString:@"PostWork"]) [out addObject:vc];
+    }
+    if (out.count) return out;
+
+    // 类名换了也不至于瞎：认「在我页里、能被要求重刷」的那个页面
+    for (UIViewController *vc in vcs) {
+        if (SLProfKindFromVC(vc) != 1) continue;
+        if ([vc respondsToSelector:NSSelectorFromString(@"refreshDataWithCompletion:")] ||
+            [vc respondsToSelector:NSSelectorFromString(@"refreshDataIsPullRefresh:completion:")])
             [out addObject:vc];
+    }
     return out;
 }
 
@@ -1820,6 +2086,7 @@ static void SLProfWorksDiagnose(void) {
             // 接口偶尔抽风（或者这次赶在换 id 之前就发出去了），补一枪
             sSLWorksRetry++;
             sSLWorksReloaded = -1;
+            sSLWorksKickAt = 0;              // 别被巡检的 1.5s 限流挡住
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.8 * NSEC_PER_SEC)),
                            dispatch_get_main_queue(), ^{ SLProfWorksKick(); });
         }
@@ -1835,6 +2102,10 @@ static void SLProfWorksDiagnose(void) {
 static void SLProfWorksKick(void) {
     if (sSLWorksGen == sSLWorksReloaded) return;
     if (!sSLWorkWant.length || !SLProfWorksEnabled() || !SLProfGateLoose()) return;
+    // 巡检每 0.8s 调一次；没成功（页面还没建出来）也至少隔 1.5s 再试，别刷屏
+    NSTimeInterval now = [NSProcessInfo processInfo].systemUptime;
+    if (now - sSLWorksKickAt < 1.5) return;
+    sSLWorksKickAt = now;
 
     NSUInteger n = 0;
     void (^done)(id) = ^(id resp) { (void)resp; };
@@ -2006,27 +2277,45 @@ static void SLProfPaintAvatar(void) {
 static void SLProfHidePrivateIn(UIView *root);
 static void SLProfHidePrivateUI(void) {
     if (!SLProfHidePrivateOn()) return;
-    if (sSLProfKindVal != 1) return;
+    // 面板拨开关时页面正被我们自己的浮窗盖着（kind 会被算成 0），
+    // 所以这里用「我页出现过」的松门，别只认 kind==1
+    if (!sSLProfOnMePage && sSLProfKindVal != 1) return;
     for (UIScene *sce in [[UIApplication sharedApplication].connectedScenes copy]) {
         if (![sce isKindOfClass:[UIWindowScene class]]) continue;
         for (UIWindow *w in [((UIWindowScene *)sce).windows copy]) SLProfHidePrivateIn(w);
     }
 }
 
+// 我们自己面板里的「隐藏私密作品」这一行也带「私密」两个字 —— 别把自己的开关藏了
+static BOOL SLProfInOwnView(UIView *v) {
+    for (UIView *p = v; p; p = p.superview) {
+        if ([NSStringFromClass([p class]) hasPrefix:@"SL"]) return YES;
+        UIResponder *r = p.nextResponder;
+        if ([r isKindOfClass:[UIViewController class]] &&
+            [NSStringFromClass([r class]) hasPrefix:@"SL"]) return YES;
+    }
+    return NO;
+}
+
 static void SLProfHidePrivateIn(UIView *root) {
     if (!root || root.hidden) return;
+    if (SLProfInOwnView(root)) return;
     NSString *t = nil;
     if ([root isKindOfClass:[UILabel class]]) t = ((UILabel *)root).text;
     else if ([root isKindOfClass:[UIButton class]])
         t = [((UIButton *)root) titleForState:UIControlStateNormal];
     if (t.length && [t containsString:@"私密"]) {
-        UIView *anc = root;
-        for (int i = 0; i < 5 && anc.superview; i++) {
+        UIView *anc = root, *target = nil;
+        for (int i = 0; i < 6 && anc.superview; i++) {
             anc = anc.superview;
             if ([anc isKindOfClass:NSClassFromString(@"UICollectionViewCell")] ||
-                [anc isKindOfClass:NSClassFromString(@"UITableViewCell")]) break;
+                [anc isKindOfClass:NSClassFromString(@"UITableViewCell")]) { target = anc; break; }
+            // 不是 cell 的话，退到「只包着这一小截」的容器就停（比如「作品 / 私密」那个分段）
+            if (!target && CGRectGetWidth(anc.bounds) < 220 && CGRectGetHeight(anc.bounds) < 90)
+                target = anc;
         }
-        anc.hidden = YES;
+        UIView *hide = target ?: root.superview ?: root;
+        hide.hidden = YES;
         static BOOL sLogged = NO;
         if (!sLogged) { sLogged = YES; SLLog(@"PROF| 已隐起「私密作品」入口"); }
         return;
@@ -2467,21 +2756,22 @@ static void h_profEnterPage(id self, SEL _cmd, BOOL animated) {
     if (!sSLProfOnMePage) SLLog(@"PROF| 进入本人主页（%@）", NSStringFromClass([self class]));
     sSLProfOnMePage = YES;
     sSLProfGateUntil = 0;
+    sSLWasOnMe = YES;
+    // 每次进来都算新的一代：作品要重新按对方 id 拉，不能因为「这个号刷过」就跳过
+    sSLWorksGen++;
+    sSLWorksReloaded = -1;
+    sSLWorksRetry = 0;
     IMP o = SLProfFindOrig(self, _cmd);
     if (o) ((void (*)(id, SEL, BOOL))o)(self, _cmd, animated);
 
     // 头图 / 头像 / 九宫格在页面出现时可能已经按真实资料配好了，这里补几遍：
     // 页面渲染、接口回填、列表复用都发生在这两三秒里，只补一次经常赶不上。
+    // （真机上这个回调有时根本不触发，所以真正的兜底是 SLProfTick 的巡检）
     for (int i = 0; i < 3; i++) {
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
                                      (int64_t)((0.55 + 0.9 * i) * NSEC_PER_SEC)),
                        dispatch_get_main_queue(), ^{
-            if (!SLProfGate()) return;
-            SLProfForceCover();
-            SLProfPaintAvatar();
-            SLProfWorksKick();           // 内部按「代」去重，成功一次就不再打扰
-            SLProfApplyAgeLocationNow();
-            SLProfHidePrivateUI();
+            SLProfTick();
         });
     }
 }
@@ -2492,6 +2782,55 @@ static void h_profLeavePage(id self, SEL _cmd, BOOL animated) {
     sSLProfGateUntil = 0;
     IMP o = SLProfFindOrig(self, _cmd);
     if (o) ((void (*)(id, SEL, BOOL))o)(self, _cmd, animated);
+}
+
+#pragma mark - 驻留巡检（v0.9.2 的核心）
+//
+// 0.9.1 把「背景图 / 年龄地区 / 私密入口 / 作品重拉」全挂在容器的 viewDidAppear: 后面。
+// 真机日志：整场都没有 `PROF| 进入本人主页` —— 39.9.0 这次根本没触发那个回调
+// （容器早就在，或者压根走的是另一个类），于是这一整串静默不生效：
+// 背景重启没图、年龄地区不动、私密入口还在、作品没人去踢。
+//
+// 不再赌回调：只要「我」页在，就每 0.8 秒确认一遍，缺什么补什么。
+// 每一步内部都有「已经对了就立刻返回」的短路，稳定之后几乎不产生开销。
+
+static void SLProfTick(void) {
+    if (![NSThread isMainThread]) return;
+    if (!SLProfileEnabled()) { sSLWasOnMe = NO; return; }
+
+    int kind = SLProfPageKind();
+    BOOL onMe = (kind == 1) || (sSLProfKindVal == 1) || sSLProfOnMePage;
+    if (!onMe || !SLProfGateLoose()) {
+        if (sSLWasOnMe) { sSLWasOnMe = NO; SLLog(@"PROF| 我页不在，巡检待机"); }
+        return;
+    }
+    if (!sSLWasOnMe) {
+        sSLWasOnMe = YES;
+        // 每次回到「我」页都算新的一代：作品要按对方 id 重新拉一次
+        // （不然重进就刷回自己的 —— 页面重建 dataSource 时用的是真实 id）
+        sSLWorksGen++;
+        sSLWorksReloaded = -1;
+        sSLWorksRetry = 0;
+        SLLog(@"PROF| 我页在，开始驻留巡检（缺什么补什么）");
+    }
+
+    sSLTickCount++;
+    SLProfCoverPrefetch();            // 本地没存过这张封面就先存一份（重启后有图）
+    SLProfForceCover();               // 已经贴对的那张会被短路掉
+    SLProfApplyAgeLocationNow();
+    if (sSLTickCount % 2 == 0) SLProfHidePrivateUI();   // 遍历两次跑一次，省点
+    SLProfWorksKick();                // 按「代」去重，成功一次就不再重复
+    if (sSLTickCount % 4 == 0) SLProfPaintAvatar();
+}
+
+static void SLProfStartTicker(void) {
+    static BOOL sStarted = NO;
+    if (sStarted) return;
+    sStarted = YES;
+    NSTimer *t = [NSTimer timerWithTimeInterval:0.8 repeats:YES
+                                          block:^(NSTimer *timer) { (void)timer; SLProfTick(); }];
+    // CommonModes：滚动时也要跑，不然一滑就停摆
+    [[NSRunLoop mainRunLoop] addTimer:t forMode:NSRunLoopCommonModes];
 }
 
 static void SLProfHookPageLifecycle(Class cls) {
@@ -2745,7 +3084,8 @@ void SLProfileStart(void) {
     SLProfHookPageLifecycle(objc_getClass("AWEProfileMergedTabContainerViewController"));
     SLProfHookPageLifecycle(objc_getClass("AWEProfileBaseContainerViewController"));
 
-    SLLog(@"PROF| ==== 主页伪装 v0.9.1 · 已挂载 · 快照 %lu 个 ====", (unsigned long)SLSnapList().count);
+    SLLog(@"PROF| ==== 主页伪装 v0.9.2 · 已挂载 · 快照 %lu 个 ====", (unsigned long)SLSnapList().count);
+    SLProfStartTicker();       // 0.8s 驻留巡检：不依赖任何一次 viewDidAppear 恰好触发
     // 账号要等我页出现才认得出，晚点再打一行状态，免得开局那行永远是「账号 ?」
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.0 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
