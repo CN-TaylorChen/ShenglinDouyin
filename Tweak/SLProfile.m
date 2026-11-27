@@ -129,38 +129,48 @@ static void SLProfHookGetter(Class cls, SEL sel, IMP imp, IMP *slot, NSString *t
 
 #pragma mark - 页面判定
 //
-// 调 39.9.0 真机日志证实：AWEProfileTabContainerViewController 的
-// -setIsCurrentUser: 与 AWEUserHomeViewControllerV2 的 -isCurrentUserProfilePage
-// 在进「我」页时都没被调用（selector 存在，但没人调，八成是 init 里直接写 ivar）。
-// 所以不能再用那两个方法当门，改成看「此刻最上面显示的是哪个页面」。
+// 39.9.0 真机日志证实两件事：
+//   1) -setIsCurrentUser: / -isCurrentUserProfilePage 在进「我」页时都没被调用，
+//      挂它们的 setter/getter 等不到，不代表方法不存在；
+//   2) 「我」页和别人的主页共用同一个 AWEUserHomeViewControllerV2，
+//      单看类名区分不了（v0.8.2 把 UserHome 一律判成他人主页，正好把「我」页排除了）。
+// 所以改成：找到当前页面，主动调它自己的 isCurrentUserProfilePage / isCurrentUser 来问。
 
 // 从 keyWindow 一路下沉：presented > nav.top > tab.selected
 // 走 UIWindowScene（部署目标 15.0），避免 -windows / -keyWindow 的弃用警告
 static UIViewController *SLProfTopVC(void) {
-    UIWindowScene *scene = nil;
-    for (UIScene *s in [UIApplication sharedApplication].connectedScenes) {
-        if ([s isKindOfClass:[UIWindowScene class]] &&
-            s.activationState == UISceneActivationStateForegroundActive) {
-            scene = (UIWindowScene *)s;
-            break;
-        }
-    }
-    if (!scene) {
-        for (UIScene *s in [UIApplication sharedApplication].connectedScenes) {
-            if ([s isKindOfClass:[UIWindowScene class]]) { scene = (UIWindowScene *)s; break; }
-        }
-    }
-    if (!scene) return nil;
-
     UIWindow *win = nil;
-    for (UIWindow *w in scene.windows) {
-        if (w.isKeyWindow) { win = w; break; }
-    }
-    if (!win) {
-        for (UIWindow *w in scene.windows) {
-            if (!w.isHidden) { win = w; break; }
+    for (UIScene *s in [UIApplication sharedApplication].connectedScenes) {
+        if (![s isKindOfClass:[UIWindowScene class]]) continue;
+        UIWindowScene *ws = (UIWindowScene *)s;
+        BOOL active = (s.activationState == UISceneActivationStateForegroundActive);
+        UIWindow *cand = nil;
+        for (UIWindow *w in ws.windows) {
+            if (w.isKeyWindow) { cand = w; break; }
+        }
+        if (!cand) {
+            for (UIWindow *w in ws.windows) {
+                if (!w.isHidden) { cand = w; break; }
+            }
+        }
+        if (cand) {
+            win = cand;
+            if (active) break;          // 前台那个优先，别被后台窗口盖掉
         }
     }
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+    if (!win) {                          // 极早期 scene 还没 active 时的兜底
+        for (UIWindow *w in [UIApplication sharedApplication].windows) {
+            if (w.isKeyWindow) { win = w; break; }
+        }
+        if (!win) {
+            for (UIWindow *w in [UIApplication sharedApplication].windows) {
+                if (!w.isHidden) { win = w; break; }
+            }
+        }
+    }
+#pragma clang diagnostic pop
     if (!win) return nil;
 
     UIViewController *vc = win.rootViewController;
@@ -177,17 +187,50 @@ static UIViewController *SLProfTopVC(void) {
     return vc;
 }
 
-// 顺着 parent 链往上找：先撞见 UserHome（他人主页）判 -1，
-// 先撞见 Profile 判 1。这样「我」页里 push 了别人主页时也不会串。
+// 顺着 parent 链往上找，直接问页面自己「你是不是本人主页」：
+//   AWEUserHomeViewControllerV2  -isCurrentUserProfilePage   （我页与别人主页共用这个 VC）
+//   AWEProfileTabContainerViewController / Merged  -isCurrentUser
+// 这两个方法在 39.9.0 都存在（已从脱壳包方法表确认），主动调比猜类名可靠得多。
+// 用 IMP 调用而不是 objc_msgSend：ARC 下把 objc_msgSend 转成自定义签名会被编译器拦。
+// class_getInstanceMethod 会沿父类找，这里只是读取，不会改到父类实现。
+static BOOL SLProfCallBool(id obj, NSString *selName) {
+    SEL sel = NSSelectorFromString(selName);
+    if (!obj || !sel || ![obj respondsToSelector:sel]) return NO;
+    Method m = class_getInstanceMethod(object_getClass(obj), sel);
+    if (!m) return NO;
+    return ((BOOL (*)(id, SEL))method_getImplementation(m))(obj, sel);
+}
+
+static id SLProfCallObj(id obj, NSString *selName) {
+    SEL sel = NSSelectorFromString(selName);
+    if (!obj || !sel || ![obj respondsToSelector:sel]) return nil;
+    Method m = class_getInstanceMethod(object_getClass(obj), sel);
+    if (!m) return nil;
+    return ((id (*)(id, SEL))method_getImplementation(m))(obj, sel);
+}
+
 static int SLProfPageKindSlow(void) {
     UIViewController *vc = SLProfTopVC();
     if (!vc) return 0;
+
+    Class home   = objc_getClass("AWEUserHomeViewControllerV2");
+    Class tab    = objc_getClass("AWEProfileTabContainerViewController");
+    Class merged = objc_getClass("AWEProfileMergedTabContainerViewController");
+
     UIViewController *p = vc;
     for (int i = 0; i < 10 && p; i++) {
-        NSString *cn = NSStringFromClass([p class]);
-        if (cn.length) {
-            if ([cn rangeOfString:@"UserHome"].location != NSNotFound) return -1;
-            if ([cn rangeOfString:@"Profile"].location != NSNotFound) return 1;
+        if (home && [p isKindOfClass:home]) {
+            if ([p respondsToSelector:NSSelectorFromString(@"isCurrentUserProfilePage")]) {
+                if (SLProfCallBool(p, @"isCurrentUserProfilePage")) return 1;
+                // 首次渲染时这个标志可能还没算好；「我」页独有设置入口，有它就是本人页
+                if (SLProfCallObj(p, @"profileSettingComponent") != nil) return 1;
+                return -1;
+            }
+        }
+        if ((tab && [p isKindOfClass:tab]) || (merged && [p isKindOfClass:merged])) {
+            if ([p respondsToSelector:NSSelectorFromString(@"isCurrentUser")]) {
+                return SLProfCallBool(p, @"isCurrentUser") ? 1 : -1;
+            }
         }
         p = p.parentViewController;
     }
@@ -197,6 +240,19 @@ static int SLProfPageKindSlow(void) {
 static int            sSLProfKindVal   = 0;
 static NSTimeInterval sSLProfGateUntil = 0;
 
+// 页面一变就记一行（只在变化时打，不刷屏），用来确认「我」页到底走到哪一步
+static void SLProfNotePageChange(int kind) {
+    static int  lastKind = -99;
+    static char lastName[160] = {0};
+    UIViewController *vc = SLProfTopVC();
+    const char *cur = vc ? class_getName([vc class]) : "nil";
+    if (kind == lastKind && strcmp(lastName, cur) == 0) return;
+    lastKind = kind;
+    strncpy(lastName, cur, sizeof(lastName) - 1);
+    lastName[sizeof(lastName) - 1] = '\0';
+    SLLog(@"PROF| 页面 → %s（kind=%d）", cur, kind);
+}
+
 // 0.15s 缓存：getter 一屏几十次调用，不能每次都爬一遍视图树
 static int SLProfPageKind(void) {
     if (![NSThread isMainThread]) return 0;
@@ -204,6 +260,7 @@ static int SLProfPageKind(void) {
     if (now < sSLProfGateUntil) return sSLProfKindVal;
     sSLProfKindVal = SLProfPageKindSlow();
     sSLProfGateUntil = now + 0.15;
+    SLProfNotePageChange(sSLProfKindVal);
     return sSLProfKindVal;
 }
 
@@ -219,14 +276,11 @@ static BOOL SLProfGate(void) {
     return sSLProfOnMePage;               // 页面认不出来时，退回容器 appear 的记录
 }
 
-// 门没开时打一条现场，用来确认 getter 到底有没有在渲染「我」页时被调用，
-// 以及「我」页真正的顶层类名是什么（只打前 8 条，不刷屏）
+// 门没开时记一笔，用来确认 getter 到底有没有在渲染时被调用（限 12 条）
 static void SLProfNoteMiss(NSString *tag) {
-    if (sSLProfMissLogged >= 8) return;
+    if (sSLProfMissLogged >= 12) return;
     sSLProfMissLogged++;
-    UIViewController *vc = SLProfTopVC();
-    SLLog(@"PROF| %@ 被调但不在「我」页（顶层=%@）", tag,
-          vc ? NSStringFromClass([vc class]) : @"nil");
+    SLLog(@"PROF| %@ 被调（门未开）", tag);
 }
 
 #pragma mark - 字符串字段
@@ -354,7 +408,7 @@ void SLProfileStart(void) {
     SLProfHookPageLifecycle(objc_getClass("AWEProfileMergedTabContainerViewController"));
     SLProfHookPageLifecycle(objc_getClass("AWEProfileBaseContainerViewController"));
 
-    SLLog(@"PROF| ==== 主页伪装 v0.8.2 · 开=%d · 已填 %ld 项 ====",
+    SLLog(@"PROF| ==== 主页伪装 v0.8.3 · 开=%d · 已填 %ld 项 ====",
           SLProfileEnabled(), (long)SLProfileFilledCount());
 
     UIViewController *top = SLProfTopVC();
