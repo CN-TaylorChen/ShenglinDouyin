@@ -18,6 +18,18 @@
 //    · 换账号不再串：伪装绑定在开启时登录的那个账号上，换号自动收手并还原贴过的图
 //    · 「伪装主页」点按反馈改成回弹 + 图标淡入绿对勾，不再硬切文字
 //
+//  v0.8.9：
+//    · 预设按账号分家（SLProf.xxx.<我的uid>）：A 号伪装谁、B 号伪装谁互不影响，切号不清空
+//    · 身份硬闸：model.userID 必须等于当前账号才替换 —— 修「进抖音第一个视频的 id 变伪装 id」
+//    · 背景图找准真身：profileCover 本身就是 NSArray<AWEProfileCoverURLModel>，
+//      之前按 coverList 多挖一层所以永远拿不到；现在 URL 落盘、重启也能重建
+//    · 头像补齐 avatarLarger（39.9.0 就叫这个，avatarLarge 根本不存在），重启后用保存的 URL 重建
+//    · 作品：换掉 dataSource 后不再只对 collectionView reloadData，
+//      改为调作品页自己的 reloadDataWithDataSourceChanged，九宫格才会真的重建
+//    · 新增专属会员 / 群聊 / 橱窗：抓对方 model 上的 hasMembership / canShowGroupCard /
+//      withShopEntry 等开关，套用时打开
+//    · 设置页去掉「从他人主页套用」列表（伪装主页按钮已经覆盖），新增三枚标识开关
+//
 
 #import "SLProfile.h"
 #import "SLLog.h"
@@ -37,8 +49,15 @@
 #define SLProfKeyLike      @"SLProf.like"       // 获赞
 #define SLProfKeyFriend    @"SLProf.friend"     // 互关
 #define SLProfKeyCover     @"SLProf.coverURL"   // 主页背景图（封面）URL
+#define SLProfKeyCoverLight @"SLProf.coverLight" // 封面浅色蒙层色（抖音自己算的，原样回传）
+#define SLProfKeyCoverDark @"SLProf.coverDark"   // 封面深色蒙层色
 #define SLProfKeyAvatar    @"SLProf.avatarURL"  // 头像 URL
-#define SLProfKeyOwner     @"SLProf.ownerUid"   // 伪装绑定在哪个账号上（换了号就不生效）
+#define SLProfKeyWant      @"SLProf.want"       // 这个账号要模拟谁（作品/封面/头像都照这个来）
+#define SLProfKeyMember    @"SLProf.member"     // 专属会员标识
+#define SLProfKeyGroup     @"SLProf.group"      // 群聊入口
+#define SLProfKeyShop      @"SLProf.shop"       // 橱窗入口
+#define SLProfKeyWorks     @"SLProf.works"      // 模拟作品与播放量
+#define SLProfKeyOwner     @"SLProf.ownerUid"   // 旧版单账号绑定，仅用于把老预设迁到分账号存储
 
 static volatile BOOL sSLProfOnMePage = NO;   // 「我」页可见期间为 YES
 static BOOL sSLProfStarted  = NO;
@@ -47,30 +66,66 @@ static int  sSLProfMissLogged = 0;  // 门未开的诊断日志，最多打几�
 
 static id SLProfCallObj(id obj, NSString *selName);   // 定义在「页面判定」段，快照要用
 static void SLProfForceCover(void);                   // 定义在「封面」段，套用后用
-static NSString *sSLWorkWant = nil;                   // 要模拟谁（内存内，重启失效）
+static NSString *sSLWorkWant = nil;                   // 要模拟谁（每个账号各自一份，落盘）
 static NSString *sSLProfMyUID = nil;                  // 当前登录账号的 uid（在「我」页读到）
+static NSString *sSLCurAcct = nil;                    // 当前生效的账号 uid：所有预设键都按它分家
 static NSMutableDictionary *sSLCoverObjs = nil;       // uid -> 对方真实 coverList（模型对象）
 static NSMutableDictionary *sSLFakeUsers = nil;       // uid -> 对方真实 AWEUserModel（头像用）
 static void SLProfResetPainted(void);                 // 还原被我们直接改过图的视图
 static int sSLWorksGen = 0;                           // 每次套用 +1（作品列表重拉用）
 static int sSLWorksReloaded = -1;                     // 已经为哪一代重拉过
 
-#pragma mark - 配置
+#pragma mark - 配置（按账号分家）
+//
+// v0.8.9 起所有预设都带账号后缀：SLProf.nickname.<我的uid>。
+// 换号只是换一组键，A 号伪装成谁、B 号伪装成谁互不影响，也不会互相清空。
+// 旧版只有一套全局键 + SLProf.ownerUid，启动时一次性迁到 owner 名下。
 
-static NSString *SLProfStr(NSString *key) {
+static NSString *SLProfRawStr(NSString *key) {
     NSString *v = [[NSUserDefaults standardUserDefaults] stringForKey:key];
     return v.length ? v : nil;
 }
 
+static NSString *SLProfScopedKey(NSString *key) {
+    if (!sSLCurAcct.length) return key;
+    return [NSString stringWithFormat:@"%@.%@", key, sSLCurAcct];
+}
+
+static NSString *SLProfStr(NSString *key) {
+    NSUserDefaults *d = [NSUserDefaults standardUserDefaults];
+    if (sSLCurAcct.length) {
+        NSString *v = [d stringForKey:SLProfScopedKey(key)];
+        if (v.length) return v;
+    }
+    return SLProfRawStr(key);      // 还没认到账号 / 老数据兜底
+}
+
 static void SLProfSetStr(NSString *value, NSString *key) {
     NSUserDefaults *d = [NSUserDefaults standardUserDefaults];
-    if (value.length) [d setObject:value forKey:key];
-    else [d removeObjectForKey:key];
+    NSString *k = SLProfScopedKey(key);
+    if (value.length) [d setObject:value forKey:k];
+    else [d removeObjectForKey:k];
+    if (sSLCurAcct.length) [d removeObjectForKey:key];   // 分账号后老的全局键作废，免得串号
+    [d synchronize];
+}
+
+static BOOL SLProfBool(NSString *key, BOOL def) {
+    NSUserDefaults *d = [NSUserDefaults standardUserDefaults];
+    id v = nil;
+    if (sSLCurAcct.length) v = [d objectForKey:SLProfScopedKey(key)];
+    if (!v) v = [d objectForKey:key];
+    return v ? [v boolValue] : def;
+}
+
+static void SLProfSetBool(BOOL on, NSString *key) {
+    NSUserDefaults *d = [NSUserDefaults standardUserDefaults];
+    [d setObject:@(on) forKey:SLProfScopedKey(key)];
+    if (sSLCurAcct.length) [d removeObjectForKey:key];
+    [d synchronize];
 }
 
 BOOL SLProfileEnabled(void) {
-    id v = [[NSUserDefaults standardUserDefaults] objectForKey:SLProfKeyEnabled];
-    return v ? [v boolValue] : NO;
+    return SLProfBool(SLProfKeyEnabled, NO);
 }
 
 NSInteger SLProfileFilledCount(void) {
@@ -84,12 +139,45 @@ NSInteger SLProfileFilledCount(void) {
 
 void SLProfileClearAll(void) {
     NSUserDefaults *d = [NSUserDefaults standardUserDefaults];
-    for (NSString *k in @[SLProfKeyNickname, SLProfKeyUID, SLProfKeySignature,
-                          SLProfKeyAweme, SLProfKeyFollowing, SLProfKeyFollower,
-                          SLProfKeyLike, SLProfKeyFriend, SLProfKeyCover, SLProfKeyAvatar]) {
+    NSArray *keys = @[SLProfKeyNickname, SLProfKeyUID, SLProfKeySignature,
+                      SLProfKeyAweme, SLProfKeyFollowing, SLProfKeyFollower,
+                      SLProfKeyLike, SLProfKeyFriend, SLProfKeyCover, SLProfKeyCoverLight,
+                      SLProfKeyCoverDark, SLProfKeyAvatar, SLProfKeyWant,
+                      SLProfKeyMember, SLProfKeyGroup, SLProfKeyShop, SLProfKeyWorks,
+                      SLProfKeyEnabled];
+    for (NSString *k in keys) {
+        [d removeObjectForKey:SLProfScopedKey(k)];
         [d removeObjectForKey:k];
     }
-    SLLog(@"PROF| 已清空全部预设值");
+    [d synchronize];
+    sSLWorkWant = nil;
+    SLLog(@"PROF| 已清空账号 %@ 的全部预设值", sSLCurAcct ?: @"(未识别)");
+}
+
+// 旧版只有一套全局预设 + ownerUid。第一次跑新版时整体搬到 owner 名下，
+// 之后每个账号只认自己那份，换号不会把数据带走，也不会清掉。
+static void SLProfMigrateLegacy(void) {
+    NSUserDefaults *d = [NSUserDefaults standardUserDefaults];
+    NSString *owner = [d stringForKey:SLProfKeyOwner];
+    if (!owner.length) return;
+    NSString *guard = [NSString stringWithFormat:@"SLProf.migrated.%@", owner];
+    if ([d boolForKey:guard]) return;
+    [d setBool:YES forKey:guard];
+
+    NSArray *keys = @[SLProfKeyNickname, SLProfKeyUID, SLProfKeySignature,
+                      SLProfKeyAweme, SLProfKeyFollowing, SLProfKeyFollower,
+                      SLProfKeyLike, SLProfKeyFriend, SLProfKeyCover, SLProfKeyAvatar,
+                      SLProfKeyEnabled, SLProfKeyWorks];
+    NSUInteger n = 0;
+    for (NSString *k in keys) {
+        id v = [d objectForKey:k];
+        if (!v) continue;
+        [d setObject:v forKey:[NSString stringWithFormat:@"%@.%@", k, owner]];
+        [d removeObjectForKey:k];
+        n++;
+    }
+    [d synchronize];
+    if (n) SLLog(@"PROF| 已把 %lu 项旧预设迁到账号 %@ 名下", (unsigned long)n, owner);
 }
 
 // 抖音自己会把数字排成「1.2万」，这里只在它的 Str 字段上补一份同样的格式
@@ -340,7 +428,7 @@ static NSString *SLSnapText(NSDictionary *s, NSString *k) {
     return str.length ? str : nil;
 }
 
-// 把一份快照整套写进预设（只写抓到了的字段，缺的不去动原有值）
+// 把一份快照整套写进**当前账号**的预设（只写抓到了的字段，缺的不去动原有值）
 static void SLApplySnap(NSDictionary *s) {
     SLProfSetStr(SLSnapText(s, @"nickname"),  SLProfKeyNickname);
     SLProfSetStr(SLSnapText(s, @"uniqueID"),  SLProfKeyUID);
@@ -351,17 +439,23 @@ static void SLApplySnap(NSDictionary *s) {
     SLProfSetStr(SLSnapText(s, @"like"),      SLProfKeyLike);
     SLProfSetStr(SLSnapText(s, @"friend"),    SLProfKeyFriend);
     SLProfSetStr(SLSnapText(s, @"cover"),     SLProfKeyCover);
+    SLProfSetStr(SLSnapText(s, @"coverLight"), SLProfKeyCoverLight);
+    SLProfSetStr(SLSnapText(s, @"coverDark"), SLProfKeyCoverDark);
     SLProfSetStr(SLSnapText(s, @"avatar"),    SLProfKeyAvatar);
-    [[NSUserDefaults standardUserDefaults] setBool:YES forKey:SLProfKeyEnabled];
-    // 绑定到当前登录的这个账号：换号之后自动不套用（否则切号后数据会跟过去）
-    if (sSLProfMyUID.length) {
-        [[NSUserDefaults standardUserDefaults] setObject:sSLProfMyUID forKey:SLProfKeyOwner];
-    }
     NSString *uid = SLSnapText(s, @"uid");
-    if (uid.length) sSLWorkWant = uid;          // 作品 / 封面 / 头像都要换成这个人的
+    if (uid.length) SLProfSetStr(uid, SLProfKeyWant);   // 作品/封面/头像都照这个人的来
+    sSLWorkWant = uid;
+
+    SLProfSetBool(YES, SLProfKeyEnabled);
+    // 对方有这些入口才打开（没有就关掉，避免凭空多出来）
+    SLProfSetBool([SLSnapText(s, @"member") isEqualToString:@"1"], SLProfKeyMember);
+    SLProfSetBool([SLSnapText(s, @"group")  isEqualToString:@"1"], SLProfKeyGroup);
+    SLProfSetBool([SLSnapText(s, @"shop")   isEqualToString:@"1"], SLProfKeyShop);
+
     sSLWorksGen++;
-    SLLog(@"SNAP| 套用 %@ 的整套资料", SLSnapText(s, @"nickname") ?: @"?");
-    SLProfForceCover();                         // 若此刻正停在「我」页，立刻换背景
+    sSLWorksReloaded = -1;
+    SLLog(@"SNAP| 套用 %@ 的整套资料（账号 %@）", SLSnapText(s, @"nickname") ?: @"?", sSLCurAcct ?: @"?");
+    if (SLProfGate()) SLProfForceCover();               // 若此刻正停在「我」页，立刻换背景
 }
 
 #pragma mark - 钩子基座
@@ -519,14 +613,39 @@ static id SLProfCallObj(id obj, NSString *selName) {
     return ((id (*)(id, SEL))method_getImplementation(m))(obj, sel);
 }
 
-// 在「我」页记下当前登录账号的 uid —— 伪装只对这个账号生效，换号后要自动收手
+// 读到「我」页 model 的 uid 就切换当前账号：预设按账号各存一份，换号不会串也不会清。
+static void SLProfSetAcct(NSString *uid) {
+    if (!uid.length || [uid isEqualToString:@"0"]) return;
+    if ([sSLCurAcct isEqualToString:uid]) return;
+    sSLCurAcct = [uid copy];
+
+    // 老版本没写过 owner（更早的安装）：第一次认到账号时把全局预设归到它名下
+    NSUserDefaults *d = [NSUserDefaults standardUserDefaults];
+    if (![d stringForKey:SLProfKeyOwner].length) {
+        [d setObject:uid forKey:SLProfKeyOwner];
+        SLProfMigrateLegacy();
+    }
+
+    // 这个账号自己要模拟谁 —— 落盘过，重启也还在（作品源仍需本次运行里看过对方主页）
+    sSLWorkWant = SLProfStr(SLProfKeyWant);
+    sSLWorksGen++;                 // 换号后作品列表也要按新账号重判一次
+    sSLWorksReloaded = -1;
+    SLProfResetPainted();
+    sSLProfHits = 0;
+    SLLog(@"PROF| 已切到账号 %@（预设按账号独立，互不清空）", uid);
+}
+
+// 在「我」页记下当前登录账号的 uid
 static void SLProfNoteMyUID(UIViewController *vc) {
     id um = SLProfCallObj(vc, @"userModel");
     id uid = um ? SLProfCallObj(um, @"userID") : nil;
     NSString *s = nil;
     if ([uid isKindOfClass:[NSString class]]) s = uid;
     else if ([uid isKindOfClass:[NSNumber class]]) s = [uid stringValue];
-    if (s.length && ![s isEqualToString:@"0"]) sSLProfMyUID = s;
+    if (s.length && ![s isEqualToString:@"0"]) {
+        sSLProfMyUID = s;
+        SLProfSetAcct(s);
+    }
 }
 
 // 沿 parent 链判断这一摞 VC 属于哪种页面
@@ -596,14 +715,18 @@ static void SLProfNotePageChange(int kind) {
 // 0.15s 缓存：getter 一屏几十次调用，不能每次都爬一遍视图树
 static int SLProfPageKind(void) {
     if (![NSThread isMainThread]) return sSLProfKindVal;
+    static BOOL sInKind = NO;
+    if (sInKind) return sSLProfKindVal;      // 防止 isCurrentUserProfilePage 内部回调 getter 时递归
     NSTimeInterval now = [NSProcessInfo processInfo].systemUptime;
     if (now < sSLProfGateUntil) return sSLProfKindVal;
 
     int prev = sSLProfKindVal;
     UIViewController *top = SLProfTopVC();
     sSLProfTopIsOurs = top ? [NSStringFromClass([top class]) hasPrefix:@"SL"] : NO;
+    sSLProfGateUntil = now + 0.15;           // 先占住缓存窗口，再往下问页面
+    sInKind = YES;
     sSLProfKindVal = SLProfPageKindSlow();
-    sSLProfGateUntil = now + 0.15;
+    sInKind = NO;
 
     if (sSLProfKindVal != prev) {
         if (sSLProfKindVal == -1) SLCapBegin();        // 进别人主页，开始记账
@@ -613,21 +736,19 @@ static int SLProfPageKind(void) {
     return sSLProfKindVal;
 }
 
-// 伪装绑定在「开启那一刻登录的账号」上。切换到别的账号后数据不能跟着走 ——
-// owner 与当前账号不一致时整条链路关掉，并把自己贴过的图还原。
-static BOOL SLProfOwnerOK(void) {
-    NSString *owner = [[NSUserDefaults standardUserDefaults] stringForKey:SLProfKeyOwner];
-    if (!owner.length) return YES;                 // 还没绑定，第一次进我页时绑
-    if (!sSLProfMyUID.length) return YES;          // 这次还没读到自己的 uid，先放行
-    if ([owner isEqualToString:sSLProfMyUID]) return YES;
-
-    static NSString *sLastWarn = nil;
-    if (![sLastWarn isEqualToString:sSLProfMyUID]) {
-        sLastWarn = sSLProfMyUID;
-        SLLog(@"PROF| 当前账号 %@ ≠ 伪装绑定账号 %@ → 本账号不套用", sSLProfMyUID, owner);
-    }
-    SLProfResetPainted();
-    return NO;
+// 这个 model 是不是「我自己」。
+//
+// v0.8.9 加的硬闸：getter 是全局的，只靠「当前页面是本人主页」判断，
+// 信息流预加载 / 首刷视频的作者 model 也会被替换 —— 用户反馈的
+// 「进抖音第一个视频的 id 变成伪装的」就是这么来的。
+// 现在要求 model.userID == 当前登录账号，别人的 model 一律原样返回。
+static BOOL SLProfIsMe(id model) {
+    if (!model || !sSLProfMyUID.length) return NO;
+    id uidObj = SLProfCallObj(model, @"userID");
+    NSString *uid = nil;
+    if ([uidObj isKindOfClass:[NSString class]]) uid = uidObj;
+    else if ([uidObj isKindOfClass:[NSNumber class]]) uid = [uidObj stringValue];
+    return uid.length > 0 && [uid isEqualToString:sSLProfMyUID];
 }
 
 // 只在「确认是本人主页」时开门。
@@ -636,20 +757,15 @@ static BOOL SLProfOwnerOK(void) {
 // 唯一例外：自己弹出的面板（类名 SL 开头）盖在「我」页上时，沿用上一次的状态，
 // 否则面板一开、背后的主页就闪回真实资料。
 static BOOL SLProfGate(void) {
+    // 先认页面 —— 顺带把「当前登录的是哪个账号」认出来。
+    // 顺序很重要：预设按账号分家，没认出账号就读不到本账号的「启用」开关，
+    // 一旦先判开关就会永远关着（0.8.9 初版的坑）。
+    int kind = [NSThread isMainThread] ? SLProfPageKind() : sSLProfKindVal;
     if (!SLProfileEnabled()) return NO;
-    if (![NSThread isMainThread]) return (sSLProfKindVal == 1);
-    int kind = SLProfPageKind();
     if (kind == 1) {
-        if (!SLProfOwnerOK()) { sSLProfOnMePage = NO; return NO; }
         sSLProfOnMePage = YES;
-        // 第一次确认身份时把 owner 定下来，之后换号就不生效了
-        if (sSLProfMyUID.length) {
-            NSUserDefaults *d = [NSUserDefaults standardUserDefaults];
-            if (![d stringForKey:SLProfKeyOwner].length) {
-                [d setObject:sSLProfMyUID forKey:SLProfKeyOwner];
-                SLLog(@"PROF| 已把伪装绑定到当前账号 %@", sSLProfMyUID);
-            }
-        }
+        // 换号后第一次进我页：把「要模拟谁」换成本账号自己的那份
+        if (!sSLWorkWant.length) sSLWorkWant = SLProfStr(SLProfKeyWant);
         return YES;
     }
     if (kind == 0 && sSLProfOnMePage && sSLProfTopIsOurs) return YES;
@@ -672,6 +788,7 @@ static void SLProfNoteMiss(NSString *tag) {
         id v = o_##NAME ? o_##NAME(self, _cmd) : nil;                     \
         if (!SLProfGate()) { SLCapNote(self, FIELD, v);                   \
                              SLProfNoteMiss(TAG); return v; }             \
+        if (!SLProfIsMe(self)) return v;                                  \
         NSString *f = SLProfStr(KEY);                                     \
         if (!f.length) return v;                                          \
         if (sSLProfHits < 12) { sSLProfHits++;                            \
@@ -691,6 +808,7 @@ SL_PROF_STR_HOOK(uniqueID, SLProfKeyUID, @"uniqueIDForShow", @"uniqueID")
         id v = o_##NAME ? o_##NAME(self, _cmd) : nil;                     \
         if (!SLProfGate()) { SLCapNote(self, FIELD, v);                   \
                              SLProfNoteMiss(TAG); return v; }             \
+        if (!SLProfIsMe(self)) return v;                                  \
         long long n = 0;                                                  \
         if (!SLProfNumber(KEY, &n)) return v;                             \
         if (sSLProfHits < 12) { sSLProfHits++;                            \
@@ -708,7 +826,7 @@ SL_PROF_NUM_HOOK(friendCount, SLProfKeyFriend, @"friendCount", @"friend")
 static id (*o_followerCountStr)(id, SEL);
 static id h_followerCountStr(id self, SEL _cmd) {
     id v = o_followerCountStr ? o_followerCountStr(self, _cmd) : nil;
-    if (!SLProfGate()) return v;
+    if (!SLProfGate() || !SLProfIsMe(self)) return v;
     long long n = 0;
     if (!SLProfNumber(SLProfKeyFollower, &n)) return v;
     return SLProfFormatCount(n);
@@ -718,7 +836,7 @@ static id h_followerCountStr(id self, SEL _cmd) {
 static id (*o_totalFavoriteStr)(id, SEL);
 static id h_totalFavoriteStr(id self, SEL _cmd) {
     id v = o_totalFavoriteStr ? o_totalFavoriteStr(self, _cmd) : nil;
-    if (!SLProfGate()) return v;
+    if (!SLProfGate() || !SLProfIsMe(self)) return v;
     long long n = 0;
     if (!SLProfNumber(SLProfKeyLike, &n)) return v;
     return SLProfFormatCount(n);
@@ -781,6 +899,35 @@ SL_PROF_COUNT_HOOK(friendText, SLProfKeyFriend,    @"friend",   @"friend")
 SL_PROF_COUNT_HOOK(playText,   SLProfKeyAweme,     @"play",     @"aweme")
 SL_PROF_COUNT_HOOK(fansText,   SLProfKeyFollower,  @"fans",     @"follower")
 SL_PROF_COUNT_HOOK(followText, SLProfKeyFollowing, @"follow",   @"following")
+
+#pragma mark - 主页标识（专属会员 / 群聊 / 橱窗）
+//
+// 这三个入口不看用户资料接口返回的卡片列表，而是各自一个 BOOL 开关：
+//   hasMembership        专属会员标识
+//   canShowGroupCard     群聊卡片
+//   withShopEntry / withFusionShopEntry / withTaobaoShopEntry / hasAwemeGoodsEntry / withNewGoods
+//                        橱窗入口（不同版本走不同开关，全部打开最稳）
+// 对方主页有就记下来，套用时一并打开；自己本来没有也会跟着出现。
+
+#define SL_PROF_BOOL_HOOK(NAME, KEY, TAG)                                  \
+    static BOOL (*o_##NAME)(id, SEL);                                      \
+    static BOOL h_##NAME(id self, SEL _cmd) {                              \
+        BOOL v = o_##NAME ? o_##NAME(self, _cmd) : NO;                     \
+        if (!SLProfGate() || !SLProfIsMe(self)) return v;                  \
+        if (!SLProfBool(KEY, NO)) return v;                                \
+        static BOOL sLogged_##NAME = NO;                                   \
+        if (!sLogged_##NAME) { sLogged_##NAME = YES;                       \
+            SLLog(@"PROF| 已打开「%@」入口", TAG); }                       \
+        return YES;                                                        \
+    }
+
+SL_PROF_BOOL_HOOK(hasMembership,      SLProfKeyMember, @"专属会员")
+SL_PROF_BOOL_HOOK(canShowGroupCard,   SLProfKeyGroup,  @"群聊")
+SL_PROF_BOOL_HOOK(withShopEntry,      SLProfKeyShop,   @"橱窗")
+SL_PROF_BOOL_HOOK(withFusionShopEntry, SLProfKeyShop,  @"橱窗(fusion)")
+SL_PROF_BOOL_HOOK(withTaobaoShopEntry, SLProfKeyShop,  @"橱窗(taobao)")
+SL_PROF_BOOL_HOOK(hasAwemeGoodsEntry, SLProfKeyShop,   @"橱窗(goods)")
+SL_PROF_BOOL_HOOK(withNewGoods,       SLProfKeyShop,   @"橱窗(newGoods)")
 
 #pragma mark - 图片下载 / 直接改图（可还原）
 //
@@ -849,13 +996,15 @@ static void SLProfResetPainted(void) {
 
 #pragma mark - 主页背景图（封面）
 //
-// 39.9.0 的封面视图 AWEProfileBannerBGCoverView 有两个入口：
-//   -configWithCoverList:                              ← 实际在用的（直接收模型对象）
-//   -configWithURLList:lightColorList:darkColorList:   ← 旧入口
-// v0.8.7 只挂了后面那个，所以既抓不到也换不上，日志里一直是「无背景」。
+// 39.9.0 的真身（脱壳包 ivar 确认）：AWEUserModel.profileCover 本身就是
+// NSArray<AWEProfileCoverURLModel *>，每个元素带 urlModel / lightCoverColor / darkCoverColor。
+// v0.8.7/0.8.8 一直按 profileCover → coverList 去挖，多跳了一层，所以永远「无背景」。
 //
-// 现在的做法：别人主页把 coverList 那一组**真实模型对象**整包留住，
-// 回我页时原样喂回去 —— 颜色、裁切、渐变全是抖音自己算的，不存在版式错位。
+// 现在的做法：
+//   1) 截 -profileCover：别人主页把这份数组整包留住（颜色/裁切/渐变都是抖音算的）；
+//   2) 我页时直接返回一份用保存的 URL 重建的同款数组 —— 重启后照样有背景；
+//   3) 再挂封面视图的 configWithCoverList: / configWithURLList:… 兜底，
+//      就算哪天 model 那条链不读了，视图层也能换。
 
 static void (*o_coverConfig)(id, SEL, id, id, id);
 static void (*o_coverList)(id, SEL, id);
@@ -876,16 +1025,25 @@ static NSString *SLProfFirstURL(id list) {
     return nil;
 }
 
+// AWEURLModel 的取图数组方法名是 -URLList（大写 URL），不是 urlList ——
+// 两个都试，免得哪天版本改回来又落空。
+static NSString *SLProfModelFirstURL(id m) {
+    if (!m) return nil;
+    NSString *s = SLProfFirstURL(SLProfCallObj(m, @"URLList"));
+    if (!s.length) s = SLProfFirstURL(SLProfCallObj(m, @"urlList"));
+    if (!s.length) s = SLProfFirstURL(SLProfCallObj(m, @"originURLList"));
+    return s;
+}
+
 // 从 coverList（模型对象数组）里挖出第一张图的 URL
 static NSString *SLProfCoverURL(id coverList) {
     if (![coverList isKindOfClass:[NSArray class]]) return nil;
     for (id item in (NSArray *)coverList) {
         NSString *s = SLProfURLString(item);
         if (s.length) return s;
-        id um = SLProfCallObj(item, @"urlModel");
-        s = SLProfFirstURL(um ? SLProfCallObj(um, @"urlList") : nil);
+        s = SLProfModelFirstURL(SLProfCallObj(item, @"urlModel"));
         if (s.length) return s;
-        s = SLProfFirstURL(SLProfCallObj(item, @"urlList"));
+        s = SLProfModelFirstURL(item);
         if (s.length) return s;
     }
     return nil;
@@ -913,18 +1071,76 @@ static void SLCoverRemember(NSString *uid, id coverList, NSString *url) {
 static void SLCoverCapture(id coverList, NSString *url) {
     if (!sSLCapOn) return;
     if (SLProfPageKind() == 1) return;      // 已经回到我页：绝不能把我自己的封面记到别人名下
+    if ([coverList isKindOfClass:[NSArray class]]) {
+        id first = [(NSArray *)coverList firstObject];
+        id lc = SLProfCallObj(first, @"lightCoverColor");
+        id dc = SLProfCallObj(first, @"darkCoverColor");
+        if ([lc isKindOfClass:[NSString class]] && [(NSString *)lc length]) SLCapNoteValue(@"coverLight", lc);
+        if ([dc isKindOfClass:[NSString class]] && [(NSString *)dc length]) SLCapNoteValue(@"coverDark", dc);
+    }
     if (url.length) SLCapNoteValue(@"cover", url);
     NSString *uid = SLCurViewUID();
     if (uid.length) SLCoverRemember(uid, coverList, nil);
+}
+
+// 造一个和抖音同款的 AWEURLModel（只要 urlList 就够 SDWebImage 拉图）。
+// 这里不用 -initWithURLList:（ARC 下通过 IMP 调 init 家族容易多释放一次），
+// 直接 alloc/init 再用 KVC 落到 URLList 这个 ivar 上。
+static id SLProfURLModelFrom(NSString *url) {
+    if (!url.length) return nil;
+    Class c = objc_getClass("AWEURLModel");
+    if (!c) return nil;
+    id um = [[c alloc] init];
+    @try {
+        [um setValue:@[url] forKey:@"URLList"];
+        [um setValue:@[url] forKey:@"originURLList"];
+    } @catch (__unused NSException *e) {
+        return nil;
+    }
+    return um;
+}
+
+// 用保存下来的 URL + 蒙层色重建 coverList：重启后也吃得到，不依赖内存里留着对方的 model
+static NSString *sSLFakeCoverKey = nil;
+static id sSLFakeCoverArr = nil;
+
+static id SLProfFakeCoverArray(void) {
+    NSString *url = SLProfStr(SLProfKeyCover);
+    if (!url.length) return nil;
+    NSString *lc = SLProfStr(SLProfKeyCoverLight) ?: @"";
+    NSString *dc = SLProfStr(SLProfKeyCoverDark) ?: @"";
+    NSString *sig = [NSString stringWithFormat:@"%@|%@|%@|%@", sSLCurAcct ?: @"", url, lc, dc];
+    if (sSLFakeCoverArr && [sSLFakeCoverKey isEqualToString:sig]) return sSLFakeCoverArr;
+
+    Class c = objc_getClass("AWEProfileCoverURLModel");
+    id item = c ? [[c alloc] init] : nil;
+    id um = SLProfURLModelFrom(url);
+    if (!item || !um) return nil;
+    @try {
+        [item setValue:um forKey:@"urlModel"];
+        if (lc.length) [item setValue:lc forKey:@"lightCoverColor"];
+        if (dc.length) [item setValue:dc forKey:@"darkCoverColor"];
+    } @catch (__unused NSException *e) {
+        SLLog(@"COVER| 重建封面模型失败（%@）", url);
+        return nil;
+    }
+    sSLFakeCoverKey = sig;
+    sSLFakeCoverArr = @[item];
+    return sSLFakeCoverArr;
 }
 
 static NSArray *sCoverLastURLs  = nil;   // 「我」页最近一次下发的参数，强制刷新时原样回传
 static NSArray *sCoverLastLight = nil;
 static NSArray *sCoverLastDark  = nil;
 
-// 我页换封面：优先喂对方那组模型对象，退而求其次用 URL
+// 我页换封面：优先喂重建出来的同款数组，其次用老入口的 URL 列表
 static BOOL SLProfApplyCoverTo(id view) {
     if (!view) return NO;
+    NSArray *fake = SLProfFakeCoverArray();
+    if (fake.count && o_coverList) {
+        o_coverList(view, NSSelectorFromString(@"configWithCoverList:"), fake);
+        return YES;
+    }
     NSArray *objs = sSLWorkWant.length ? sSLCoverObjs[sSLWorkWant] : nil;
     if (objs.count && o_coverList) {
         o_coverList(view, NSSelectorFromString(@"configWithCoverList:"), objs);
@@ -960,9 +1176,19 @@ static void h_coverConfig(id self, SEL _cmd, id urls, id light, id dark) {
     if ([light isKindOfClass:[NSArray class]]) sCoverLastLight = [(NSArray *)light copy];
     if ([dark isKindOfClass:[NSArray class]])  sCoverLastDark  = [(NSArray *)dark copy];
 
-    if (SLProfApplyCoverTo(self)) {
+    NSArray *fake = SLProfFakeCoverArray();
+    if (fake.count) {
+        NSString *url = SLProfStr(SLProfKeyCover);
+        id first = urls;
+        if ([urls isKindOfClass:[NSArray class]]) first = [(NSArray *)urls firstObject];
+        id neu = [first isKindOfClass:[NSURL class]] ? [NSURL URLWithString:url] : url;
+        NSString *lc = SLProfStr(SLProfKeyCoverLight);
+        NSString *dc = SLProfStr(SLProfKeyCoverDark);
         static BOOL sCoverLogged = NO;
-        if (!sCoverLogged) { sCoverLogged = YES; SLLog(@"COVER| 已把背景换成对方的"); }
+        if (!sCoverLogged) { sCoverLogged = YES; SLLog(@"COVER| 已把背景换成对方的（URL 入口）"); }
+        if (o_coverConfig) o_coverConfig(self, _cmd, @[neu],
+                                        lc.length ? @[lc] : @[],
+                                        dc.length ? @[dc] : @[]);
         return;
     }
     if (o_coverConfig) o_coverConfig(self, _cmd, urls, light, dark);
@@ -976,12 +1202,55 @@ static void h_coverList(id self, SEL _cmd, id coverList) {
     }
 
     if ([coverList isKindOfClass:[NSArray class]]) sCoverLastURLs = [coverList copy];
-    if (SLProfApplyCoverTo(self)) {
+    NSArray *fake = SLProfFakeCoverArray();
+    if (fake.count) {
         static BOOL sCoverListLogged = NO;
         if (!sCoverListLogged) { sCoverListLogged = YES; SLLog(@"COVER| 已把背景换成对方的（coverList）"); }
+        if (o_coverList) o_coverList(self, _cmd, fake);
         return;
     }
     if (o_coverList) o_coverList(self, _cmd, coverList);
+}
+
+// AWEUserModel -profileCover：整条封面链路真正的数据源
+static id (*o_profileCover)(id, SEL);
+static id h_profileCover(id self, SEL _cmd) {
+    id v = o_profileCover ? o_profileCover(self, _cmd) : nil;
+    if (!SLProfGate()) {
+        if ([v isKindOfClass:[NSArray class]] && [(NSArray *)v count]) {
+            NSString *u = SLProfCoverURL(v);
+            SLCoverCapture(v, u);
+            static BOOL sCapLogged = NO;
+            if (!sCapLogged && u.length) {
+                sCapLogged = YES;
+                SLLog(@"COVER| 已从 model.profileCover 记下对方封面");
+            }
+        }
+        return v;
+    }
+    if (!SLProfIsMe(self)) return v;
+    NSArray *fake = SLProfFakeCoverArray();
+    if (!fake.count) return v;
+    static BOOL sProfCoverLogged = NO;
+    if (!sProfCoverLogged) {
+        sProfCoverLogged = YES;
+        SLLog(@"COVER| profileCover 已返回对方的封面（%lu 张 · %@）",
+              (unsigned long)fake.count, SLProfStr(SLProfKeyCover) ?: @"-");
+    }
+    return fake;
+}
+
+static id (*o_whiteProfileCover)(id, SEL);
+static id h_whiteProfileCover(id self, SEL _cmd) {
+    id v = o_whiteProfileCover ? o_whiteProfileCover(self, _cmd) : nil;
+    if (!SLProfGate()) {
+        if ([v isKindOfClass:[NSArray class]] && [(NSArray *)v count])
+            SLCoverCapture(v, SLProfCoverURL(v));
+        return v;
+    }
+    if (!SLProfIsMe(self)) return v;
+    NSArray *fake = SLProfFakeCoverArray();
+    return fake.count ? fake : v;
 }
 
 // 封面视图只在页面初次配置时被调一次。如果那次调用发生在「我」页还没被识别出来之前，
@@ -998,8 +1267,9 @@ static void SLProfFindCoverViews(UIView *root, NSMutableArray *out) {
 static void SLProfForceCover(void) {
     if (!SLProfileEnabled()) return;
     NSString *url = SLProfStr(SLProfKeyCover);
+    NSArray *fake = SLProfFakeCoverArray();
     NSArray *objs = sSLWorkWant.length ? sSLCoverObjs[sSLWorkWant] : nil;
-    if (!url.length && !objs.count) return;
+    if (!url.length && !fake.count && !objs.count) return;
 
     NSMutableArray *views = [NSMutableArray array];
     for (UIScene *s in [UIApplication sharedApplication].connectedScenes) {
@@ -1011,11 +1281,11 @@ static void SLProfForceCover(void) {
     NSUInteger n = 0;
     for (UIView *v in views) {
         if (SLProfApplyCoverTo(v)) n++;
-        SLProfPaintCoverView(v, url.length ? url : SLProfCoverURL(objs));
+        SLProfPaintCoverView(v, url.length ? url : SLProfCoverURL(fake.count ? fake : objs));
         [v setNeedsLayout];
     }
     SLLog(@"COVER| 已强制刷新 %lu 处封面（%@）", (unsigned long)n,
-          objs.count ? @"模型对象" : @"URL");
+          fake.count ? @"重建模型" : (objs.count ? @"对方对象" : @"URL"));
 }
 
 #pragma mark - 作品列表 + 播放量
@@ -1028,11 +1298,8 @@ static void SLProfForceCover(void) {
 // 这里把它按 uid 强引用住，等我回自己主页时交给我的 data manager 用。
 // 只在内存里，重启即失效 —— 与快照本身的设计一致。
 
-#define SLProfKeyWorks  @"SLProf.works"
-
 static BOOL SLProfWorksEnabled(void) {
-    id v = [[NSUserDefaults standardUserDefaults] objectForKey:SLProfKeyWorks];
-    return v ? [v boolValue] : YES;      // 默认开
+    return SLProfBool(SLProfKeyWorks, YES);      // 默认开
 }
 
 static NSMutableDictionary *sSLWorkSrc = nil;   // uid -> dataSource（强引用）
@@ -1067,7 +1334,10 @@ static void h_postsSetDS(id self, SEL _cmd, id ds) {
 static id h_postsDS(id self, SEL _cmd) {
     id orig = o_postsDS ? o_postsDS(self, _cmd) : nil;
     if (!sSLWorkWant.length || !SLProfWorksEnabled()) return orig;
-    if (!(SLProfGate() || sSLProfOnMePage)) return orig;   // 只在「我」页换，别人主页不动
+    if (!SLProfGate()) return orig;                        // 只在「我」页换，别人主页不动
+    // 只换「我」自己的 manager：别人的 manager 读到的是他自己的作品
+    NSString *owner = objc_getAssociatedObject(self, &kSLPostsUIDKey);
+    if (owner.length && sSLProfMyUID.length && ![owner isEqualToString:sSLProfMyUID]) return orig;
     id cached = sSLWorkSrc[sSLWorkWant];
     if (!cached) return orig;
     // 类型不一致就别硬塞，宁可显示自己的
@@ -1082,8 +1352,9 @@ static id h_postsDS(id self, SEL _cmd) {
     return cached;
 }
 
-// 作品九宫格是列表视图自己缓存的，换掉 dataSource 之后得让它重拉一次。
-// 只在「我」页刚出现、并且真的套用过别人作品时才做，且每次套用只做一次。
+// 作品九宫格是列表视图自己缓存的，换掉 dataSource 之后得让它按新数据重建 section。
+// v0.8.8 只是对最大的 UICollectionView 调 reloadData，IGListKit 不会重建 section ——
+// 所以日志说「换了」但屏幕上还是自己的。现在直接找作品页，调它自己的重建入口。
 static UIView *SLProfBiggestCollection(UIView *root) {
     UIView *best = nil;
     CGFloat bestArea = 0;
@@ -1101,42 +1372,112 @@ static UIView *SLProfBiggestCollection(UIView *root) {
     return best;
 }
 
-static void SLProfReloadListOnce(void) {
-    if (sSLWorksGen == sSLWorksReloaded) return;
-    if (!sSLWorkWant.length || !sSLWorkSrc[sSLWorkWant]) return;
-    if (!SLProfWorksEnabled() || !SLProfGate()) return;
+static void SLProfCollectVCs(UIViewController *vc, NSMutableArray *out) {
+    if (!vc || out.count > 200) return;
+    [out addObject:vc];
+    for (UIViewController *c in vc.children) SLProfCollectVCs(c, out);
+    if ([vc isKindOfClass:[UINavigationController class]]) {
+        for (UIViewController *c in ((UINavigationController *)vc).viewControllers) SLProfCollectVCs(c, out);
+    }
+    if ([vc isKindOfClass:[UITabBarController class]]) {
+        UIViewController *sel = ((UITabBarController *)vc).selectedViewController;
+        if (sel) SLProfCollectVCs(sel, out);
+    }
+    if (vc.presentedViewController) SLProfCollectVCs(vc.presentedViewController, out);
+}
 
-    UIViewController *top = SLProfTopVC();
-    if (!top.isViewLoaded) return;
-    UIView *cv = SLProfBiggestCollection(top.view);
-    if (!cv) return;
-    sSLWorksReloaded = sSLWorksGen;
-    [(UICollectionView *)cv reloadData];
-    SLLog(@"WORKS| 已让「我」页作品列表重新拉一次");
+static void SLProfCallVoid(id obj, NSString *selName) {
+    SEL sel = NSSelectorFromString(selName);
+    if (!obj || ![obj respondsToSelector:sel]) return;
+    Method m = class_getInstanceMethod(object_getClass(obj), sel);
+    if (!m) return;
+    ((void (*)(id, SEL))method_getImplementation(m))(obj, sel);
+}
+
+static BOOL SLProfReloadListOnce(void) {
+    if (sSLWorksGen == sSLWorksReloaded) return YES;
+    if (!sSLWorkWant.length || !sSLWorkSrc[sSLWorkWant]) return NO;
+    if (!SLProfWorksEnabled() || !SLProfGate()) return NO;
+
+    NSMutableArray *vcs = [NSMutableArray array];
+    for (UIScene *s in [UIApplication sharedApplication].connectedScenes) {
+        if (![s isKindOfClass:[UIWindowScene class]]) continue;
+        for (UIWindow *w in ((UIWindowScene *)s).windows) SLProfCollectVCs(w.rootViewController, vcs);
+    }
+
+    BOOL did = NO;
+    UIViewController *fallback = nil;
+    for (UIViewController *vc in vcs) {
+        NSString *n = NSStringFromClass([vc class]);
+        if ([n isEqualToString:@"AWEPostWorkViewControllerV2"]) {
+            SLProfCallVoid(vc, @"reloadDataWithDataSourceChanged");
+            did = YES;
+            SLLog(@"WORKS| 已让作品页按新数据重建（%@）", n);
+        } else if ([n isEqualToString:@"AWEProfileTabContainerViewController"] ||
+                   [n isEqualToString:@"AWEProfileMergedTabContainerViewController"]) {
+            fallback = vc;
+        }
+    }
+    if (!did && fallback) {
+        SLProfCallVoid(fallback, @"reloadData");
+        did = YES;
+        SLLog(@"WORKS| 已让「我」页容器重新拉一次");
+    }
+    if (!did) {
+        UIViewController *top = SLProfTopVC();
+        UIView *cv = top.isViewLoaded ? SLProfBiggestCollection(top.view) : nil;
+        if (cv) {
+            [(UICollectionView *)cv reloadData];
+            did = YES;
+            SLLog(@"WORKS| 已让最大的列表重新拉一次（兜底）");
+        }
+    }
+    if (did) sSLWorksReloaded = sSLWorksGen;
+    return did;
 }
 
 #pragma mark - 头像
 //
-// 头像是 AWEUserModel 上的一组 getter（avatarThumb / avatarMedium / avatarLarge …）给出来的，
+// 头像是 AWEUserModel 上的一组 getter（avatarThumb / avatarMedium / avatarLarger …）给出来的，
 // header 里的 AWEAvatarImageView 也是拿着 user model 去读。所以最稳的办法不是自己造 URL，
 // 而是把**对方那个真实 model** 存下来，我页读头像时原样返回对方的对象 —— 类型天然一致。
+//
+// v0.8.9：39.9.0 的头像字段叫 avatarLarger（不是 avatarLarge，后者根本不存在），
+// 之前漏挂最大的那张，所以页面上一直是自己的头像。
+// 另外重启后内存里没有对方的 model，这里再用保存的 URL 重建一个同款 AWEURLModel。
 // 万一某条链路不读 getter，回我页时再把窗口里最大的那颗方形头像直接贴成对方的图。
 
 static BOOL sSLAvatarBusy = NO;      // 防止 getter 里再回调自己
 
 static id SLProfAvatarDo(id model, id orig, NSString *getter) {
     if (sSLAvatarBusy) return orig;
-    if (!sSLWorkWant.length || !SLProfGate()) return orig;
-    id other = sSLFakeUsers[sSLWorkWant];
-    if (!other || other == model) return orig;
-    sSLAvatarBusy = YES;
-    id fake = SLProfCallObj(other, getter);
-    sSLAvatarBusy = NO;
-    if (!fake) return orig;
-    if (orig && [fake class] != [orig class]) return orig;   // 类型不一致宁可不动
-    static BOOL sAvLogged = NO;
-    if (!sAvLogged) { sAvLogged = YES; SLLog(@"AVATAR| model.%@ 已返回对方的头像对象", getter); }
-    return fake;
+    if (!SLProfGate() || !SLProfIsMe(model)) return orig;
+
+    id other = sSLWorkWant.length ? sSLFakeUsers[sSLWorkWant] : nil;
+    if (other && other != model) {
+        sSLAvatarBusy = YES;
+        id fake = SLProfCallObj(other, getter);
+        sSLAvatarBusy = NO;
+        if (fake && (!orig || [fake class] == [orig class])) {
+            static BOOL sAvLogged = NO;
+            if (!sAvLogged) { sAvLogged = YES; SLLog(@"AVATAR| model.%@ 已返回对方的头像对象", getter); }
+            return fake;
+        }
+    }
+
+    // 重启后 / 对方 model 已被回收：用保存的 URL 重建一份
+    NSString *url = SLProfStr(SLProfKeyAvatar);
+    if (!url.length) return orig;
+    Class uc = objc_getClass("AWEURLModel");
+    if (!uc || (orig && ![orig isKindOfClass:uc])) return orig;
+    id rebuilt = SLProfURLModelFrom(url);
+    if (!rebuilt) return orig;
+    static BOOL sAvUrlLogged = NO;
+    if (!sAvUrlLogged) {
+        sAvUrlLogged = YES;
+        SLLog(@"AVATAR| model.%@ 已用保存的 URL 重建头像（%@）", getter, url);
+    }
+    return rebuilt;
 }
 
 #define SL_AVATAR_HOOK(NAME, GETTER)                                   \
@@ -1148,18 +1489,18 @@ static id SLProfAvatarDo(id model, id orig, NSString *getter) {
 
 SL_AVATAR_HOOK(avThumb,  @"avatarThumb")
 SL_AVATAR_HOOK(avMedium, @"avatarMedium")
-SL_AVATAR_HOOK(avLarge,  @"avatarLarge")
+SL_AVATAR_HOOK(avLarger, @"avatarLarger")
 SL_AVATAR_HOOK(av168,    @"avatar168")
 SL_AVATAR_HOOK(av300,    @"avatar300")
 
 // 从 model 里挑一张最清晰的头像 URL（抓快照 / 贴图兜底用）
 static NSString *SLProfAvatarURL(id model) {
     if (!model) return nil;
-    for (NSString *n in @[@"avatarLarge", @"avatar300", @"avatarMedium",
+    for (NSString *n in @[@"avatarLarger", @"avatar300", @"avatarMedium",
                           @"avatar168", @"avatarThumb"]) {
         id v = SLProfCallObj(model, n);
         NSString *s = SLProfURLString(v);
-        if (!s.length) s = SLProfFirstURL(SLProfCallObj(v, @"urlList"));
+        if (!s.length) s = SLProfModelFirstURL(v);
         if (s.length) return s;
     }
     return SLProfFirstURL(SLProfCallObj(model, @"avatarURLs"));
@@ -1249,25 +1590,31 @@ static NSDictionary *SLFakeHarvest(id model) {
         if (t.length) out[(NSString *)kv[0]] = t;
     }
 
-    // 背景图：model 里就有真身，不用等封面视图被调
-    //   AWEUserModel.profileCover -> AWEProfileCoverInfoModel.coverList
-    //     -> 每项 AWEProfileCoverURLModel.urlModel -> AWEURLModel.urlList
-    id cover = SLProfCallObj(model, @"profileCover");
-    if (cover) {
-        id list = SLProfCallObj(cover, @"coverList");
-        if ([list isKindOfClass:[NSArray class]]) {
-            for (id item in (NSArray *)list) {
-                id um2 = SLProfCallObj(item, @"urlModel");
-                id urls = um2 ? SLProfCallObj(um2, @"urlList") : nil;
-                NSString *u = SLProfFirstURL(urls);
-                if (u.length) { out[@"cover"] = u; break; }
-            }
-        }
+    // 背景图：model.profileCover 本身就是 NSArray<AWEProfileCoverURLModel *>，
+    // 元素里带 urlModel（AWEURLModel.urlList）+ 浅色/深色蒙层色。
+    // v0.8.8 还按 profileCover.coverList 多挖了一层，所以日志里一直是「无背景」。
+    id covers = SLProfCallObj(model, @"profileCover");
+    if (![covers isKindOfClass:[NSArray class]] || [(NSArray *)covers count] == 0)
+        covers = SLProfCallObj(model, @"whiteProfileCover");
+    if ([covers isKindOfClass:[NSArray class]]) {
+        NSString *cu = SLProfCoverURL(covers);
+        if (cu.length) out[@"cover"] = cu;
+        id first = [(NSArray *)covers firstObject];
+        id lc = SLProfCallObj(first, @"lightCoverColor");
+        id dc = SLProfCallObj(first, @"darkCoverColor");
+        if ([lc isKindOfClass:[NSString class]] && [(NSString *)lc length]) out[@"coverLight"] = lc;
+        if ([dc isKindOfClass:[NSString class]] && [(NSString *)dc length]) out[@"coverDark"] = dc;
     }
-    NSString *cov2 = SLProfCoverURL(SLProfCallObj(cover, @"coverList"));
-    if (cov2.length && !out[@"cover"]) out[@"cover"] = cov2;
 
-    // 头像：header 用的那几张里挑最清晰的存一份 URL（重启后靠它兜底贴图）
+    // 主页标识：专属会员 / 群聊 / 橱窗 —— 对方有的才记下来，套用时按需打开
+    if (SLProfCallBool(model, @"hasMembership")) out[@"member"] = @"1";
+    if (SLProfCallBool(model, @"canShowGroupCard")) out[@"group"] = @"1";
+    if (SLProfCallBool(model, @"withShopEntry") ||
+        SLProfCallBool(model, @"withFusionShopEntry") ||
+        SLProfCallBool(model, @"withTaobaoShopEntry") ||
+        SLProfCallBool(model, @"hasAwemeGoodsEntry")) out[@"shop"] = @"1";
+
+    // 头像：header 用的那几张里挑最清晰的存一份 URL（重启后靠它兜底重建）
     NSString *av = SLProfAvatarURL(model);
     if (av.length) out[@"avatar"] = av;
     return out;
@@ -1620,15 +1967,18 @@ static void h_profEnterPage(id self, SEL _cmd, BOOL animated) {
     IMP o = SLProfFindOrig(self, _cmd);
     if (o) ((void (*)(id, SEL, BOOL))o)(self, _cmd, animated);
 
-    // 头图 / 头像在页面出现时可能已经按真实资料配好了，这里补一次：
-    // 先让页面把数据渲染完，再换成对方的（只在我页且门开着时才动）
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.6 * NSEC_PER_SEC)),
-                   dispatch_get_main_queue(), ^{
-        if (!SLProfGate()) return;
-        SLProfForceCover();
-        SLProfPaintAvatar();
-        SLProfReloadListOnce();
-    });
+    // 头图 / 头像 / 九宫格在页面出现时可能已经按真实资料配好了，这里补几遍：
+    // 页面渲染、接口回填、列表复用都发生在这两三秒里，只补一次经常赶不上。
+    for (int i = 0; i < 3; i++) {
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
+                                     (int64_t)((0.55 + 0.9 * i) * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            if (!SLProfGate()) return;
+            SLProfForceCover();
+            SLProfPaintAvatar();
+            SLProfReloadListOnce();      // 内部按「代」去重，成功一次就不再打扰
+        });
+    }
 }
 
 static void h_profLeavePage(id self, SEL _cmd, BOOL animated) {
@@ -1663,6 +2013,8 @@ static void SLProfHookPageLifecycle(Class cls) {
 void SLProfileStart(void) {
     if (sSLProfStarted) return;
     sSLProfStarted = YES;
+
+    SLProfMigrateLegacy();     // 老版本的单账号预设搬到 owner 名下，只做一次
 
     Class user = objc_getClass("AWEUserModel");
     SLProfHookGetter(user, @selector(nickname), (IMP)h_nickname, (IMP *)&o_nickname, @"nickname");
@@ -1710,8 +2062,13 @@ void SLProfileStart(void) {
                      NSSelectorFromString(@"displayCountForItem:"),
                      (IMP)h_followText, (IMP *)&o_followText, @"follow.displayCount");
 
-    // 主页背景图：别人主页把 coverList 模型对象留住，自己主页原样喂回去
+    // 主页背景图：profileCover 是真正的数据源；视图层两个入口也兜住
     {
+        SLProfHookGetter(user, NSSelectorFromString(@"profileCover"),
+                         (IMP)h_profileCover, (IMP *)&o_profileCover, @"profileCover");
+        SLProfHookGetter(user, NSSelectorFromString(@"whiteProfileCover"),
+                         (IMP)h_whiteProfileCover, (IMP *)&o_whiteProfileCover, @"whiteProfileCover");
+
         Class cover = objc_getClass("AWEProfileBannerBGCoverView");
         Method l = cover ? SLProfExact(cover, NSSelectorFromString(@"configWithCoverList:")) : NULL;
         if (l && method_getNumberOfArguments(l) == 3) {
@@ -1731,19 +2088,38 @@ void SLProfileStart(void) {
         }
     }
 
-    // 头像：我页读头像时返回对方 model 的那份对象
+    // 头像：我页读头像时返回对方 model 的那份对象（没有就用保存的 URL 重建）
     {
         Class user2 = objc_getClass("AWEUserModel");
         SLProfHookGetter(user2, NSSelectorFromString(@"avatarThumb"),
                          (IMP)h_avThumb, (IMP *)&o_avThumb, @"avatarThumb");
         SLProfHookGetter(user2, NSSelectorFromString(@"avatarMedium"),
                          (IMP)h_avMedium, (IMP *)&o_avMedium, @"avatarMedium");
-        SLProfHookGetter(user2, NSSelectorFromString(@"avatarLarge"),
-                         (IMP)h_avLarge, (IMP *)&o_avLarge, @"avatarLarge");
+        SLProfHookGetter(user2, NSSelectorFromString(@"avatarLarger"),
+                         (IMP)h_avLarger, (IMP *)&o_avLarger, @"avatarLarger");
         SLProfHookGetter(user2, NSSelectorFromString(@"avatar168"),
                          (IMP)h_av168, (IMP *)&o_av168, @"avatar168");
         SLProfHookGetter(user2, NSSelectorFromString(@"avatar300"),
                          (IMP)h_av300, (IMP *)&o_av300, @"avatar300");
+    }
+
+    // 主页标识：专属会员 / 群聊 / 橱窗
+    {
+        Class user3 = objc_getClass("AWEUserModel");
+        SLProfHookBoolGetter(user3, NSSelectorFromString(@"hasMembership"),
+                             (IMP)h_hasMembership, (IMP *)&o_hasMembership, @"hasMembership");
+        SLProfHookBoolGetter(user3, NSSelectorFromString(@"canShowGroupCard"),
+                             (IMP)h_canShowGroupCard, (IMP *)&o_canShowGroupCard, @"canShowGroupCard");
+        SLProfHookBoolGetter(user3, NSSelectorFromString(@"withShopEntry"),
+                             (IMP)h_withShopEntry, (IMP *)&o_withShopEntry, @"withShopEntry");
+        SLProfHookBoolGetter(user3, NSSelectorFromString(@"withFusionShopEntry"),
+                             (IMP)h_withFusionShopEntry, (IMP *)&o_withFusionShopEntry, @"withFusionShopEntry");
+        SLProfHookBoolGetter(user3, NSSelectorFromString(@"withTaobaoShopEntry"),
+                             (IMP)h_withTaobaoShopEntry, (IMP *)&o_withTaobaoShopEntry, @"withTaobaoShopEntry");
+        SLProfHookBoolGetter(user3, NSSelectorFromString(@"hasAwemeGoodsEntry"),
+                             (IMP)h_hasAwemeGoodsEntry, (IMP *)&o_hasAwemeGoodsEntry, @"hasAwemeGoodsEntry");
+        SLProfHookBoolGetter(user3, NSSelectorFromString(@"withNewGoods"),
+                             (IMP)h_withNewGoods, (IMP *)&o_withNewGoods, @"withNewGoods");
     }
 
     // 别人主页：挂 viewDidAppear:，把「伪装主页」胶囊挂上去
@@ -1801,17 +2177,14 @@ void SLProfileStart(void) {
     SLProfHookPageLifecycle(objc_getClass("AWEProfileMergedTabContainerViewController"));
     SLProfHookPageLifecycle(objc_getClass("AWEProfileBaseContainerViewController"));
 
-    SLLog(@"PROF| ==== 主页伪装 v0.8.8 · 开=%d · 已填 %ld 项 · 快照 %lu 个 ====",
-          SLProfileEnabled(), (long)SLProfileFilledCount(), (unsigned long)SLSnapList().count);
+    SLLog(@"PROF| ==== 主页伪装 v0.8.9 · 开=%d · 已填 %ld 项 · 账号 %@ · 快照 %lu 个 ====",
+          SLProfileEnabled(), (long)SLProfileFilledCount(), sSLCurAcct ?: @"?", (unsigned long)SLSnapList().count);
 
     UIViewController *top = SLProfTopVC();
     SLLog(@"PROF| 启动时顶层页面 = %@", top ? NSStringFromClass([top class]) : @"nil");
 }
 
 #pragma mark - 编辑器
-
-@interface SLSnapListController : UITableViewController
-@end
 
 @implementation SLProfileEditorController
 
@@ -1834,6 +2207,7 @@ void SLProfileStart(void) {
 
 - (void)viewWillAppear:(BOOL)animated {
     [super viewWillAppear:animated];
+    SLProfPageKind();          // 顺便认出当前账号，写预设才落到正确的账号名下
     [self.tableView reloadData];
 }
 
@@ -1842,17 +2216,17 @@ void SLProfileStart(void) {
 - (NSInteger)tableView:(UITableView *)tv numberOfRowsInSection:(NSInteger)s {
     (void)tv;
     if (s == 0) return 2;
-    if (s == 1) return 4;
+    if (s == 1) return 3;
     if (s == 2) return 5;
-    return 1;
+    return 3;
 }
 
 - (NSString *)tableView:(UITableView *)tv titleForHeaderInSection:(NSInteger)s {
     (void)tv;
-    if (s == 0) return nil;
+    if (s == 0) return sSLCurAcct.length ? [NSString stringWithFormat:@"账号 %@", sSLCurAcct] : nil;
     if (s == 1) return @"资料";
     if (s == 2) return @"数字";
-    return @"快捷";
+    return @"主页标识";
 }
 
 - (UITableViewCell *)tableView:(UITableView *)tv cellForRowAtIndexPath:(NSIndexPath *)ip {
@@ -1885,16 +2259,9 @@ void SLProfileStart(void) {
     }
 
     if (ip.section == 1) {
-        NSArray *titles = @[@"昵称", @"抖音号", @"简介", @"头像"];
-        NSArray *keys = @[SLProfKeyNickname, SLProfKeyUID, SLProfKeySignature, @""];
+        NSArray *titles = @[@"昵称", @"抖音号", @"简介"];
+        NSArray *keys = @[SLProfKeyNickname, SLProfKeyUID, SLProfKeySignature];
         cell.textLabel.text = titles[ip.row];
-        if (ip.row == 3) {
-            cell.detailTextLabel.text = @"后续";
-            cell.detailTextLabel.textColor = [UIColor tertiaryLabelColor];
-            cell.textLabel.textColor = [UIColor tertiaryLabelColor];
-            cell.selectionStyle = UITableViewCellSelectionStyleNone;
-            return cell;
-        }
         NSString *v = SLProfStr(keys[ip.row]);
         cell.detailTextLabel.text = v.length ? v : @"未设置";
         cell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
@@ -1902,14 +2269,15 @@ void SLProfileStart(void) {
     }
 
     if (ip.section == 3) {
-        cell.textLabel.text = @"从他人主页套用";
-        NSArray *snaps = SLSnapList();
-        cell.detailTextLabel.text = snaps.count
-            ? [NSString stringWithFormat:@"%lu 人", (unsigned long)snaps.count]
-            : @"先去点开对方主页";
-        cell.detailTextLabel.textColor = snaps.count ? [UIColor secondaryLabelColor]
-                                                     : [UIColor tertiaryLabelColor];
-        cell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
+        NSArray *titles = @[@"专属会员", @"群聊", @"橱窗"];
+        NSArray *keys = @[SLProfKeyMember, SLProfKeyGroup, SLProfKeyShop];
+        UISwitch *sw = [[UISwitch alloc] initWithFrame:CGRectZero];
+        sw.tag = 2 + ip.row;
+        sw.on = SLProfBool(keys[ip.row], NO);
+        [sw addTarget:self action:@selector(sl_toggle:) forControlEvents:UIControlEventValueChanged];
+        cell.textLabel.text = titles[ip.row];
+        cell.accessoryView = sw;
+        cell.selectionStyle = UITableViewCellSelectionStyleNone;
         return cell;
     }
 
@@ -1924,26 +2292,20 @@ void SLProfileStart(void) {
 }
 
 - (void)sl_toggle:(UISwitch *)sw {
-    if (sw.tag == 1) {
-        [[NSUserDefaults standardUserDefaults] setBool:sw.on forKey:SLProfKeyWorks];
-        SLLog(@"PROF| 模拟作品与播放量 = %d", sw.on);
-        return;
+    switch (sw.tag) {
+        case 0: SLProfSetBool(sw.on, SLProfKeyEnabled);  SLLog(@"PROF| 总开关 = %d", sw.on); break;
+        case 1: SLProfSetBool(sw.on, SLProfKeyWorks);    SLLog(@"PROF| 模拟作品与播放量 = %d", sw.on); break;
+        case 2: SLProfSetBool(sw.on, SLProfKeyMember);   SLLog(@"PROF| 专属会员 = %d", sw.on); break;
+        case 3: SLProfSetBool(sw.on, SLProfKeyGroup);    SLLog(@"PROF| 群聊 = %d", sw.on); break;
+        case 4: SLProfSetBool(sw.on, SLProfKeyShop);     SLLog(@"PROF| 橱窗 = %d", sw.on); break;
+        default: break;
     }
-    [[NSUserDefaults standardUserDefaults] setBool:sw.on forKey:SLProfKeyEnabled];
-    SLLog(@"PROF| 总开关 = %d", sw.on);
 }
 
 - (void)tableView:(UITableView *)tv didSelectRowAtIndexPath:(NSIndexPath *)ip {
     [tv deselectRowAtIndexPath:ip animated:YES];
 
-    if (ip.section == 0) return;
-    if (ip.section == 1 && ip.row == 3) return;
-
-    if (ip.section == 3) {
-        SLSnapListController *vc = [[SLSnapListController alloc] init];
-        [self.navigationController pushViewController:vc animated:YES];
-        return;
-    }
+    if (ip.section == 0 || ip.section == 3) return;
 
     NSString *title = nil, *key = nil;
     UIKeyboardType kb = UIKeyboardTypeDefault;
@@ -1993,105 +2355,6 @@ void SLProfileStart(void) {
                                                                            UIView *v,
                                                                            void (^done)(BOOL)) {
         SLProfileClearAll();
-        [self.tableView reloadData];
-        done(YES);
-    }];
-    return [UISwipeActionsConfiguration configurationWithActions:@[a]];
-}
-
-@end
-
-#pragma mark - 快照列表
-
-@implementation SLSnapListController
-
-- (instancetype)init {
-    return [super initWithStyle:UITableViewStyleInsetGrouped];
-}
-
-- (void)viewDidLoad {
-    [super viewDidLoad];
-    self.title = @"套用他人主页";
-    self.navigationItem.titleView = SLPillTitleView(@"套用他人主页");
-    SLApplyGlassTable(self.tableView);
-    SLInstallPillBack(self);
-}
-
-- (NSInteger)numberOfSectionsInTableView:(UITableView *)tv { (void)tv; return 1; }
-
-- (NSInteger)tableView:(UITableView *)tv numberOfRowsInSection:(NSInteger)s {
-    (void)tv; (void)s;
-    NSUInteger n = SLSnapList().count;
-    return n ? n : 1;
-}
-
-- (UITableViewCell *)tableView:(UITableView *)tv cellForRowAtIndexPath:(NSIndexPath *)ip {
-    static NSString *rid = @"slsnapcell";
-    UITableViewCell *cell = [tv dequeueReusableCellWithIdentifier:rid];
-    if (!cell) cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleSubtitle reuseIdentifier:rid];
-    cell.backgroundColor = SLGlassCellColor();
-    cell.textLabel.textColor = [UIColor labelColor];
-    cell.detailTextLabel.textColor = [UIColor secondaryLabelColor];
-    cell.detailTextLabel.numberOfLines = 1;
-    cell.accessoryType = UITableViewCellAccessoryNone;
-    cell.selectionStyle = UITableViewCellSelectionStyleDefault;
-
-    NSArray *snaps = SLSnapList();
-    if (!snaps.count) {
-        cell.textLabel.text = @"还没有";
-        cell.textLabel.textColor = [UIColor tertiaryLabelColor];
-        cell.detailTextLabel.text = @"先去点开一次对方主页，回来就有了";
-        cell.selectionStyle = UITableViewCellSelectionStyleNone;
-        return cell;
-    }
-
-    NSDictionary *s = snaps[ip.row];
-    NSString *nick = SLSnapText(s, @"nickname") ?: @"(无昵称)";
-    NSMutableArray *sub = [NSMutableArray array];
-    NSString *v = nil;
-    if ((v = SLSnapText(s, @"follower")))  [sub addObject:[NSString stringWithFormat:@"粉 %@", v]];
-    if ((v = SLSnapText(s, @"following"))) [sub addObject:[NSString stringWithFormat:@"关 %@", v]];
-    if ((v = SLSnapText(s, @"aweme")))     [sub addObject:[NSString stringWithFormat:@"作 %@", v]];
-    if ((v = SLSnapText(s, @"like")))      [sub addObject:[NSString stringWithFormat:@"赞 %@", v]];
-    if ((v = SLSnapText(s, @"friend")))    [sub addObject:[NSString stringWithFormat:@"互 %@", v]];
-    if (SLSnapText(s, @"cover"))           [sub addObject:@"带背景"];
-    NSString *uid = SLSnapText(s, @"uniqueID");
-    if (uid.length) [sub addObject:[NSString stringWithFormat:@"号 %@", uid]];
-
-    cell.textLabel.text = nick;
-    cell.detailTextLabel.text = sub.count ? [sub componentsJoinedByString:@" · "] : nil;
-    cell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
-    return cell;
-}
-
-- (NSString *)tableView:(UITableView *)tv titleForHeaderInSection:(NSInteger)s {
-    (void)tv; (void)s;
-    return @"点一下即套用（会自动打开开关）";
-}
-
-- (void)tableView:(UITableView *)tv didSelectRowAtIndexPath:(NSIndexPath *)ip {
-    [tv deselectRowAtIndexPath:ip animated:YES];
-    NSArray *snaps = SLSnapList();
-    if (ip.row >= (NSInteger)snaps.count) return;
-    SLApplySnap(snaps[ip.row]);
-    [self.navigationController popViewControllerAnimated:YES];
-}
-
-- (UISwipeActionsConfiguration *)tableView:(UITableView *)tv
-    trailingSwipeActionsConfigurationForRowAtIndexPath:(NSIndexPath *)ip {
-    (void)tv;
-    NSArray *snaps = SLSnapList();
-    if (ip.row >= (NSInteger)snaps.count) return nil;
-    NSDictionary *s = snaps[ip.row];
-    NSString *key = SLSnapText(s, @"uid") ?: SLSnapText(s, @"sec");
-    if (!key.length) return nil;
-    UIContextualAction *a = [UIContextualAction contextualActionWithStyle:UIContextualActionStyleDestructive
-                                                                   title:@"删除"
-                                                                 handler:^(UIContextualAction *act,
-                                                                           UIView *v,
-                                                                           void (^done)(BOOL)) {
-        [SLCapStore() removeObjectForKey:key];
-        SLCapPersist();
         [self.tableView reloadData];
         done(YES);
     }];
