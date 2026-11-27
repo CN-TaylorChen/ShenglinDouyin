@@ -257,7 +257,7 @@ void SLProfileStart(void) {
             BOOL isBool = (ret && (ret[0] == 'B' || ret[0] == 'c'));
             if (ret) free(ret);
             if (isBool) {
-                o_isCurrentUserProfilePage = method_getImplementation(m);
+                o_isCurrentUserProfilePage = (BOOL (*)(id, SEL))method_getImplementation(m);
                 method_setImplementation(m, (IMP)h_isCurrentUserProfilePage);
                 SLLog(@"PROF| 已挂 isCurrentUserProfilePage @ AWEUserHomeViewControllerV2");
             }
