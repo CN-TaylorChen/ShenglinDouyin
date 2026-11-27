@@ -1346,7 +1346,12 @@ static id h_postsInit(id self, SEL _cmd, id uid, id sec) {
     id r = o_postsInit ? o_postsInit(self, _cmd, uid, sec) : nil;
     if ([uid isKindOfClass:[NSString class]] && [(NSString *)uid length]) {
         objc_setAssociatedObject(self, &kSLPostsUIDKey, uid, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-        if (!sSLMyMgrs) sSLMyMgrs = [NSHashTable weakObjectsHashTable];
+        if (!sSLMyMgrs) {
+            // 按指针认，别用 isEqual: —— 这个类自己重写过比较，能力上也不需要「相等」语义
+            sSLMyMgrs = [[NSHashTable alloc] initWithOptions:
+                         (NSPointerFunctionsWeakMemory | NSPointerFunctionsObjectPointerPersonality)
+                                                capacity:4];
+        }
         [sSLMyMgrs addObject:self];
     }
     return r;
