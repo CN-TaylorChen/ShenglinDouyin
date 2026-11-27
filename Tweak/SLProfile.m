@@ -27,6 +27,7 @@
 #define SLProfKeyFollower  @"SLProf.follower"
 #define SLProfKeyLike      @"SLProf.like"       // 获赞
 #define SLProfKeyFriend    @"SLProf.friend"     // 互关
+#define SLProfKeyCover     @"SLProf.coverURL"   // 主页背景图（封面）URL
 
 static volatile BOOL sSLProfOnMePage = NO;   // 「我」页可见期间为 YES
 static BOOL sSLProfStarted  = NO;
@@ -118,7 +119,7 @@ static BOOL SLProfNumber(NSString *key, long long *out) {
 //   另外同一 uid 改成「逐字段合并」，残片不会再覆盖掉完整记录。
 
 #define SLProfKeySnaps @"SLProf.snaps"
-#define SLProfKeyCover @"SLProf.coverURL"     // 主页背景图（封面）URL
+// SLProfKeyCover 定义在文件顶部（清空逻辑要用）
 
 static BOOL sSLCapOn  = NO;
 static NSMutableDictionary *sSLCapCur   = nil;   // 正在看的这个人的字段
@@ -758,6 +759,11 @@ static void h_coverConfig(id self, SEL _cmd, id urls, id light, id dark) {
             ? @[[(NSArray *)light firstObject]] : light;
     id nd = ([dark isKindOfClass:[NSArray class]] && [(NSArray *)dark count])
             ? @[[(NSArray *)dark firstObject]] : dark;
+    static BOOL sCoverLogged = NO;
+    if (!sCoverLogged) {
+        sCoverLogged = YES;
+        SLLog(@"PROF| 替换封面 → %@", mine);
+    }
     if (o_coverConfig) o_coverConfig(self, _cmd, @[neu], nl, nd);
 }
 
