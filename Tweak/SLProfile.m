@@ -113,7 +113,7 @@
 #include <string.h>
 #include <stdlib.h>
 
-#define SLProfVersion      @"0.9.10"          // 与 control / SLSettingsPanel 同步
+#define SLProfVersion      @"0.9.11"          // 与 control / SLSettingsPanel 同步
 #define SLProfKeyEnabled   @"SLProf.enabled"
 #define SLProfKeyNickname  @"SLProf.nickname"
 #define SLProfKeyUID       @"SLProf.uid"
@@ -130,12 +130,8 @@
 #define SLProfKeyAvatar    @"SLProf.avatarURL"  // 头像 URL
 #define SLProfKeyWant      @"SLProf.want"       // 这个账号要模拟谁（作品/封面/头像都照这个来）
 #define SLProfKeySec       @"SLProf.sec"        // 对方的 sec_user_id（联网拉作品要用）
-#define SLProfKeyGender    @"SLProf.gender"     // 性别（1 男 / 2 女）
-#define SLProfKeyAge       @"SLProf.age"        // 年龄
-#define SLProfKeyGenderTxt @"SLProf.genderText" // 「女 · 22岁」这种现成字符串
 #define SLProfKeyExtra     @"SLProf.extra"      // 地区 / 认证 / 学校等一揽子文本字段
 #define SLProfKeyWorks     @"SLProf.works"      // 模拟作品与播放量
-#define SLProfKeyHidePriv  @"SLProf.hidePrivate" // 隐藏私密作品（我页里不显示自己的私密作品）
 #define SLProfKeyOwner     @"SLProf.ownerUid"   // 旧版单账号绑定，仅用于把老预设迁到分账号存储
 
 static volatile BOOL sSLProfOnMePage = NO;   // 「我」页可见期间为 YES
@@ -146,6 +142,7 @@ static int  sSLProfMissLogged = 0;  // 门未开的诊断日志，最多打几�
 static id SLProfCallObj(id obj, NSString *selName);   // 定义在「页面判定」段，快照要用
 static BOOL SLProfGate(void);                         // 定义在「页面判定」段，套用快照时要用
 static void SLProfSpoofPlayInList(id ds);             // 定义在「封面播放量」段，列表回来时补挂
+static id SLProfFilterPostsFor(id ds, id mgr);        // 定义在「作品」段，剔掉切号残留
 static void SLProfForceCover(void);                   // 定义在「封面」段，套用后用
 static NSString *sSLWorkWant = nil;                   // 要模拟谁（每个账号各自一份，落盘）
 static NSString *sSLProfMyUID = nil;                  // 当前登录账号的 uid（在「我」页读到）
@@ -153,8 +150,8 @@ static NSString *sSLCurAcct = nil;                    // 当前生效的账号 u
 static NSMutableDictionary *sSLCoverObjs = nil;       // uid -> 对方真实 coverList（模型对象）
 static NSMutableDictionary *sSLFakeUsers = nil;       // uid -> 对方真实 AWEUserModel（头像用）
 static void SLProfResetPainted(void);                 // 还原被我们直接改过图的视图
-static void SLApplySnapExtras(NSDictionary *snap);    // 定义在「性别 / 地区」段，套用快照时要用
-static NSString *SLExtraStr(NSString *field);         // 同上，日志里要打地区
+static void SLApplySnapExtras(NSDictionary *snap);    // 定义在「认证 / 学校」段，套用快照时要用
+static NSString *SLExtraStr(NSString *field);         // 同上，认证 / 学校要用
 static void SLProfCoverPrefetch(void);                // 定义在「封面」段，套用后先把原图存一份
 static int sSLWorksGen = 0;                           // 每次套用 +1（作品列表重拉用）
 static int sSLPostsMgrLog = 0;                        // 作品管理器记录日志（限几条）
@@ -252,8 +249,7 @@ void SLProfileClearAll(void) {
                       SLProfKeyAweme, SLProfKeyFollowing, SLProfKeyFollower,
                       SLProfKeyLike, SLProfKeyFriend, SLProfKeyCover, SLProfKeyCoverLight,
                       SLProfKeyCoverDark, SLProfKeyAvatar, SLProfKeyWant,
-                      SLProfKeySec, SLProfKeyGender, SLProfKeyAge, SLProfKeyGenderTxt,
-                      SLProfKeyExtra, SLProfKeyWorks, SLProfKeyHidePriv, SLProfKeyEnabled];
+                      SLProfKeySec, SLProfKeyExtra, SLProfKeyWorks, SLProfKeyEnabled];
     for (NSString *k in keys) {
         [d removeObjectForKey:SLProfScopedKey(k)];
         [d removeObjectForKey:k];
@@ -553,16 +549,7 @@ static void SLApplySnap(NSDictionary *s) {
     SLProfSetStr(SLSnapText(s, @"coverDark"), SLProfKeyCoverDark);
     SLProfSetStr(SLSnapText(s, @"avatar"),    SLProfKeyAvatar);
     SLProfSetStr(SLSnapText(s, @"sec"),       SLProfKeySec);      // 联网拉作品要用
-    // 0.9.8：性别 / 年龄以**设置页手填的**为准。
-    // 别人的主页现在基本不公开这几项（只有「+ 添加性别等标签」和 IP 属地），
-    // 从那边抓回来的多半是空，却把手填的值一并覆盖了 —— 所以只在本地没设过时才补。
-    if (!SLProfStr(SLProfKeyGender).length)
-        SLProfSetStr(SLSnapText(s, @"gender"), SLProfKeyGender);
-    if (!SLProfStr(SLProfKeyAge).length)
-        SLProfSetStr(SLSnapText(s, @"age"), SLProfKeyAge);
-    if (!SLProfStr(SLProfKeyGenderTxt).length)
-        SLProfSetStr(SLSnapText(s, @"genderText"), SLProfKeyGenderTxt);
-    SLApplySnapExtras(s);                                       // 地区 / 认证 / 学校
+    SLApplySnapExtras(s);                                       // 认证 / 学校
     NSString *uid = SLSnapText(s, @"uid");
     if (uid.length) SLProfSetStr(uid, SLProfKeyWant);   // 作品/封面/头像都照这个人的来
     sSLWorkWant = uid;
@@ -639,27 +626,6 @@ static void SLProfHookBoolGetter(Class cls, SEL sel, IMP imp, IMP *slot, NSStrin
     BOOL isBool = (ret && (ret[0] == 'B' || ret[0] == 'c'));
     if (ret) free(ret);
     if (!isBool) { SLLog(@"PROF| 跳过 %@：返回值不是 BOOL", tag); return; }
-    if (method_getNumberOfArguments(m) != 2) {
-        SLLog(@"PROF| 跳过 %@：参数个数不是 0", tag);
-        return;
-    }
-    *slot = method_getImplementation(m);
-    method_setImplementation(m, imp);
-    SLLog(@"PROF| 已挂 %@ @ %@", tag, NSStringFromClass(cls));
-}
-
-// 返回整数、无参数
-static void SLProfHookIntGetter(Class cls, SEL sel, IMP imp, IMP *slot, NSString *tag) {
-    if (!cls) { SLLog(@"PROF| 跳过 %@：类不存在", tag); return; }
-    Method m = SLProfExact(cls, sel);
-    if (!m) { SLLog(@"PROF| 跳过 %@：%@ 未实现该 selector", tag, NSStringFromClass(cls)); return; }
-    char *ret = method_copyReturnType(m);
-    char c = ret ? ret[0] : 0;
-    if (ret) free(ret);
-    if (c != 'q' && c != 'Q' && c != 'i' && c != 'I' && c != 'l' && c != 'L') {
-        SLLog(@"PROF| 跳过 %@：返回值不是整数", tag);
-        return;
-    }
     if (method_getNumberOfArguments(m) != 2) {
         SLLog(@"PROF| 跳过 %@：参数个数不是 0", tag);
         return;
@@ -792,12 +758,9 @@ static void SLProfSetAcct(NSString *uid) {
     sSLWasOnMe = NO;                // 巡检下一拍按新号重来
 
     SLLog(@"PROF| 已切到账号 %@（预设按账号独立，互不清空）", uid);
-    SLLog(@"PROF| 本账号预设：昵称=%@ 赞=%@ 性别=%@ 年龄=%@ 地区=%@ 背景=%@ 头像=%@ 作品源=%@",
+    SLLog(@"PROF| 本账号预设：昵称=%@ 赞=%@ 背景=%@ 头像=%@ 作品源=%@",
           SLProfStr(SLProfKeyNickname) ?: @"无",
           SLProfStr(SLProfKeyLike) ?: @"无",
-          SLProfStr(SLProfKeyGender) ?: @"无",
-          SLProfStr(SLProfKeyAge) ?: @"无",
-          SLExtraStr(@"city") ?: SLExtraStr(@"location") ?: @"无",
           SLProfStr(SLProfKeyCover) ?: @"无",
           SLProfStr(SLProfKeyAvatar) ?: @"无",
           sSLWorkWant ?: @"无");
@@ -1091,53 +1054,8 @@ static BOOL h_shouldShowUniqueID(id self, SEL _cmd) {
 // 这个方法返的其实是 NSNumber，于是每次都在这里原样吐回去，静默失败。
 // 现在 NSString / NSNumber / nil 三种都接，只在奇怪类型（富文本之类）上放行。
 
-// 过亿的数字抖音会用富文本（数字一段、"亿"一段，字号和颜色都不一样）——
-// 原来遇到非 NSString/NSNumber 就原样放行，所以一亿以上永远同步不过来。
-//
-// 0.9.7：不再「新建一个 NSAttributedString 套第一段属性」——那样会把抖音自己的
-// 私有富文本类换成普通 NSMutableAttributedString，部分 cell 会按类判断后直接忽略。
-// 现在就地改原对象的可变副本，长度不够时单位单独沿用原串最后一段的属性（"亿"保持小字号）。
-static id SLProfAttrCount(id v, long long n) {
-    NSString *s = SLProfFormatCount(n);
-    if (![v isKindOfClass:[NSAttributedString class]] || ![v length]) return s;
-    NSAttributedString *src = (NSAttributedString *)v;
-    NSDictionary *a0 = [src attributesAtIndex:0 effectiveRange:NULL];
-    NSDictionary *aLast = [src attributesAtIndex:src.length - 1 effectiveRange:NULL];
-    @try {
-        NSMutableAttributedString *m = [src mutableCopy];
-        if (m && [m isKindOfClass:[NSMutableAttributedString class]]) {
-            [m replaceCharactersInRange:NSMakeRange(0, m.length) withString:s];
-            if (a0.count) [m setAttributes:a0 range:NSMakeRange(0, s.length)];
-            if (aLast.count && s.length >= 2 &&
-                ([s hasSuffix:@"亿"] || [s hasSuffix:@"万"])) {
-                [m setAttributes:aLast range:NSMakeRange(s.length - 1, 1)];
-            }
-            if (m.length == s.length) return m;
-        }
-    } @catch (NSException *e) {
-        static BOOL sOnce = NO;
-        if (!sOnce) { sOnce = YES;
-            SLLog(@"STAT| 富文本就地替换失败（%@），改用重建", e.reason ?: @"?"); }
-    }
-    // 就地改不动就重建一份：样式照抄第一段，单位沿用最后一段
-    NSMutableAttributedString *m2 = [[NSMutableAttributedString alloc] initWithString:s];
-    if (a0.count) [m2 setAttributes:a0 range:NSMakeRange(0, s.length)];
-    if (aLast.count && s.length >= 2 && ([s hasSuffix:@"亿"] || [s hasSuffix:@"万"]))
-        [m2 setAttributes:aLast range:NSMakeRange(s.length - 1, 1)];
-    return m2;
-}
-
-// 计数接口返回了认不出的类型（抖音的私有富文本 / 展示模型之类）时记一笔类名。
-// 「一亿以上换不了」多半就卡在这里 —— 有这个类名，下一轮就能按类名精准处理。
-static void SLProfNoteCountType(NSString *tag, id v) {
-    static NSMutableSet *seen = nil;
-    if (!seen) seen = [NSMutableSet set];
-    NSString *cn = v ? NSStringFromClass([v class]) : @"nil";
-    NSString *k = [NSString stringWithFormat:@"%@|%@", tag, cn];
-    if ([seen containsObject:k]) return;
-    [seen addObject:k];
-    SLLog(@"STAT| %@ 返回 %@，类型没认出来 → 原样放行", tag, cn);
-}
+// 过亿（富文本）那条按用户要求不再特殊处理：认不出的类型一律原样放行，
+// 只把 NSString / NSNumber 两种常规返回值换掉。
 
 #define SL_PROF_COUNT_HOOK(NAME, KEY, TAG, FIELD)                          \
     static id (*o_##NAME)(id, SEL, id);                                    \
@@ -1148,11 +1066,8 @@ static void SLProfNoteCountType(NSString *tag, id v) {
         if (!SLProfNumber(KEY, &n)) return v;                              \
         if (sSLProfHits < 20) { sSLProfHits++;                             \
             SLLog(@"PROF| 替换 %@ → %lld", TAG, n); }                      \
-        if ([v isKindOfClass:[NSAttributedString class]])                  \
-            return SLProfAttrCount(v, n);                                  \
         if (v && ![v isKindOfClass:[NSString class]] &&                    \
-            ![v isKindOfClass:[NSNumber class]]) {                         \
-            SLProfNoteCountType(TAG, v); return v; }                       \
+            ![v isKindOfClass:[NSNumber class]]) return v;                  \
         if ([v isKindOfClass:[NSString class]]) return SLProfFormatCount(n); \
         return @(n);                                                       \
     }
@@ -1168,7 +1083,7 @@ SL_PROF_COUNT_HOOK(followText, SLProfKeyFollowing, @"follow",   @"following")
 
 
 // 过亿的获赞有时候不走上面的组件，直接由 header 的统计 cell 收文本。
-// 这里在最后一环再兜一次：参数是什么类型就还回什么类型，认不出类型（富文本）就不动。
+// 这里在最后一环再兜一次：参数是什么类型就还回什么类型，认不出类型就不动。
 static void SLProfHookOneObjVoid(Class cls, NSString *selName, IMP imp, IMP *slot, NSString *tag) {
     if (!cls) { SLLog(@"PROF| 跳过 %@：类不存在", tag); return; }
     SEL sel = NSSelectorFromString(selName);
@@ -1195,13 +1110,7 @@ static void SLProfHookOneObjVoid(Class cls, NSString *selName, IMP imp, IMP *slo
         if (SLProfGateLoose() && SLProfNumber(KEY, &n) && n > 0) {          \
             if ([v isKindOfClass:[NSNumber class]]) nv = @(n);              \
             else if ([v isKindOfClass:[NSString class]]) nv = SLProfFormatCount(n); \
-            else if ([v isKindOfClass:[NSAttributedString class]]) nv = SLProfAttrCount(v, n); \
-            else if (v) {                                                   \
-                static BOOL sTypeLogged = NO;                               \
-                if (!sTypeLogged) { sTypeLogged = YES;                      \
-                    SLLog(@"STAT| %@ 参数是 %@，暂不动", TAG,                \
-                          NSStringFromClass([v class])); }                  \
-            }                                                               \
+            /* 富文本等认不出的类型：原样放行（过亿那条不做了） */           \
         }                                                                   \
         if (o_##NAME) o_##NAME(self, _cmd, nv);                             \
     }
@@ -1211,19 +1120,17 @@ SL_PROF_CELLCOUNT_HOOK(cellFans,   SLProfKeyFollower,  @"stat.fans")
 SL_PROF_CELLCOUNT_HOOK(cellFollow, SLProfKeyFollowing, @"stat.follow")
 SL_PROF_CELLCOUNT_HOOK(cellFriend, SLProfKeyFriend,    @"stat.friend")
 
-#pragma mark - 性别 / 年龄 / 地区 / 认证 / 学校
+#pragma mark - 认证 / 学校
 //
-// 昵称下面那行「女 · 22岁 · 广东」和认证、学校这些，都是 AWEUserModel 自己给的：
-//   -gender（1 男 / 2 女，0 未设）、-userAge、-genderDisplayString
-//   -city / -province / -district / -ipLocation / -location
+// 0.9.11 起性别 / 年龄 / 地区整块删除（用户要求）：设置项、资料标签改写、
+// header 文本改写、model 上的 getter 钩子全部移除，页面上那一排保持抖音原样。
+// 这里只留认证标识和学校 —— 它们本来就是 AWEUserModel 自己给的：
 //   -verifyInfo / -customVerifyInfo / -schoolName
-// 统一按账号存一份，只在我页替换 —— 页面上看得见的资料全跟着对方走。
-// （专属会员 / 群聊 / 橱窗交给抖音自己的设置，插件不再插手。）
+// 按账号存一份，只在我页替换。
 
 // 一揽子文本字段存在同一个词典里：SLProf.extra.<我的uid> -> { city: "广东", ... }
 static NSArray *SLExtraFields(void) {
-    return @[@"city", @"province", @"district", @"ipLocation", @"location",
-             @"verifyInfo", @"customVerifyInfo", @"schoolName"];
+    return @[@"verifyInfo", @"customVerifyInfo", @"schoolName"];
 }
 
 static NSString *SLExtraStr(NSString *field) {
@@ -1233,21 +1140,6 @@ static NSString *SLExtraStr(NSString *field) {
     id v = [d isKindOfClass:[NSDictionary class]] ? d[field] : nil;
     if (![v isKindOfClass:[NSString class]] || ![(NSString *)v length]) return nil;
     return v;
-}
-
-// 单个 extra 字段的写入（设置页手动填地区时用）
-static void SLProfSetExtra(NSString *field, NSString *value) {
-    if (!field.length) return;
-    NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
-    NSString *k = SLProfScopedKey(SLProfKeyExtra);
-    NSMutableDictionary *d = [NSMutableDictionary dictionary];
-    id cur = [ud dictionaryForKey:k];
-    if ([cur isKindOfClass:[NSDictionary class]]) [d addEntriesFromDictionary:cur];
-    if (value.length) d[field] = value;
-    else [d removeObjectForKey:field];
-    if (d.count) [ud setObject:[d copy] forKey:k];
-    else [ud removeObjectForKey:k];
-    [ud synchronize];
 }
 
 // 从快照里把这几个字段抽出来整包写进去（对方没有的就不写，避免凭空多出认证）
@@ -1268,27 +1160,6 @@ static void SLApplySnapExtras(NSDictionary *snap) {
     [ud synchronize];
 }
 
-static id (*o_genderText)(id, SEL);
-static id h_genderText(id self, SEL _cmd) {
-    id v = o_genderText ? o_genderText(self, _cmd) : nil;
-    if (!SLProfGateLoose() || !SLProfIsMe(self)) return v;
-    NSString *f = SLProfStr(SLProfKeyGenderTxt);
-    return f.length ? f : v;
-}
-
-#define SL_PROF_INT_HOOK(NAME, KEY)                                        \
-    static NSInteger (*o_##NAME)(id, SEL);                                 \
-    static NSInteger h_##NAME(id self, SEL _cmd) {                         \
-        NSInteger v = o_##NAME ? o_##NAME(self, _cmd) : 0;                 \
-        if (!SLProfGateLoose() || !SLProfIsMe(self)) return v;             \
-        long long n = 0;                                                   \
-        if (!SLProfNumber(KEY, &n) || n <= 0) return v;                    \
-        return (NSInteger)n;                                               \
-    }
-
-SL_PROF_INT_HOOK(gender,  SLProfKeyGender)
-SL_PROF_INT_HOOK(userAge, SLProfKeyAge)
-
 #define SL_PROF_EXTRA_HOOK(NAME, FIELD)                                    \
     static id (*o_##NAME)(id, SEL);                                        \
     static id h_##NAME(id self, SEL _cmd) {                                \
@@ -1298,523 +1169,10 @@ SL_PROF_INT_HOOK(userAge, SLProfKeyAge)
         return f.length ? f : v;                                           \
     }
 
-SL_PROF_EXTRA_HOOK(city,       @"city")
-SL_PROF_EXTRA_HOOK(province,   @"province")
-SL_PROF_EXTRA_HOOK(district,   @"district")
-SL_PROF_EXTRA_HOOK(ipLocation, @"ipLocation")
-SL_PROF_EXTRA_HOOK(location,   @"location")
 SL_PROF_EXTRA_HOOK(verifyInfo, @"verifyInfo")
 SL_PROF_EXTRA_HOOK(customVerifyInfo, @"customVerifyInfo")
 SL_PROF_EXTRA_HOOK(schoolName, @"schoolName")
 
-
-// 主页上「女 · 22岁 · 广东 · 学校」这一排，是
-//   AWEProfileHeaderAgeAndLocationCollectionViewCell -configWithHeaderContext:
-// 自己按 headerContext 里的 model 拼按钮标题的 —— 不读我们挂的那几个 getter，
-// 所以性别年龄一直不跟着变。在它配好之后把标题直接改成对方的。
-static void SLProfSetBtnText(id btn, NSString *text) {
-    if (!btn || !text.length) return;
-    if ([btn isKindOfClass:[UIButton class]]) {
-        UIButton *b = (UIButton *)btn;
-        if ([[b titleForState:UIControlStateNormal] isEqualToString:text]) return;
-        [b setAttributedTitle:nil forState:UIControlStateNormal];
-        [b setTitle:text forState:UIControlStateNormal];
-        return;
-    }
-    if (![btn isKindOfClass:[UIView class]]) return;
-    for (UIView *v in [((UIView *)btn).subviews copy]) {
-        if ([v isKindOfClass:[UILabel class]]) { ((UILabel *)v).text = text; return; }
-    }
-}
-
-static NSString *SLProfAgeGenderText(void) {
-    long long g = 0, a = 0;
-    BOOL hasG = SLProfNumber(SLProfKeyGender, &g);
-    BOOL hasA = SLProfNumber(SLProfKeyAge, &a);
-    // 两个都有就拼成一整条（抖音那排就是「女 · 22岁」）
-    if (hasG && g > 0 && hasA && a > 0)
-        return [NSString stringWithFormat:@"%@ · %lld岁", (g == 2 ? @"女" : @"男"), a];
-    NSString *t = SLProfStr(SLProfKeyGenderTxt);
-    if (t.length) return t;
-    if (hasA && a > 0) return [NSString stringWithFormat:@"%lld岁", a];
-    if (hasG && g > 0) return (g == 2) ? @"女" : @"男";
-    return nil;
-}
-
-// chip 上要分开写：「男」一颗、「99岁」一颗；原来只有拼好的「男 · 99岁」。
-static NSString *SLProfGenderWord(void) {
-    long long g = 0;
-    if (!SLProfNumber(SLProfKeyGender, &g) || g <= 0) return nil;
-    return (g == 2) ? @"女" : @"男";
-}
-
-static NSString *SLProfAgeWord(void) {
-    long long a = 0;
-    if (!SLProfNumber(SLProfKeyAge, &a) || a <= 0) return nil;
-    return [NSString stringWithFormat:@"%lld岁", a];
-}
-
-// 读「我」自己 model 的**真实**值（绕过我们自己的钩子，直接调原实现）
-static NSString *SLProfRealStr(id model, id (*orig)(id, SEL), NSString *selName) {
-    if (!model || !orig) return nil;
-    id v = orig(model, NSSelectorFromString(selName));
-    if ([v isKindOfClass:[NSString class]] && [(NSString *)v length]) return v;
-    return nil;
-}
-
-// 「男 · 22岁」这种组合文本，抖音不一定会给 genderDisplayString，自己拼一份
-static NSString *SLProfRealCombo(id model) {
-    if (!model) return nil;
-    NSInteger g = o_gender ? o_gender(model, @selector(gender)) : 0;
-    NSInteger a = o_userAge ? o_userAge(model, NSSelectorFromString(@"userAge")) : 0;
-    NSString *sx = (g == 2) ? @"女" : (g == 1 ? @"男" : nil);
-    if (sx.length && a > 0) return [NSString stringWithFormat:@"%@ · %ld岁", sx, (long)a];
-    if (a > 0) return [NSString stringWithFormat:@"%ld岁", (long)a];
-    return sx;
-}
-
-// 「真实文本 → 要显示的文本」。cell 是拿模型现拼的标题，我们不知道它拼成什么样，
-// 但知道**我自己的**真实值长什么样：按内容比对，比按 ivar 名字找稳得多。
-static NSDictionary *SLProfRealTextMap(void) {
-    NSMutableDictionary *m = [NSMutableDictionary dictionary];
-    NSString *ageTxt = SLProfAgeGenderText();
-    if (ageTxt.length) {
-        NSString *rt = SLProfRealStr(sSLMyModel, o_genderText, @"genderDisplayString");
-        if (rt.length) m[rt] = ageTxt;
-        NSString *combo = SLProfRealCombo(sSLMyModel);
-        if (combo.length) m[combo] = ageTxt;
-        NSInteger g = o_gender ? o_gender(sSLMyModel, @selector(gender)) : 0;
-        if (g == 2) m[@"女"] = ageTxt;
-        else if (g == 1) m[@"男"] = ageTxt;
-        // 真值读不到（model 还没来 / 对方没公开）也照样换：
-        // 页面上那颗 chip 只可能是「男」或「女」，两个都指向我们要显示的文本。
-        // 0.9.7 之前这里因为拿不到真值，整条 map 是空的 —— 设置里填了也一点不动。
-        if (!rt.length && !combo.length) {
-            m[@"男"] = ageTxt;
-            m[@"女"] = ageTxt;
-        }
-    }
-
-    NSString *loc = SLExtraStr(@"city") ?: SLExtraStr(@"location");
-    NSString *ip  = SLExtraStr(@"ipLocation");
-    NSString *sch = SLExtraStr(@"schoolName");
-    NSArray *pairs = @[@[@"city", loc ?: @""], @[@"province", loc ?: @""],
-                       @[@"district", loc ?: @""], @[@"location", loc ?: @""],
-                       @[@"ipLocation", ip ?: @""], @[@"schoolName", sch ?: @""]];
-    id (*origs[6])(id, SEL) = { o_city, o_province, o_district, o_location, o_ipLocation, o_schoolName };
-    NSArray *sels = @[@"city", @"province", @"district", @"location", @"ipLocation", @"schoolName"];
-    for (NSUInteger i = 0; i < pairs.count; i++) {
-        NSString *want = pairs[i][1];
-        if (!want.length) continue;
-        NSString *real = SLProfRealStr(sSLMyModel, origs[i], sels[i]);
-        if (real.length && ![real isEqualToString:want]) m[real] = want;
-    }
-    return m;
-}
-
-static NSString *SLProfTextOfView(UIView *v) {
-    if ([v isKindOfClass:[UILabel class]]) return ((UILabel *)v).text;
-    if ([v isKindOfClass:[UIButton class]])
-        return [((UIButton *)v) titleForState:UIControlStateNormal];
-    return nil;
-}
-
-static BOOL SLProfSetTextOfView(UIView *v, NSString *text) {
-    if (!text.length) return NO;
-    if ([v isKindOfClass:[UILabel class]]) {
-        UILabel *l = (UILabel *)v;
-        if ([l.text isEqualToString:text]) return NO;
-        l.text = text;
-        return YES;
-    }
-    if ([v isKindOfClass:[UIButton class]]) {
-        UIButton *b = (UIButton *)v;
-        if ([[b titleForState:UIControlStateNormal] isEqualToString:text]) return NO;
-        [b setAttributedTitle:nil forState:UIControlStateNormal];
-        [b setTitle:text forState:UIControlStateNormal];
-        return YES;
-    }
-    return NO;
-}
-
-// 在 cell 里按文本内容替换（含「IP属地：广东」这种带前缀的写法）
-// v0.9.3：加深度上限 + 重入闸。改标题会触发一轮 layout，某些 cell 在 layout 里又会配一遍，
-// 没有闸就是「改 → layout → 再配 → 再改」的无限套娃，真机上就是一闪退。
-static BOOL sSLTextMapBusy = NO;
-
-// 「26岁」「女 · 26岁」这种才认。0.9.6 之前用 [t containsString:@"岁"] 判，
-// 作品标题里带个「岁」字就被改成伪装值；更早还有 `[t containsString:@"男"]` 的泛匹配，
-// 含「男」的任何文案都会被整段替换 —— 全页扫的时候这就是灾难。
-static BOOL SLProfLooksLikeAge(NSString *t) {
-    if (!t.length || t.length > 10 || ![t hasSuffix:@"岁"]) return NO;
-    NSString *head = [t substringToIndex:t.length - 1];
-    if ([head hasPrefix:@"女"] || [head hasPrefix:@"男"]) {
-        NSRange sp = [head rangeOfString:@"·"];
-        if (sp.location == NSNotFound) return head.length == 1;
-        head = [[head substringFromIndex:sp.location + 1]
-                stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceCharacterSet]];
-    }
-    if (!head.length || head.length > 3) return NO;
-    NSCharacterSet *notDigit = [[NSCharacterSet decimalDigitCharacterSet] invertedSet];
-    return [head rangeOfCharacterFromSet:notDigit].location == NSNotFound;
-}
-
-static BOOL SLProfLooksLikeIP(NSString *t) {
-    return [t hasPrefix:@"IP属地"] && t.length <= 20;
-}
-
-// 资料 chip（昵称下面那排小胶囊）由 SLProfFixHeaderChips 一个人管：
-// 标了记号的视图，文本 map 那两条路一律不碰 —— 否则 map 会把「女」和「26岁」两颗
-// 都写成「男 · 99岁」，挤在一颗胶囊里显示不全（用户截图就是这个）。
-static char kSLChipKey;
-
-static BOOL SLProfIsChipView(UIView *v) {
-    for (int i = 0; i < 6 && v; i++, v = v.superview)
-        if (objc_getAssociatedObject(v, &kSLChipKey)) return YES;
-    return NO;
-}
-
-static BOOL SLProfApplyTextMapDepth(UIView *root, NSDictionary *map, NSString *ageTxt, int depth) {
-    if (!root || depth > 8 || sSLTextMapBusy) return NO;
-    BOOL hit = NO;
-    for (UIView *v in [root.subviews copy]) {
-        if (SLProfIsChipView(v)) continue;
-        NSString *t = SLProfTextOfView(v);
-        if (t.length) {
-            NSString *nv = map[t];
-            if (!nv.length && ageTxt.length && SLProfLooksLikeAge(t)) nv = ageTxt;
-            if (nv.length && ![nv isEqualToString:t]) {
-                if (SLProfSetTextOfView(v, nv)) hit = YES;
-            }
-        }
-        if (SLProfApplyTextMapDepth(v, map, ageTxt, depth + 1)) hit = YES;
-    }
-    return hit;
-}
-
-static BOOL SLProfApplyTextMap(UIView *root, NSDictionary *map, NSString *ageTxt) {
-    if (!root || sSLTextMapBusy) return NO;
-    sSLTextMapBusy = YES;
-    BOOL hit = SLProfApplyTextMapDepth(root, map, ageTxt, 0);
-    sSLTextMapBusy = NO;
-    return hit;
-}
-
-static void SLProfApplyAgeLocation(id cell) {
-    if (!SLProfGateLoose()) return;
-    if (sSLProfKindVal != 1 && !sSLProfOnMePage) return;
-
-    NSString *ageTxt = SLProfAgeGenderText();
-    // 先按老名字改（38/39 早期版本就是这几个 ivar，最快最准）
-    SLProfSetBtnText(SLProfCallObj(cell, @"genderAndAgeButton"), ageTxt);
-    NSString *loc = SLExtraStr(@"city") ?: SLExtraStr(@"location");
-    SLProfSetBtnText(SLProfCallObj(cell, @"locationBtn"), loc);
-    SLProfSetBtnText(SLProfCallObj(cell, @"ipLocationBtn"), SLExtraStr(@"ipLocation"));
-    SLProfSetBtnText(SLProfCallObj(cell, @"schoolBtn"), SLExtraStr(@"schoolName"));
-
-    // 再按内容改：版本换了控件名 / 换成纯 label 也照样对得上
-    if (![cell isKindOfClass:[UIView class]]) return;
-    NSDictionary *map = SLProfRealTextMap();
-    if (!map.count && !ageTxt.length) return;
-    if (SLProfApplyTextMap(cell, map, ageTxt)) {
-        static BOOL sLogged = NO;
-        if (!sLogged) { sLogged = YES; SLLog(@"PROF| 已按文本改写年龄 / 地区 / 学校"); }
-    }
-}
-
-static int sSLAgeLocHooks = 0;      // configWithHeaderContext: 被调了几次（诊断用）
-
-static void (*o_ageLocConfig)(id, SEL, id);
-static void h_ageLocConfig(id self, SEL _cmd, id ctx) {
-    sSLAgeLocHooks++;
-    if (o_ageLocConfig) o_ageLocConfig(self, _cmd, ctx);
-    SLProfApplyAgeLocation(self);
-}
-
-// cell 往往比「认出我页」先配好，进页后再按类名找一遍补上
-static void SLProfFindAgeLocCells(UIView *root, NSMutableArray *out) {
-    if (!root || out.count > 20) return;
-    NSString *cn = NSStringFromClass([root class]);
-    // 类名换过几次（AgeAndLocation / AgeLocation），按关键词认
-    if ([cn containsString:@"AgeAndLocation"] || [cn containsString:@"AgeLocation"]) {
-        [out addObject:root];
-        return;
-    }
-    for (UIView *v in [root.subviews copy]) SLProfFindAgeLocCells(v, out);
-}
-
-// 「我」页顶部那一块（header）才允许改写文本：作品网格里的标题、文案一律不碰。
-// 0.9.6 之前是全窗口扫 + 泛匹配，作品标题里带「岁」「男」「女」都会被误改。
-static BOOL SLProfInHeaderArea(UIView *v, UIWindow *win) {
-    if (!v || !win || !v.window) return NO;
-    CGRect r = [v convertRect:v.bounds toView:win];
-    if (r.size.width <= 1 || r.size.height <= 1) return NO;
-    return CGRectGetMinY(r) < CGRectGetHeight(win.bounds) * 0.58;
-}
-
-// header 以下的子树直接剪掉（作品网格有几百个 cell，每 0.8 秒全量递归太重）。
-// 滚动容器本身要下去 —— header 就躺在 collectionView 里。
-static BOOL SLProfShouldDescend(UIView *v, UIWindow *win) {
-    if (!v || !v.window) return NO;
-    if ([v isKindOfClass:[UIScrollView class]]) return YES;
-    CGRect r = [v convertRect:v.bounds toView:win];
-    if (r.size.height <= 0) return YES;
-    return CGRectGetMinY(r) < CGRectGetHeight(win.bounds) * 0.58;
-}
-
-static void SLProfDumpHeaderTexts(UIView *root, UIWindow *win, NSMutableArray *out, int depth) {
-    if (!root || !win || depth > 14 || out.count >= 14) return;
-    for (UIView *v in [root.subviews copy]) {
-        if ([NSStringFromClass([v class]) hasPrefix:@"SL"]) continue;
-        NSString *t = SLProfTextOfView(v);
-        if (t.length && t.length <= 14 && SLProfInHeaderArea(v, win) && ![out containsObject:t])
-            [out addObject:t];
-        if (SLProfShouldDescend(v, win)) SLProfDumpHeaderTexts(v, win, out, depth + 1);
-    }
-}
-
-static BOOL SLProfApplyAgeLocTextDepth(UIView *root, NSDictionary *map, NSString *ageTxt,
-                                       NSString *ipTxt, UIWindow *win, int depth) {
-    if (!root || !win || depth > 14) return NO;
-    BOOL hit = NO;
-    for (UIView *v in [root.subviews copy]) {
-        if ([NSStringFromClass([v class]) hasPrefix:@"SL"]) continue;
-        if (SLProfIsChipView(v)) continue;
-        NSString *t = SLProfTextOfView(v);
-        if (t.length && SLProfInHeaderArea(v, win)) {
-            NSString *nv = map[t];
-            if (!nv.length && ageTxt.length && SLProfLooksLikeAge(t)) nv = ageTxt;
-            if (!nv.length && ipTxt.length && SLProfLooksLikeIP(t)) nv = ipTxt;
-            if (nv.length && ![nv isEqualToString:t] && SLProfSetTextOfView(v, nv)) hit = YES;
-        }
-        if (SLProfShouldDescend(v, win) &&
-            SLProfApplyAgeLocTextDepth(v, map, ageTxt, ipTxt, win, depth + 1)) hit = YES;
-    }
-    return hit;
-}
-
-// 39.9.0 的「我」页里，性别 / 地区根本不是 AgeAndLocation 那个 cell（日志里永远是 0 个），
-// 而是昵称下面那一排 chips：
-//     [中国台湾]  [+ 添加性别等标签]
-//     [女]        [+ 添加所在地等标签]
-// 这些小方块是抖音按 model 现拼的，拼完就缓存成标题，所以我们挂的 getter 追不上。
-// 这里换个思路：找到「+ 添加XX等标签」那颗按钮，它和资料 chip 是同一个父视图下的兄弟，
-// 把兄弟里不是按钮的那几个按内容认出来直接改字。
-//   · 文本是「男 / 女 / NN岁 / 女 · NN岁」→ 换成设置里的性别年龄
-//   · 其余短文本 → 换成设置里的地区
-static NSString *SLProfFirstTextIn(UIView *v, int depth) {
-    NSString *t = SLProfTextOfView(v);
-    if (t.length) return t;
-    if (depth <= 0) return nil;
-    for (UIView *s in v.subviews) {
-        NSString *r = SLProfFirstTextIn(s, depth - 1);
-        if (r.length) return r;
-    }
-    return nil;
-}
-
-static BOOL SLProfSetFirstTextIn(UIView *v, NSString *text, int depth) {
-    if (!text.length) return NO;
-    if (SLProfSetTextOfView(v, text)) return YES;
-    if (depth <= 0) return NO;
-    for (UIView *s in v.subviews) if (SLProfSetFirstTextIn(s, text, depth - 1)) return YES;
-    return NO;
-}
-
-static UILabel *SLProfFirstLabelIn(UIView *v, int depth) {
-    if ([v isKindOfClass:[UILabel class]]) return (UILabel *)v;
-    if ([v isKindOfClass:[UIButton class]]) {
-        UILabel *t = ((UIButton *)v).titleLabel;
-        if (t) return t;
-    }
-    if (depth <= 0) return nil;
-    for (UIView *s in v.subviews) {
-        UILabel *l = SLProfFirstLabelIn(s, depth - 1);
-        if (l) return l;
-    }
-    return nil;
-}
-
-// 改完字以后把胶囊的宽度放开。
-// 39.9.0 的胶囊是「固定宽度 + 背景图」，字数一变就截一半 —— 用户说的
-// 「地区背景不会根据伪装的字数更改长度」就是这个。三条一起上：
-//   ① 宽度约束常数改成「文字宽 + 内边距」  ② 撑不动的（frame 布局）直接改 frame 和背景
-//   ③ label 打开 adjustsFontSizeToFitWidth，实在改不动也不截成「…」
-static void SLProfFitChip(UIView *chip, NSString *text) {
-    if (!chip || !text.length) return;
-    UILabel *lab = SLProfFirstLabelIn(chip, 4);
-    UIFont *font = lab.font ?: [UIFont systemFontOfSize:12];
-    if (lab) {
-        lab.numberOfLines = 1;
-        lab.adjustsFontSizeToFitWidth = YES;
-        if (lab.minimumScaleFactor > 0.8 || lab.minimumScaleFactor <= 0.01)
-            lab.minimumScaleFactor = 0.8;
-    }
-    CGFloat need = ceil([text sizeWithAttributes:@{NSFontAttributeName: font}].width) + 18.0;
-
-    NSMutableArray *cs = [NSMutableArray array];
-    [cs addObjectsFromArray:chip.constraints];
-    if (chip.superview) [cs addObjectsFromArray:chip.superview.constraints];
-    for (NSLayoutConstraint *c in cs) {
-        if (c.firstAttribute != NSLayoutAttributeWidth) continue;
-        if (c.firstItem != chip) continue;
-        if (c.relation != NSLayoutRelationEqual) continue;
-        if (c.constant < need) { c.constant = need; [chip setNeedsLayout]; }
-    }
-
-    if (chip.translatesAutoresizingMaskIntoConstraints) {
-        CGRect f = chip.frame;
-        if (f.size.width > 0.5 && f.size.width < need) {
-            chip.frame = CGRectMake(f.origin.x, f.origin.y, need, f.size.height);
-            for (UIView *s in chip.subviews) {
-                CGRect sf = s.frame;
-                if (sf.size.width <= 0.5 || sf.size.width >= need) continue;
-                if ([s isKindOfClass:[UIImageView class]] || [s isKindOfClass:[UILabel class]] ||
-                    [NSStringFromClass([s class]) rangeOfString:@"Background"].location != NSNotFound)
-                    s.frame = CGRectMake(sf.origin.x, sf.origin.y, need, sf.size.height);
-            }
-        }
-    }
-    [chip.superview setNeedsLayout];
-}
-
-// 这颗 chip 的原文该改成什么：
-//   「女」        → 只写性别
-//   「26岁」      → 只写年龄
-//   「女 · 26岁」 → 两样一起
-//   其它短文本    → 地区（「中国台湾」这种）
-static NSString *SLProfChipWantText(NSString *t, NSString *genderWord, NSString *ageWord,
-                                    NSString *regionTxt, NSString *bothTxt) {
-    if (!t.length) return nil;
-    BOOL hasAge = SLProfLooksLikeAge(t);
-    BOOL hasGender = [t hasPrefix:@"男"] || [t hasPrefix:@"女"];
-    if (hasAge && hasGender) return bothTxt;
-    if (hasAge) return ageWord;
-    if (hasGender) return genderWord;
-    return regionTxt;
-}
-
-static BOOL SLProfFixHeaderChips(UIView *root, NSString *genderWord, NSString *ageWord,
-                                 NSString *regionTxt, NSString *bothTxt, int depth) {
-    if (!root || depth > 16 || sSLTextMapBusy) return NO;
-    BOOL hit = NO;
-    for (UIView *v in [root.subviews copy]) {
-        if ([NSStringFromClass([v class]) hasPrefix:@"SL"]) continue;
-        NSString *t = SLProfTextOfView(v);
-        if (t.length && [t containsString:@"添加"] && [t containsString:@"标签"]) {
-            UIView *row = v.superview;
-            if (row) {
-                for (UIView *chip in [row.subviews copy]) {
-                    if (chip == v) continue;
-                    NSString *ct = SLProfFirstTextIn(chip, 3);
-                    if (!ct.length || [ct containsString:@"添加"]) continue;
-                    objc_setAssociatedObject(chip, &kSLChipKey, @(YES), OBJC_ASSOCIATION_RETAIN);
-                    NSString *want = SLProfChipWantText(ct, genderWord, ageWord, regionTxt, bothTxt);
-                    if (!want.length || [want isEqualToString:ct]) {
-                        SLProfFitChip(chip, ct.length ? ct : want);   // 文本没变也把宽度放开
-                        continue;
-                    }
-                    if (SLProfSetFirstTextIn(chip, want, 3)) {
-                        SLProfFitChip(chip, want);
-                        hit = YES;
-                        SLLog(@"CHIP| 「%@」→「%@」", ct, want);
-                    }
-                }
-            }
-        }
-        if (SLProfFixHeaderChips(v, genderWord, ageWord, regionTxt, bothTxt, depth + 1)) hit = YES;
-    }
-    return hit;
-}
-
-static BOOL sSLAgelocBusy = NO;
-
-static void SLProfApplyAgeLocationNow(void) {
-    if (!SLProfGateLoose()) return;
-    if (sSLAgelocBusy) return;
-    sSLAgelocBusy = YES;
-
-    NSMutableArray *cells = [NSMutableArray array];
-    @try {
-        for (UIScene *sce in [[UIApplication sharedApplication].connectedScenes copy]) {
-            if (![sce isKindOfClass:[UIWindowScene class]]) continue;
-            for (UIWindow *w in [((UIWindowScene *)sce).windows copy]) SLProfFindAgeLocCells(w, cells);
-        }
-        for (id c in [cells copy]) SLProfApplyAgeLocation(c);
-
-        // 真机 39.9.0 上那个 AgeAndLocation cell 根本没被创建（日志：cell 0 个 · 回调 0 次），
-        // 所以不能只认类名。这里直接在「我页」header 区域按**内容**改：
-        // 只有整串等于真实值、或者长得像「26岁 / 女 · 26岁 / IP属地」的文本才动。
-        UIWindow *win = nil;
-        for (UIScene *sce in [[UIApplication sharedApplication].connectedScenes copy]) {
-            if (![sce isKindOfClass:[UIWindowScene class]]) continue;
-            for (UIWindow *w in ((UIWindowScene *)sce).windows) {
-                if (w.isKeyWindow) { win = w; break; }
-            }
-            if (win) break;
-        }
-        UIViewController *meVC = nil;
-        for (UIScene *sce in [[UIApplication sharedApplication].connectedScenes copy]) {
-            if (![sce isKindOfClass:[UIWindowScene class]]) continue;
-            for (UIWindow *w in [((UIWindowScene *)sce).windows copy]) {
-                NSMutableArray *vcs = [NSMutableArray array];
-                SLProfCollectVCs(w.rootViewController, vcs);
-                for (UIViewController *vc in vcs) {
-                    if (SLProfKindFromVC(vc) == 1 && vc.isViewLoaded) { meVC = vc; break; }
-                }
-                if (meVC) break;
-            }
-            if (meVC) break;
-        }
-
-        NSString *ageTxt = SLProfAgeGenderText();
-        NSString *ipTxt = SLExtraStr(@"ipLocation");
-        if (ipTxt.length && ![ipTxt hasPrefix:@"IP属地"])
-            ipTxt = [@"IP属地：" stringByAppendingString:ipTxt];
-        NSString *regionTxt = SLExtraStr(@"city") ?: SLExtraStr(@"location");
-        // chips 那一排（截图里的「中国台湾 / + 添加性别等标签」）必须**先**改：
-        // 它一改完就把视图标上记号，下面文本 map 那条路就会绕开它们。
-        // 反过来先跑 map，「女」和「26岁」都会被写成「男 · 99岁」，挤成一颗。
-        if (meVC) {
-            NSString *gw = SLProfGenderWord();
-            NSString *aw = SLProfAgeWord();
-            if (gw.length || aw.length || regionTxt.length) {
-                BOOL chips = SLProfFixHeaderChips(meVC.view, gw, aw, regionTxt, ageTxt, 0);
-                if (chips) {
-                    static BOOL sChipLogged = NO;
-                    if (!sChipLogged) { sChipLogged = YES;
-                        SLLog(@"PROF| 已改写资料标签（性别=%@ 年龄=%@ 地区=%@ 合并=%@）",
-                              gw ?: @"不动", aw ?: @"不动", regionTxt ?: @"不动", ageTxt ?: @"不动"); }
-                }
-            }
-        }
-        NSDictionary *map = SLProfRealTextMap();
-        if (meVC && win && (map.count || ageTxt.length)) {
-            if (SLProfApplyAgeLocTextDepth(meVC.view, map, ageTxt, ipTxt, win, 0)) {
-                static BOOL sWriteLogged = NO;
-                if (!sWriteLogged) { sWriteLogged = YES;
-                    SLLog(@"PROF| 已在 header 按文本改写年龄 / 地区 / IP"); }
-            }
-        }
-
-        // 诊断：cells=0 说明那个类没被创建；把 header 里的短文本 dump 出来，
-        // 下次就能看到页面到底显示的是「女 · 26岁」还是别的写法，不用再猜。
-        static BOOL sLogged = NO;
-        if (!sLogged && (cells.count > 0 || sSLTickCount > 10)) {
-            sLogged = YES;
-            NSMutableArray *texts = [NSMutableArray array];
-            if (meVC && win) SLProfDumpHeaderTexts(meVC.view, win, texts, 0);
-            SLLog(@"PROF| 年龄地区 cell %lu 个 · 配置回调 %d 次 · 性别=%@ 年龄=%@ 地区=%@ IP=%@ 学校=%@",
-                  (unsigned long)cells.count, sSLAgeLocHooks,
-                  SLProfStr(SLProfKeyGender) ?: @"无", SLProfStr(SLProfKeyAge) ?: @"无",
-                  SLExtraStr(@"city") ?: @"无", SLExtraStr(@"ipLocation") ?: @"无",
-                  SLExtraStr(@"schoolName") ?: @"无");
-            SLLog(@"PROF| header 文本样本：%@", texts.count ? [texts componentsJoinedByString:@" | "] : @"（空）");
-        }
-    } @finally {
-        sSLAgelocBusy = NO;
-    }
-}
 
 #pragma mark - 图片下载 / 直接改图（可还原）
 //
@@ -2334,13 +1692,6 @@ static NSString *SLProfObjText(id v) {
     return nil;
 }
 
-// 私密作品不再从 dataSource 里删（条数一变 IGListKit 就炸），
-// 所以判私密这件事挪到界面上做，这里不再需要。
-
-static BOOL SLProfHidePrivateOn(void) {
-    return SLProfBool(SLProfKeyHidePriv, NO);
-}
-
 // 每个 data manager 建出来时就知道它属于谁，挂到自己身上带走
 static id (*o_postsInit)(id, SEL, id, id);
 static id h_postsInit(id self, SEL _cmd, id uid, id sec) {
@@ -2377,9 +1728,13 @@ static void h_postsSetDS(id self, SEL _cmd, id ds) {
         if (n) SLLog(@"WORKS| 记住 %@ 的作品列表（%@，%lu 条）", uid,
                      NSStringFromClass([ds class]), (unsigned long)n);
     }
-    // 列表一到先挂统计模型 / 改字典 —— 那会儿 cell 还没配置，赶得上首屏
+    // 列表一到先挂统计模型 / 改写播放量 —— 那会儿 cell 还没配置，赶得上首屏
     if (ds) SLProfSpoofPlayInList(ds);
-    if (o_postsSetDS) o_postsSetDS(self, _cmd, ds);
+    // 切号后抖音会把新账号的第一页 append 到旧账号那份列表后面（日志里 9 条变 21 条）。
+    // 在**装进 dataSource 之前**把不是伪装对象的条目剔掉：这样 collectionView 拿到的
+    // 始终是一份自洽的数组，diff 走正常的删除/插入，不会出现「条数对不上」的硬崩。
+    id out = ds ? SLProfFilterPostsFor(ds, self) : ds;
+    if (o_postsSetDS) o_postsSetDS(self, _cmd, out);
 }
 
 // 这个 manager 是不是「我」的。
@@ -2408,9 +1763,24 @@ static NSString *SLProfPostsOwner(id mgr) {
 // 列表 9 条永远是他 —— 只能重启。
 // 归属和当前账号对不上，就说明这个管理器是跨号复用的，归属已经过期：
 // 按当前账号读，当前账号没存预设才退回旧归属。
+// 这个 uid 是不是「我们自己登录过的号」。
+// 0.9.11 的关键修复：别的用户的作品管理器，owner 也是别人的 uid、也跟当前账号不相等，
+// 原来一律当成「归属过期」而套上**当前账号**的作品源 —— 结果点开任何人的主页，
+// 作品都被换成了我们伪装对象的那一套。只有 owner 名下真的存过预设（说明这个号是我们
+// 自己登录并配置过的）才允许走「过期改按当前账号」这条路。
+static BOOL SLProfAcctHasPreset(NSString *uid) {
+    if (!uid.length) return NO;
+    return SLProfStrForUID(SLProfKeyNickname, uid).length
+        || SLProfStrForUID(SLProfKeyWant, uid).length
+        || SLProfStrForUID(SLProfKeyUID, uid).length
+        || SLProfStrForUID(SLProfKeySignature, uid).length
+        || SLProfStrForUID(SLProfKeyAvatar, uid).length;
+}
+
 static NSString *SLProfWorkWantFor(id mgr) {
     NSString *owner = SLProfPostsOwner(mgr);
     if (owner.length && sSLCurAcct.length && ![owner isEqualToString:sSLCurAcct]) {
+        if (!SLProfAcctHasPreset(owner)) return nil;        // 别人主页的管理器：一个字都不改
         NSString *mine = SLProfStrForUID(SLProfKeyWant, sSLCurAcct);
         if (mine.length) {
             static NSString *sLastMine = nil;
@@ -2429,6 +1799,7 @@ static NSString *SLProfWorkWantFor(id mgr) {
 static NSString *SLProfWorkSecFor(id mgr) {
     NSString *owner = SLProfPostsOwner(mgr);
     if (owner.length && sSLCurAcct.length && ![owner isEqualToString:sSLCurAcct]) {
+        if (!SLProfAcctHasPreset(owner)) return nil;        // 同上：别人主页不换 sec
         NSString *mine = SLProfStrForUID(SLProfKeySec, sSLCurAcct);
         if (mine.length) return mine;
     }
@@ -2452,6 +1823,52 @@ static BOOL SLProfPostsSpoofOn(id mgr) {
     if (!SLProfPostsIsMine(mgr)) return NO;
     if (sSLProfMyUID.length && [want isEqualToString:sSLProfMyUID]) return NO;
     return sSLProfMyUID.length > 0;
+}
+
+// 一条作品属于谁（author.uid）
+static NSString *SLProfAwemeAuthorUID(id aweme) {
+    id a = SLProfCallObj(aweme, @"author");
+    id u = a ? SLProfCallObj(a, @"uid") : nil;
+    if ([u isKindOfClass:[NSString class]]) return [(NSString *)u length] ? u : nil;
+    if ([u isKindOfClass:[NSNumber class]]) return [(NSNumber *)u stringValue];
+    return nil;
+}
+
+// 切号残留清理：只保留「想要的那个 uid」的作品。
+// 认不出作者的条目一律留着（宁可少剔，不能把正常作品误删）。
+static id SLProfFilterPostsFor(id ds, id mgr) {
+    if (![ds isKindOfClass:[NSArray class]]) return ds;
+    NSArray *arr = (NSArray *)ds;
+    if (!arr.count) return ds;
+    if (!SLProfPostsSpoofOn(mgr)) return ds;
+    NSString *want = SLProfWorkWantFor(mgr);
+    if (!want.length) return ds;
+    NSMutableArray *keep = [NSMutableArray arrayWithCapacity:arr.count];
+    NSUInteger drop = 0;
+    for (id it in arr) {
+        NSString *a = SLProfAwemeAuthorUID(it);
+        if (!a.length || [a isEqualToString:want]) [keep addObject:it];
+        else drop++;
+    }
+    if (!drop) return ds;
+    // 一条都对不上 = 这大概率不是作品 tab（私密 / 喜欢 各有各的管理器），
+    // 清空只会把那个 tab 弄成白板 —— 这时一律不动，只在日志里说一声。
+    if (!keep.count) {
+        static int sNoneN = 0;
+        if (sNoneN < 4) {
+            sNoneN++;
+            SLLog(@"WORKS| 这 %lu 条都不是 %@ 的，不动它（不是作品 tab 就别管）",
+                  (unsigned long)arr.count, want);
+        }
+        return ds;
+    }
+    static int sLogN = 0;
+    if (sLogN < 8) {
+        sLogN++;
+        SLLog(@"WORKS| 列表里混了 %lu 条不是 %@ 的（切号残留），装进去之前剔掉，还剩 %lu 条",
+              (unsigned long)drop, want, (unsigned long)keep.count);
+    }
+    return [keep mutableCopy];
 }
 
 static id (*o_postsUID)(id, SEL);
@@ -2721,11 +2138,14 @@ static long long SLProfOrigPlay(id self, SEL _cmd) {
 }
 
 // 只在「我页伪装别人」期间生效；别人主页（kind == -1）一条都不动
+// 门放开一点：只要「本账号存过作品源」就算数，不再依赖巡检那一拍是否已经写好 sSLWorkWant。
+// 0.9.10 的日志里 `PLAY| 统计对象是 AWEAwemeStatisticsModel · 首条播放 0` 就是被这道门
+// 挡掉的（那一拍 sSLWorkWant 还是空），于是推算逻辑一次都没跑。
 static BOOL SLProfPlaySpoofOn(void) {
     if (!SLProfWorksEnabled()) return NO;
-    if (!sSLWorkWant.length) return NO;
     if (sSLProfKindVal == -1) return NO;
-    return YES;
+    if (sSLWorkWant.length) return YES;
+    return SLProfStr(SLProfKeyWant).length > 0;
 }
 
 // KVC 取标量：不关心它是 long long / int / NSNumber；字典的 key 也走同一条路
@@ -2839,6 +2259,28 @@ static void SLProfSpoofPlayInList(id ds) {
             if (want > cur) {
                 @try { [(NSMutableDictionary *)stats setObject:@(want) forKey:@"play_count"]; }
                 @catch (__unused NSException *e) {}
+            }
+        } else {
+            // 模型版本：光挂 getter 不够 —— 39.9.0 的封面不读 playCount，读的是解析时就
+            // 算好的那份。这里直接把值写进对象，cell 配的时候就是新数字了。
+            long long cur = SLProfStatsNum(stats, @"playCount");
+            if (cur <= 0) cur = SLProfStatsNum(stats, @"play_count");
+            if (cur <= 0) {
+                long long want = SLProfFakePlayFor(stats, cur);
+                BOOL ok = NO;
+                @try { [stats setValue:@(want) forKey:@"playCount"]; ok = YES; }
+                @catch (__unused NSException *e) {}
+                @try {
+                    if ([stats respondsToSelector:NSSelectorFromString(@"setPlayCountStr:")])
+                        [stats setValue:SLProfFormatCount(want) forKey:@"playCountStr"];
+                } @catch (__unused NSException *e) {}
+                static int sWriteN = 0;
+                if (sWriteN < 8) {
+                    sWriteN++;
+                    long long after = SLProfStatsNum(stats, @"playCount");
+                    SLLog(@"PLAY| 已把播放写成 %lld（原 0 · %@ · 读回 %lld）",
+                          want, ok ? @"写模型" : @"只挂了 getter", after);
+                }
             }
         }
     }
@@ -3021,178 +2463,6 @@ static void SLProfPaintAvatar(void) {
     if (!sPainted) { sPainted = YES; SLLog(@"AVATAR| 已把 %.0fpt 的头像换成对方的", w); }
 }
 
-
-// 「隐藏私密作品」除了过滤 dataSource，页面上那个「私密作品」入口也要收起，
-// 否则点进去还是自己真实的私密列表。
-static int sSLPrivHits = 0;         // 这一轮扫到几个含「私密」的控件（诊断用）
-static void SLProfHidePrivateIn(UIView *root);
-static void SLProfHidePrivateUI(void) {
-    if (!SLProfHidePrivateOn()) return;
-    // 面板拨开关时页面正被我们自己的浮窗盖着（kind 会被算成 0），
-    // 所以这里用「我页出现过」的松门，别只认 kind==1
-    if (!sSLProfOnMePage && sSLProfKindVal != 1) return;
-    sSLPrivHits = 0;
-    for (UIScene *sce in [[UIApplication sharedApplication].connectedScenes copy]) {
-        if (![sce isKindOfClass:[UIWindowScene class]]) continue;
-        for (UIWindow *w in [((UIWindowScene *)sce).windows copy]) SLProfHidePrivateIn(w);
-    }
-    // 开关开着却一条都没命中，说明界面上那排根本没有「私密」这两个字
-    // （账号没有私密作品时抖音就不显示这个 tab）—— 不是我们没干活。
-    static BOOL sScanLogged = NO;
-    if (!sScanLogged && sSLPrivHits == 0) {
-        sScanLogged = YES;
-        SLLog(@"PROF| 私密扫描：界面上没有带「私密」的控件（可能这个账号没有私密作品）");
-    }
-}
-
-// 我们自己面板里的「隐藏私密作品」这一行也带「私密」两个字 —— 别把自己的开关藏了
-static BOOL SLProfInOwnView(UIView *v) {
-    for (UIView *p = v; p; p = p.superview) {
-        if ([NSStringFromClass([p class]) hasPrefix:@"SL"]) return YES;
-        UIResponder *r = p.nextResponder;
-        if ([r isKindOfClass:[UIViewController class]] &&
-            [NSStringFromClass([r class]) hasPrefix:@"SL"]) return YES;
-    }
-    return NO;
-}
-
-// 只设 hidden 会留一个空洞（那个 tab 仍占着宽度）。
-// 这里把宽度压到 0，并挂一次父容器的 layoutSubviews —— 否则它下次重排又把宽度算回来，
-// 屏幕上就是「藏一下 → 闪回来 → 再藏」，比不藏还难看。
-static char kSLPrivVictimKey;
-static char kSLPrivOrigWKey;
-static char kSLPrivBarKey;     // 这一条不是 tab，是「作品/私密」整条栏 → 压高度
-static BOOL sSLPrivBusy = NO;
-static NSMutableDictionary *sSLPrivOrigIMPs = nil;   // 类名 -> 原 layoutSubviews
-
-static void (*SLPrivOrigLayout(Class c))(id, SEL) {
-    if (!sSLPrivOrigIMPs) return NULL;
-    NSValue *v = sSLPrivOrigIMPs[NSStringFromClass(c)];
-    return v ? (void (*)(id, SEL))[v pointerValue] : NULL;
-}
-
-static void SLProfCollapseVictim(UIView *container) {
-    UIView *victim = objc_getAssociatedObject(container, &kSLPrivVictimKey);
-    if (!victim || victim.superview != container) return;
-    if (!victim.hidden) victim.hidden = YES;
-    victim.alpha = 0;
-    victim.userInteractionEnabled = NO;
-    CGRect r = victim.frame;
-    if (objc_getAssociatedObject(victim, &kSLPrivBarKey)) {
-        // 整条栏：只压高度，宽度留着，免得把下面的九宫格横向挤动
-        if (r.size.height > 0.5) victim.frame = CGRectMake(r.origin.x, r.origin.y, r.size.width, 0);
-        return;
-    }
-    if (r.size.width > 0.5) victim.frame = CGRectMake(r.origin.x, r.origin.y, 0, r.size.height);
-}
-
-static void h_privContainerLayout(id self, SEL _cmd) {
-    void (*orig)(id, SEL) = SLPrivOrigLayout(object_getClass(self));
-    if (orig) orig(self, _cmd);
-    if (sSLPrivBusy) return;
-    if (!objc_getAssociatedObject(self, &kSLPrivVictimKey)) return;
-    sSLPrivBusy = YES;
-    @try { SLProfCollapseVictim(self); } @catch (__unused NSException *e) { }
-    sSLPrivBusy = NO;
-}
-
-static void SLProfHookPrivContainer(Class c) {
-    if (!c) return;
-    if (!sSLPrivOrigIMPs) sSLPrivOrigIMPs = [NSMutableDictionary dictionary];
-    NSString *cn = NSStringFromClass(c);
-    if (sSLPrivOrigIMPs[cn]) return;
-    Method m = SLProfExact(c, @selector(layoutSubviews));
-    if (!m) return;
-    IMP o = method_getImplementation(m);
-    if (o == (IMP)h_privContainerLayout) return;
-    sSLPrivOrigIMPs[cn] = [NSValue valueWithPointer:o];
-    method_setImplementation(m, (IMP)h_privContainerLayout);
-}
-
-// 把「作品 / 私密」那条分段栏整条收掉。
-// 只藏着「私密」那颗的话，栏本身的高度还在，屏幕上就是一块空白（用户说的「空的区域」）。
-static void SLProfCollapseBar(UIView *bar) {
-    if (!bar) return;
-    objc_setAssociatedObject(bar, &kSLPrivBarKey, @(YES), OBJC_ASSOCIATION_RETAIN);
-    bar.alpha = 0;
-    for (NSLayoutConstraint *c in bar.constraints)
-        if (c.firstAttribute == NSLayoutAttributeHeight && c.constant > 0.5) c.constant = 0;
-    CGRect f = bar.frame;
-    if (f.size.height > 0.5) bar.frame = CGRectMake(f.origin.x, f.origin.y, f.size.width, 0);
-    UIView *box = bar.superview;
-    if (box) {
-        objc_setAssociatedObject(box, &kSLPrivVictimKey, bar, OBJC_ASSOCIATION_ASSIGN);
-        SLProfHookPrivContainer(object_getClass(box));
-    }
-    static BOOL sBarLogged = NO;
-    if (!sBarLogged) { sBarLogged = YES;
-        SLLog(@"PROF| 已把「作品/私密」那条栏整条压平（只剩一个 tab，留着就是一块空白）"); }
-}
-
-static void SLProfHidePrivateInDepth(UIView *root, int depth) {
-    if (!root || root.hidden || depth > 40) return;
-    if (SLProfInOwnView(root)) return;
-    NSString *t = nil;
-    if ([root isKindOfClass:[UILabel class]]) t = ((UILabel *)root).text;
-    else if ([root isKindOfClass:[UIButton class]])
-        t = [((UIButton *)root) titleForState:UIControlStateNormal];
-    if (t.length && [t containsString:@"私密"]) {
-        sSLPrivHits++;
-        UIView *anc = root, *target = nil;
-        for (int i = 0; i < 6 && anc.superview; i++) {
-            anc = anc.superview;
-            if ([anc isKindOfClass:NSClassFromString(@"UICollectionViewCell")] ||
-                [anc isKindOfClass:NSClassFromString(@"UITableViewCell")]) { target = anc; break; }
-            // 不是 cell 的话，退到「只包着这一小截」的容器就停（比如「作品 / 私密」那个分段）
-            if (!target && CGRectGetWidth(anc.bounds) < 220 && CGRectGetHeight(anc.bounds) < 90)
-                target = anc;
-        }
-        UIView *hide = target ?: root.superview ?: root;
-        hide.hidden = YES;
-        hide.alpha = 0;
-        // 只藏不留洞：整行的那种连高度一起压 0（只压宽度会留下一条空白横带，很难看）；
-        // 分段控件里的 tab 只压宽度，压高度会把整条挤没。
-        CGRect hf = hide.frame;
-        if (CGRectGetWidth(hf) > 260) {
-            hide.frame = CGRectMake(hf.origin.x, hf.origin.y, 0, 0);
-        } else if (CGRectGetWidth(hf) > 0.5) {
-            hide.frame = CGRectMake(hf.origin.x, hf.origin.y, 0, hf.size.height);
-        }
-        // 小容器（「作品 / 私密」那种分段条）额外盯住父容器的每次 layout
-        UIView *box = hide.superview;
-        if (box && ![box isKindOfClass:[UIStackView class]] &&
-            CGRectGetHeight(box.bounds) < 140 && CGRectGetWidth(box.bounds) < 500) {
-            objc_setAssociatedObject(hide, &kSLPrivOrigWKey,
-                                     @(CGRectGetWidth(hide.frame)), OBJC_ASSOCIATION_RETAIN);
-            objc_setAssociatedObject(box, &kSLPrivVictimKey, hide, OBJC_ASSOCIATION_ASSIGN);
-            SLProfHookPrivContainer(object_getClass(box));
-            SLProfCollapseVictim(box);
-        }
-        // 这条栏里要是只剩一个 tab（就是「作品」），整条一起收掉 —— 不然那块空白还在
-        UIView *bar = hide.superview;
-        if (bar && bar != hide &&
-            CGRectGetHeight(bar.bounds) < 90 && CGRectGetWidth(bar.bounds) < 520) {
-            int alive = 0;
-            for (UIView *s in [bar.subviews copy]) {
-                if (s.hidden || s.alpha < 0.05) continue;
-                if (SLProfFirstTextIn(s, 3).length) alive++;
-            }
-            if (alive <= 1) SLProfCollapseBar(bar);
-        }
-        static BOOL sLogged = NO;
-        if (!sLogged) { sLogged = YES; SLLog(@"PROF| 已隐起「私密作品」入口（整行压平，不留空洞）"); }
-        return;
-    }
-    for (UIView *v in [root.subviews copy]) SLProfHidePrivateInDepth(v, depth + 1);
-}
-
-static void SLProfHidePrivateIn(UIView *root) {
-    @try {
-        SLProfHidePrivateInDepth(root, 0);
-    } @catch (NSException *e) {
-        SLLog(@"PROF| 隐藏私密作品时出了点问题：%@", e.reason ?: @"?");
-    }
-}
 
 #pragma mark - 「伪装主页」（别人主页左上角那颗胶囊）
 //
@@ -3738,8 +3008,6 @@ static void SLProfTick(void) {
     }
 
     SL_TICK_STEP(cover,   SLProfCoverPrefetch(); SLProfForceCover());
-    if (!sSLProfSafeMode) SL_TICK_STEP(ageloc, SLProfApplyAgeLocationNow());
-    if (!sSLProfSafeMode && (sSLTickCount % 2 == 0)) SL_TICK_STEP(priv, SLProfHidePrivateUI());
     if (!sSLProfSafeMode) SL_TICK_STEP(works, SLProfWorksWatch());
     if (sSLTickCount % 4 == 0) SL_TICK_STEP(avatar, SLProfPaintAvatar());
 #undef SL_TICK_STEP
@@ -3903,25 +3171,11 @@ void SLProfileStart(void) {
                          (IMP)h_av300, (IMP *)&o_av300, @"avatar300");
     }
 
-    // 性别 / 年龄 / 地区 / 认证 / 学校：昵称下面那行和认证标识，全部跟着对方走
+    // 认证 / 学校：跟着对方走。
+    // 性别 / 年龄 / 地区整块已按用户要求删除（0.9.11）：设置项、资料标签改写、
+    // header 文本改写、model 上的 getter 钩子全部不再存在，页面上那排就是抖音原样。
     {
         Class u3 = objc_getClass("AWEUserModel");
-        SLProfHookIntGetter(u3, NSSelectorFromString(@"gender"),
-                            (IMP)h_gender, (IMP *)&o_gender, @"gender");
-        SLProfHookIntGetter(u3, NSSelectorFromString(@"userAge"),
-                            (IMP)h_userAge, (IMP *)&o_userAge, @"userAge");
-        SLProfHookGetter(u3, NSSelectorFromString(@"genderDisplayString"),
-                         (IMP)h_genderText, (IMP *)&o_genderText, @"genderDisplayString");
-        SLProfHookGetter(u3, NSSelectorFromString(@"city"),
-                         (IMP)h_city, (IMP *)&o_city, @"city");
-        SLProfHookGetter(u3, NSSelectorFromString(@"province"),
-                         (IMP)h_province, (IMP *)&o_province, @"province");
-        SLProfHookGetter(u3, NSSelectorFromString(@"district"),
-                         (IMP)h_district, (IMP *)&o_district, @"district");
-        SLProfHookGetter(u3, NSSelectorFromString(@"ipLocation"),
-                         (IMP)h_ipLocation, (IMP *)&o_ipLocation, @"ipLocation");
-        SLProfHookGetter(u3, NSSelectorFromString(@"location"),
-                         (IMP)h_location, (IMP *)&o_location, @"location");
         SLProfHookGetter(u3, NSSelectorFromString(@"verifyInfo"),
                          (IMP)h_verifyInfo, (IMP *)&o_verifyInfo, @"verifyInfo");
         SLProfHookGetter(u3, NSSelectorFromString(@"customVerifyInfo"),
@@ -3929,11 +3183,6 @@ void SLProfileStart(void) {
         SLProfHookGetter(u3, NSSelectorFromString(@"schoolName"),
                          (IMP)h_schoolName, (IMP *)&o_schoolName, @"schoolName");
     }
-
-    // 性别 / 年龄 / 地区：主页那一排按钮是 cell 自己拼的标题，配好之后改成对方的
-    SLProfHookOneObjVoid(objc_getClass("AWEProfileHeaderAgeAndLocationCollectionViewCell"),
-                         @"configWithHeaderContext:",
-                         (IMP)h_ageLocConfig, (IMP *)&o_ageLocConfig, @"header.ageLocation");
 
     // 获赞 / 粉丝 / 关注 / 互关：header 统计 cell 收文本的那一环（大数字兜底）
     for (NSString *cn in @[@"AWEProfileHeaderSocialStatisticCollectionViewCell",
@@ -4089,9 +3338,9 @@ void SLProfileStart(void) {
 
 - (NSInteger)tableView:(UITableView *)tv numberOfRowsInSection:(NSInteger)s {
     (void)tv;
-    if (s == 0) return 3;
-    if (s == 1) return 6;      // 昵称/抖音号/简介/性别/年龄/地区
-    return 6;                  // 作品/关注/粉丝/获赞/互关/播放量
+    if (s == 0) return 2;      // 启用 / 模拟作品
+    if (s == 1) return 3;      // 昵称 / 抖音号 / 简介
+    return 5;                  // 作品/关注/粉丝/获赞/互关
 }
 
 - (NSString *)tableView:(UITableView *)tv titleForHeaderInSection:(NSInteger)s {
@@ -4118,13 +3367,11 @@ void SLProfileStart(void) {
         UISwitch *sw = [[UISwitch alloc] initWithFrame:CGRectZero];
         sw.tag = ip.row;
         if (ip.row == 0) sw.on = SLProfileEnabled();
-        else if (ip.row == 1) sw.on = SLProfWorksEnabled();
-        else sw.on = SLProfHidePrivateOn();
+        else sw.on = SLProfWorksEnabled();
         [sw addTarget:self action:@selector(sl_toggle:) forControlEvents:UIControlEventValueChanged];
-        cell.textLabel.text = (ip.row == 0) ? @"启用"
-                            : (ip.row == 1) ? @"模拟作品" : @"隐藏私密作品";
+        cell.textLabel.text = (ip.row == 0) ? @"启用" : @"模拟作品";
         if (ip.row != 0) {
-            cell.detailTextLabel.text = (ip.row == 1) ? @"按对方 id 联网拉取" : @"我页不显示自己的私密";
+            cell.detailTextLabel.text = @"按对方 id 联网拉取";
             cell.detailTextLabel.font = [UIFont systemFontOfSize:12];
             cell.detailTextLabel.textColor = [UIColor tertiaryLabelColor];
         }
@@ -4134,28 +3381,18 @@ void SLProfileStart(void) {
     }
 
     if (ip.section == 1) {
-        NSArray *titles = @[@"昵称", @"抖音号", @"简介", @"性别", @"年龄", @"地区"];
+        NSArray *titles = @[@"昵称", @"抖音号", @"简介"];
         cell.textLabel.text = titles[ip.row];
-        NSString *v = nil;
-        if (ip.row == 3) {
-            NSString *g = SLProfStr(SLProfKeyGender);
-            v = [g isEqualToString:@"1"] ? @"男" : ([g isEqualToString:@"2"] ? @"女" : nil);
-        } else if (ip.row == 4) {
-            v = SLProfStr(SLProfKeyAge);
-        } else if (ip.row == 5) {
-            v = SLExtraStr(@"city") ?: SLExtraStr(@"location");
-        } else {
-            NSArray *keys = @[SLProfKeyNickname, SLProfKeyUID, SLProfKeySignature];
-            v = SLProfStr(keys[ip.row]);
-        }
+        NSArray *keys = @[SLProfKeyNickname, SLProfKeyUID, SLProfKeySignature];
+        NSString *v = SLProfStr(keys[ip.row]);
         cell.detailTextLabel.text = v.length ? v : @"未设置";
         cell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
         return cell;
     }
 
-    NSArray *titles = @[@"作品", @"关注", @"粉丝", @"获赞", @"互关", @"播放量"];
+    NSArray *titles = @[@"作品", @"关注", @"粉丝", @"获赞", @"互关"];
     NSString *key = @[SLProfKeyAweme, SLProfKeyFollowing, SLProfKeyFollower,
-                      SLProfKeyLike, SLProfKeyFriend, SLProfKeyPlay][ip.row];
+                      SLProfKeyLike, SLProfKeyFriend][ip.row];
     cell.textLabel.text = titles[ip.row];
     NSString *v = SLProfStr(key);
     cell.detailTextLabel.text = v.length ? v : @"未设置";
@@ -4167,9 +3404,6 @@ void SLProfileStart(void) {
     switch (sw.tag) {
         case 0: SLProfSetBool(sw.on, SLProfKeyEnabled);  SLLog(@"PROF| 总开关 = %d", sw.on); break;
         case 1: SLProfSetBool(sw.on, SLProfKeyWorks);    SLLog(@"PROF| 模拟作品 = %d", sw.on); break;
-        case 2: SLProfSetBool(sw.on, SLProfKeyHidePriv); SLLog(@"PROF| 隐藏私密作品 = %d", sw.on);
-                if (sw.on) SLProfHidePrivateUI();
-                break;
         default: break;
     }
 }
@@ -4179,54 +3413,27 @@ void SLProfileStart(void) {
 
     if (ip.section == 0) return;
 
-    // 性别：给三个选项，别让用户去记「1 男 2 女」
-    if (ip.section == 1 && ip.row == 3) {
-        UIAlertController *sheet = [UIAlertController alertControllerWithTitle:@"性别"
-                                                                       message:nil
-                                                                preferredStyle:UIAlertControllerStyleActionSheet];
-        void (^setG)(NSString *) = ^(NSString *v) {
-            SLProfSetStr(v, SLProfKeyGender);
-            SLProfSetStr(nil, SLProfKeyGenderTxt);      // 清掉旧拼接串，按新数字重算
-            [self.tableView reloadData];
-            SLLog(@"PROF| 设置 性别 = %@", v.length ? v : @"不显示");
-        };
-        [sheet addAction:[UIAlertAction actionWithTitle:@"男" style:UIAlertActionStyleDefault
-                                               handler:^(__unused UIAlertAction *a) { setG(@"1"); }]];
-        [sheet addAction:[UIAlertAction actionWithTitle:@"女" style:UIAlertActionStyleDefault
-                                               handler:^(__unused UIAlertAction *a) { setG(@"2"); }]];
-        [sheet addAction:[UIAlertAction actionWithTitle:@"不显示" style:UIAlertActionStyleDestructive
-                                               handler:^(__unused UIAlertAction *a) { setG(nil); }]];
-        [sheet addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
-        sheet.popoverPresentationController.sourceView = tv;
-        [self presentViewController:sheet animated:YES completion:nil];
-        return;
-    }
-
     NSString *title = nil, *key = nil;
-    BOOL isArea = NO;
     UIKeyboardType kb = UIKeyboardTypeDefault;
 
     if (ip.section == 1) {
         if (ip.row == 0) { title = @"昵称"; key = SLProfKeyNickname; }
         else if (ip.row == 1) { title = @"抖音号"; key = SLProfKeyUID; }
-        else if (ip.row == 2) { title = @"简介"; key = SLProfKeySignature; }
-        else if (ip.row == 4) { title = @"年龄"; key = SLProfKeyAge; kb = UIKeyboardTypeNumberPad; }
-        else { title = @"地区"; isArea = YES; }
+        else { title = @"简介"; key = SLProfKeySignature; }
     } else {
         if (ip.row == 0) { title = @"作品数"; key = SLProfKeyAweme; kb = UIKeyboardTypeNumberPad; }
         else if (ip.row == 1) { title = @"关注数"; key = SLProfKeyFollowing; kb = UIKeyboardTypeNumberPad; }
         else if (ip.row == 2) { title = @"粉丝数"; key = SLProfKeyFollower; kb = UIKeyboardTypeNumberPad; }
         else if (ip.row == 3) { title = @"获赞数"; key = SLProfKeyLike; kb = UIKeyboardTypeNumberPad; }
-        else if (ip.row == 4) { title = @"互关数"; key = SLProfKeyFriend; kb = UIKeyboardTypeNumberPad; }
-        else { title = @"播放量"; key = SLProfKeyPlay; kb = UIKeyboardTypeNumberPad; }
+        else { title = @"互关数"; key = SLProfKeyFriend; kb = UIKeyboardTypeNumberPad; }
     }
-    if (!key && !isArea) return;
+    if (!key) return;
 
     UIAlertController *ac = [UIAlertController alertControllerWithTitle:title
                                                               message:nil
                                                        preferredStyle:UIAlertControllerStyleAlert];
     [ac addTextFieldWithConfigurationHandler:^(UITextField *tf) {
-        tf.text = isArea ? (SLExtraStr(@"city") ?: SLExtraStr(@"location")) : SLProfStr(key);
+        tf.text = SLProfStr(key);
         tf.keyboardType = kb;
         tf.clearButtonMode = UITextFieldViewModeWhileEditing;
         tf.autocorrectionType = UITextAutocorrectionTypeNo;
@@ -4236,15 +3443,7 @@ void SLProfileStart(void) {
         NSString *text = ac.textFields.firstObject.text;
         text = [text stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
         if (text.length > 120) text = [text substringToIndex:120];
-        if (isArea) {
-            // 地区同时写 city / province / location：页面上那一排可能读其中任何一个
-            SLProfSetExtra(@"city", text);
-            SLProfSetExtra(@"province", text);
-            SLProfSetExtra(@"district", nil);
-            SLProfSetExtra(@"location", text);
-        } else {
-            SLProfSetStr(text, key);
-        }
+        SLProfSetStr(text, key);
         [self.tableView reloadData];
         SLLog(@"PROF| 设置 %@ = %@", title, text.length ? text : @"(空)");
     }]];

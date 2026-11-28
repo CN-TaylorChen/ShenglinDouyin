@@ -1,6 +1,6 @@
 Package: com.taylorchen.shenglindouyin
 Name: 声临·抖音版 (ShenglinDouyin)
-Version: 0.9.10
+Version: 0.9.11
 Architecture: iphoneos-arm64
 Description: 抖音评论区录音转 AI 音色，悬浮球与设置页沿用声临·陌陌版。
 Maintainer: CN-TaylorChen
