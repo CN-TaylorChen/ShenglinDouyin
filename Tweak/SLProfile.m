@@ -2398,12 +2398,7 @@ static void SLProfCollectVCs(UIViewController *vc, NSMutableArray *out) {
     if (vc.presentedViewController) SLProfCollectVCs(vc.presentedViewController, out);
 }
 
-static IMP SLProfIMP(id obj, NSString *selName) {
-    SEL sel = NSSelectorFromString(selName);
-    if (!obj || !sel || ![obj respondsToSelector:sel]) return NULL;
-    Method m = class_getInstanceMethod(object_getClass(obj), sel);
-    return m ? method_getImplementation(m) : NULL;
-}
+// （SLProfIMP 随「主动刷新作品」一起删掉了：0.9.8 起不再直接调页面的 refresh）
 
 #pragma mark - 面包屑（硬崩没有异常栈，只能留个记号）
 //
