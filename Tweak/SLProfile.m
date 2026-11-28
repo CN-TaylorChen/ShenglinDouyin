@@ -1284,8 +1284,12 @@ static BOOL SLProfSetTextOfView(UIView *v, NSString *text) {
 }
 
 // 在 cell 里按文本内容替换（含「IP属地：广东」这种带前缀的写法）
-static BOOL SLProfApplyTextMap(UIView *root, NSDictionary *map, NSString *ageTxt) {
-    if (!root) return NO;
+// v0.9.3：加深度上限 + 重入闸。改标题会触发一轮 layout，某些 cell 在 layout 里又会配一遍，
+// 没有闸就是「改 → layout → 再配 → 再改」的无限套娃，真机上就是一闪退。
+static BOOL sSLTextMapBusy = NO;
+
+static BOOL SLProfApplyTextMapDepth(UIView *root, NSDictionary *map, NSString *ageTxt, int depth) {
+    if (!root || depth > 8 || sSLTextMapBusy) return NO;
     BOOL hit = NO;
     for (UIView *v in [root.subviews copy]) {
         NSString *t = SLProfTextOfView(v);
@@ -1300,10 +1304,20 @@ static BOOL SLProfApplyTextMap(UIView *root, NSDictionary *map, NSString *ageTxt
                     }
                 }
             }
-            if (nv.length && ![nv isEqualToString:t] && SLProfSetTextOfView(v, nv)) hit = YES;
+            if (nv.length && ![nv isEqualToString:t]) {
+                if (SLProfSetTextOfView(v, nv)) hit = YES;
+            }
         }
-        if (SLProfApplyTextMap(v, map, ageTxt)) hit = YES;
+        if (SLProfApplyTextMapDepth(v, map, ageTxt, depth + 1)) hit = YES;
     }
+    return hit;
+}
+
+static BOOL SLProfApplyTextMap(UIView *root, NSDictionary *map, NSString *ageTxt) {
+    if (!root || sSLTextMapBusy) return NO;
+    sSLTextMapBusy = YES;
+    BOOL hit = SLProfApplyTextMapDepth(root, map, ageTxt, 0);
+    sSLTextMapBusy = NO;
     return hit;
 }
 
@@ -1852,16 +1866,8 @@ static NSString *SLProfObjText(id v) {
     return nil;
 }
 
-// 私密作品：-secret 是 NSNumber(1)，-labelPrivate 是「私密」角标（有就是私密）
-static BOOL SLProfAwemePrivate(id item) {
-    if (!item) return NO;
-    id sec = SLProfCallObj(item, @"secret");
-    if ([sec isKindOfClass:[NSNumber class]] && [(NSNumber *)sec boolValue]) return YES;
-    if ([sec isKindOfClass:[NSString class]] && [(NSString *)sec boolValue]) return YES;
-    id lp = SLProfCallObj(item, @"labelPrivate");
-    if (lp && lp != [NSNull null]) return YES;
-    return NO;
-}
+// 私密作品不再从 dataSource 里删（条数一变 IGListKit 就炸），
+// 所以判私密这件事挪到界面上做，这里不再需要。
 
 static BOOL SLProfHidePrivateOn(void) {
     return SLProfBool(SLProfKeyHidePriv, NO);
@@ -1970,35 +1976,24 @@ static id h_postsParams(id self, SEL _cmd) {
 }
 
 // 内存兜底：某个版本万一不读上面两个 getter，还能把记忆里的那份顶上。
-// 另外「隐藏私密作品」也在这里过滤 —— 页面每屏都从 dataSource 取。
+//
+// v0.9.2 的坑（0.9.3 修）：这里一度放宽成「总开关开 + 我页」就在 dataSource 里过滤私密作品，
+// 甚至拿内存快照替换整个列表。dataSource 的条数要跟 collectionView 的 section 对得上，
+// IGListKit 做 diff 时前后两次对象数量冷不丁变了，UICollectionView 直接抛
+// 「Invalid update: invalid number of items」把进程带走 —— 表现就是「点开我的就闪退」。
+//
+// 结论：这个 getter 不再改任何东西，一律原样返回。
+// 作品靠 h_postsParams 换 id 让服务器直接返回对方那份（条数由服务器给，天然一致）；
+// 私密作品只在界面上藏，绝不动 dataSource。
 static id h_postsDS(id self, SEL _cmd) {
     id orig = o_postsDS ? o_postsDS(self, _cmd) : nil;
-    if (!SLProfileEnabled() || !SLProfGateLoose()) return orig;
-
-    id use = orig;
-    if (sSLWorkWant.length && SLProfWorksEnabled() && SLProfPostsIsMine(self)) {
-        id cached = sSLWorkSrc[sSLWorkWant];
-        // 只在接口还没回来（nil / 空数组）时用它顶一下。
-        // 原来只要两边都是数组就用缓存 —— 服务器新拉的那份（播放量是新的）反而被旧快照盖掉，
-        // 看着就是「播放量没同步」。
-        BOOL empty = !orig || ([orig isKindOfClass:[NSArray class]] && [(NSArray *)orig count] == 0);
-        if (cached && empty) use = cached;
+    // 只留一行诊断：确认这个 manager 认的是谁
+    if (orig && sSLPostsMgrLog < 6 && sSLWorkWant.length && SLProfPostsIsMine(self)) {
+        sSLPostsMgrLog++;
+        SLLog(@"WORKS| dataSource 原样返回 %lu 条（不在这里换列表）",
+              (unsigned long)([orig isKindOfClass:[NSArray class]] ? [(NSArray *)orig count] : 0));
     }
-
-    if (!SLProfHidePrivateOn()) return use;
-    if (![use isKindOfClass:[NSArray class]]) return use;
-    NSArray *arr = use;
-    NSMutableArray *keep = [NSMutableArray arrayWithCapacity:arr.count];
-    for (id obj in arr) if (!SLProfAwemePrivate(obj)) [keep addObject:obj];
-    if (keep.count != arr.count) {
-        static BOOL sPrivLogged = NO;
-        if (!sPrivLogged) {
-            sPrivLogged = YES;
-            SLLog(@"WORKS| 已隐藏私密作品 %lu 条", (unsigned long)(arr.count - keep.count));
-        }
-        return keep;
-    }
-    return use;
+    return orig;
 }
 
 static void SLProfCollectVCs(UIViewController *vc, NSMutableArray *out) {
@@ -2298,8 +2293,8 @@ static BOOL SLProfInOwnView(UIView *v) {
     return NO;
 }
 
-static void SLProfHidePrivateIn(UIView *root) {
-    if (!root || root.hidden) return;
+static void SLProfHidePrivateInDepth(UIView *root, int depth) {
+    if (!root || root.hidden || depth > 40) return;
     if (SLProfInOwnView(root)) return;
     NSString *t = nil;
     if ([root isKindOfClass:[UILabel class]]) t = ((UILabel *)root).text;
@@ -2321,7 +2316,15 @@ static void SLProfHidePrivateIn(UIView *root) {
         if (!sLogged) { sLogged = YES; SLLog(@"PROF| 已隐起「私密作品」入口"); }
         return;
     }
-    for (UIView *v in [root.subviews copy]) SLProfHidePrivateIn(v);
+    for (UIView *v in [root.subviews copy]) SLProfHidePrivateInDepth(v, depth + 1);
+}
+
+static void SLProfHidePrivateIn(UIView *root) {
+    @try {
+        SLProfHidePrivateInDepth(root, 0);
+    } @catch (NSException *e) {
+        SLLog(@"PROF| 隐藏私密作品时出了点问题：%@", e.reason ?: @"?");
+    }
 }
 
 #pragma mark - 「伪装主页」（别人主页左上角那颗胶囊）
@@ -2795,9 +2798,44 @@ static void h_profLeavePage(id self, SEL _cmd, BOOL animated) {
 // 不再赌回调：只要「我」页在，就每 0.8 秒确认一遍，缺什么补什么。
 // 每一步内部都有「已经对了就立刻返回」的短路，稳定之后几乎不产生开销。
 
+// v0.9.3：上一轮如果是被我们的异常带崩的，这一轮先保守一点 ——
+// 只保留「只改值、不动结构」的活（封面上图 / 头像 / 数字），
+// 文本改写、私密隐藏、作品重拉先停一轮，别再一进「我的」就闪退。
+static BOOL sSLProfSafeMode = NO;
+
+static NSString *SLProfCrashMarkPath(void) {
+    NSString *dir = SLProfCacheDir();
+    if (!dir.length) return nil;
+    return [dir stringByAppendingPathComponent:@".prof_crash"];
+}
+
+static void SLProfWriteCrashMark(void) {
+    NSString *p = SLProfCrashMarkPath();
+    if (!p.length) return;
+    [@"1" writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:NULL];
+}
+
+static void SLProfCheckCrashMark(void) {
+    NSString *p = SLProfCrashMarkPath();
+    if (!p.length) return;
+    NSDictionary *a = [[NSFileManager defaultManager] attributesOfItemAtPath:p error:NULL];
+    if (!a) return;
+    NSDate *d = a[NSFileModificationDate];
+    NSTimeInterval age = d ? -[d timeIntervalSinceNow] : 1e9;
+    [[NSFileManager defaultManager] removeItemAtPath:p error:NULL];
+    if (age >= 0 && age < 1800) {
+        sSLProfSafeMode = YES;
+        SLLog(@"PROF| 上次异常退出（%d 分钟前），本次先走保守模式", (int)(age / 60));
+    }
+}
+
 static void SLProfTick(void) {
     if (![NSThread isMainThread]) return;
-    if (!SLProfileEnabled()) { sSLWasOnMe = NO; return; }
+    static BOOL sInTick = NO;
+    if (sInTick) return;              // 定时器在 CommonModes 里，滚动时会重入，必须挡一下
+    sInTick = YES;
+
+    if (!SLProfileEnabled()) { sSLWasOnMe = NO; sInTick = NO; return; }
 
     int kind = SLProfPageKind();
     // 「我页出现过」这个闩只有严格门会放下；离开后如果没人再走严格门，它会一直开着，
@@ -2810,6 +2848,7 @@ static void SLProfTick(void) {
     BOOL onMe = (kind == 1) || (sSLProfKindVal == 1) || sSLProfOnMePage;
     if (!onMe || !SLProfGateLoose()) {
         if (sSLWasOnMe) { sSLWasOnMe = NO; SLLog(@"PROF| 我页不在，巡检待机"); }
+        sInTick = NO;
         return;
     }
     if (!sSLWasOnMe) {
@@ -2819,16 +2858,29 @@ static void SLProfTick(void) {
         sSLWorksGen++;
         sSLWorksReloaded = -1;
         sSLWorksRetry = 0;
-        SLLog(@"PROF| 我页在，开始驻留巡检（缺什么补什么）");
+        SLLog(@"PROF| 我页在，开始驻留巡检（缺什么补什么）%@", sSLProfSafeMode ? @"· 保守模式" : @"");
     }
 
     sSLTickCount++;
-    SLProfCoverPrefetch();            // 本地没存过这张封面就先存一份（重启后有图）
-    SLProfForceCover();               // 已经贴对的那张会被短路掉
-    SLProfApplyAgeLocationNow();
-    if (sSLTickCount % 2 == 0) SLProfHidePrivateUI();   // 遍历两次跑一次，省点
-    SLProfWorksKick();                // 按「代」去重，成功一次就不再重复
-    if (sSLTickCount % 4 == 0) SLProfPaintAvatar();
+
+    // 每一步单独兜异常：万一抖音某个版本在某个环节抛异常，
+    // 顶多是这一项不生效，不能把整个 App 带走。
+#define SL_TICK_STEP(NAME, CODE)                                          \
+    @try { CODE; }                                                        \
+    @catch (NSException *e) {                                             \
+        static BOOL sOnce_##NAME = NO;                                     \
+        if (!sOnce_##NAME) { sOnce_##NAME = YES;                           \
+            SLLog(@"PROF| 巡检「%s」出异常：%@", #NAME, e.reason ?: @"?"); } \
+    }
+
+    SL_TICK_STEP(cover,   SLProfCoverPrefetch(); SLProfForceCover());
+    if (!sSLProfSafeMode) SL_TICK_STEP(ageloc, SLProfApplyAgeLocationNow());
+    if (!sSLProfSafeMode && (sSLTickCount % 2 == 0)) SL_TICK_STEP(priv, SLProfHidePrivateUI());
+    if (!sSLProfSafeMode) SL_TICK_STEP(works, SLProfWorksKick());
+    if (sSLTickCount % 4 == 0) SL_TICK_STEP(avatar, SLProfPaintAvatar());
+#undef SL_TICK_STEP
+
+    sInTick = NO;
 }
 
 static void SLProfStartTicker(void) {
@@ -2869,12 +2921,15 @@ static void SLProfUncaught(NSException *e) {
     NSString *reason = e.reason ?: @"?";
     NSString *stack = [[e callStackSymbols] componentsJoinedByString:@"\n"];
     SLLog(@"CRASH| %@: %@\n%@", name, reason, stack);
+    // 留个记号：下次启动先走保守模式，别一进「我的」就再崩一遍
+    SLProfWriteCrashMark();
 }
 
 void SLProfileStart(void) {
     if (sSLProfStarted) return;
     sSLProfStarted = YES;
     NSSetUncaughtExceptionHandler(&SLProfUncaught);
+    SLProfCheckCrashMark();    // 上次挂在我们的异常里？这轮先保守
 
     SLProfMigrateLegacy();     // 老版本的单账号预设搬到 owner 名下，只做一次
 
@@ -3092,7 +3147,7 @@ void SLProfileStart(void) {
     SLProfHookPageLifecycle(objc_getClass("AWEProfileMergedTabContainerViewController"));
     SLProfHookPageLifecycle(objc_getClass("AWEProfileBaseContainerViewController"));
 
-    SLLog(@"PROF| ==== 主页伪装 v0.9.2 · 已挂载 · 快照 %lu 个 ====", (unsigned long)SLSnapList().count);
+    SLLog(@"PROF| ==== 主页伪装 v0.9.3 · 已挂载 · 快照 %lu 个 ====", (unsigned long)SLSnapList().count);
     SLProfStartTicker();       // 0.8s 驻留巡检：不依赖任何一次 viewDidAppear 恰好触发
     // 账号要等我页出现才认得出，晚点再打一行状态，免得开局那行永远是「账号 ?」
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.0 * NSEC_PER_SEC)),
