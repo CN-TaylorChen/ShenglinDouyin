@@ -90,8 +90,10 @@ void SLLogWrite(NSString *line) {
                 [fh seekToEndOfFile];
                 [fh writeData:[full dataUsingEncoding:NSUTF8StringEncoding]];
                 unsigned long long end = [fh offsetInFile];
-                // 写完就落盘：日志是给"出问题之后"看的，进程被系统杀掉时缓存里的内容全丢
-                [fh synchronizeFile];
+                // 不再每条 fsync：一条一次同步会持续抢磁盘 IO，跳页面和滑动都能感觉到。
+                // writeData 已经进了内核缓冲，进程被系统杀掉也不会丢，每 8 条落一次盘足够。
+                static NSUInteger sPendingSync = 0;
+                if (++sPendingSync >= 8) { sPendingSync = 0; [fh synchronizeFile]; }
                 [fh closeFile];
                 if (end > SL_LOG_MAX_BYTES) {
                     NSData *d = [NSData dataWithContentsOfFile:path];

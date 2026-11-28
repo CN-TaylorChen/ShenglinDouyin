@@ -113,7 +113,7 @@
 #include <string.h>
 #include <stdlib.h>
 
-#define SLProfVersion      @"0.9.11"          // 与 control / SLSettingsPanel 同步
+#define SLProfVersion      @"0.9.12"          // 与 control / SLSettingsPanel 同步
 #define SLProfKeyEnabled   @"SLProf.enabled"
 #define SLProfKeyNickname  @"SLProf.nickname"
 #define SLProfKeyUID       @"SLProf.uid"
@@ -124,6 +124,7 @@
 #define SLProfKeyLike      @"SLProf.like"       // 获赞
 #define SLProfKeyFriend    @"SLProf.friend"     // 互关
 #define SLProfKeyPlay      @"SLProf.play"       // 主页作品播放量（和作品数分开，别混用）
+#define SLProfKeyPlayRate  @"SLProf.playrate"   // 封面播放量倍率（点赞 × 这个数），空=20
 #define SLProfKeyCover     @"SLProf.coverURL"   // 主页背景图（封面）URL
 #define SLProfKeyCoverLight @"SLProf.coverLight" // 封面浅色蒙层色（抖音自己算的，原样回传）
 #define SLProfKeyCoverDark @"SLProf.coverDark"   // 封面深色蒙层色
@@ -160,6 +161,7 @@ static UIImage  *sSLCoverWantImg = nil;               // 下好之后的那张�
 static NSString *sSLCoverAcctKey = nil;               // 本机原图对应的文件路径（按 want 分文件）
 static UIImage  *sSLCoverAcctImg = nil;               // 本机原图（内存里留一份，别每拍都读盘）
 static int sSLCoverMissLog = 0;                        // 「没找到封面视图」的日志上限
+static __weak UIView *sSLCoverViewWeak = nil;           // 上次找到的封面视图（还在就复用，省一次全树递归）
 static id sSLMyModel = nil;                            // 「我」页那个 model（读真实文本做比对）
 static NSTimeInterval sSLOnMeSince = 0;                // 这一轮停在我页的起始时刻（别和首刷撞车）
 static BOOL sSLWasOnMe = NO;                           // 上一拍是否停在「我」页
@@ -940,9 +942,18 @@ static void SLProfNoteMiss(NSString *tag) {
 
 // 从 model 上取 uid（NSString / NSNumber 两种都接）
 static NSString *SLProfModelUID(id model) {
-    id u = SLProfCallObj(model, @"userID");
-    if ([u isKindOfClass:[NSString class]]) return [(NSString *)u length] ? u : nil;
-    if ([u isKindOfClass:[NSNumber class]]) return [(NSNumber *)u stringValue];
+    // 账号切换面板里的 cell 不一定是 AWEUserModel，字段名也不一定叫 userID ——
+    // 39.9.0 那个面板用的是账号模块自己的 model，只认 userID 就一个都取不到。
+    static NSArray *keys = nil;
+    static dispatch_once_t onceKeys;
+    dispatch_once(&onceKeys, ^{
+        keys = @[@"userID", @"uid", @"userId", @"accountID", @"accountId", @"identifier"];
+    });
+    for (NSString *k in keys) {
+        id u = SLProfCallObj(model, k);
+        if ([u isKindOfClass:[NSString class]] && [(NSString *)u length]) return u;
+        if ([u isKindOfClass:[NSNumber class]]) return [(NSNumber *)u stringValue];
+    }
     return nil;
 }
 
@@ -1612,7 +1623,9 @@ static id h_whiteProfileCover(id self, SEL _cmd) {
 // 替换就漏了，之后也不会重来 —— 主动在窗口里把封面视图找出来重贴一遍。
 static void SLProfFindCoverViews(UIView *root, NSMutableArray *out) {
     if (!root || !out) return;
-    if ([NSStringFromClass([root class]) isEqualToString:@"AWEProfileBannerBGCoverView"]) {
+    // 每 0.8s 要把整棵视图树走一遍，NSStringFromClass 会每层造一个字符串对象；
+    // 这里直接比 C 字符串，省下来的就是滑动的帧。
+    if (!strcmp(class_getName([root class]), "AWEProfileBannerBGCoverView")) {
         [out addObject:root];
         return;
     }
@@ -1644,9 +1657,14 @@ static void SLProfForceCover(void) {
     }
 
     NSMutableArray *views = [NSMutableArray array];
-    for (UIScene *sce in [[UIApplication sharedApplication].connectedScenes copy]) {
-        if (![sce isKindOfClass:[UIWindowScene class]]) continue;
-        for (UIWindow *w in [((UIWindowScene *)sce).windows copy]) SLProfFindCoverViews(w, views);
+    UIView *hit = sSLCoverViewWeak;
+    if (hit && hit.window) [views addObject:hit];     // 还在屏幕上，直接用
+    if (!views.count) {
+        for (UIScene *sce in [[UIApplication sharedApplication].connectedScenes copy]) {
+            if (![sce isKindOfClass:[UIWindowScene class]]) continue;
+            for (UIWindow *w in [((UIWindowScene *)sce).windows copy]) SLProfFindCoverViews(w, views);
+        }
+        if (views.count) sSLCoverViewWeak = views.firstObject;
     }
     if (!views.count) {
         if (sSLCoverMissLog < 6) { sSLCoverMissLog++; SLLog(@"COVER| 没找到封面视图，跳过"); }
@@ -2159,16 +2177,42 @@ static long long SLProfStatsNum(id stats, NSString *key) {
     return 0;
 }
 
+// 倍率在设置页「数字」里填（SLProf.playrate），空着就是 20 倍。
+// 之前那个 40 + digg % 41（平均 60 倍）系统性地大了一倍多 —— 抖音真实播放/点赞比
+// 一般在 10~30，几千赞的作品大约 20~30 倍，上万赞的反而降到 10~20 倍。
+static long long SLProfPlayRate(void) {
+    NSString *t = SLProfStr(SLProfKeyPlayRate);
+    long long r = t.length ? t.longLongValue : 0;
+    if (r <= 0) return 20;
+    if (r > 500) return 500;
+    return r;
+}
+
+static char kSLStatsAwemeKey;      // 统计对象 -> 所属作品 awemeID（兜底散列要用）
+
+// 点赞为 0 的作品要有个像样的数。这里不能用对象地址：地址每次启动、每次重新解析
+// 列表都会变，同一条作品会一会儿 3 千一会儿 2 万。优先用 awemeID 做 FNV 散列，
+// 拿不到才退回地址（这时才可能不稳）。
+static unsigned long long SLProfStableSeed(id stats) {
+    id aid = objc_getAssociatedObject(stats, &kSLStatsAwemeKey);
+    if ([aid isKindOfClass:[NSString class]] && [(NSString *)aid length]) {
+        unsigned long long h = 1469598103934665603ULL;
+        const char *p = [(NSString *)aid UTF8String] ?: "";
+        for (; *p; p++) { h ^= (unsigned char)*p; h *= 1099511628211ULL; }
+        return h;
+    }
+    return ((unsigned long long)(uintptr_t)stats >> 4) * 2654435761ULL;
+}
+
 static long long SLProfFakePlayFor(id stats, long long orig) {
     if (!stats) return orig;
     long long digg = SLProfStatsNum(stats, @"diggCount");
     if (!digg) digg = SLProfStatsNum(stats, @"digg_count");
     long long play;
     if (digg > 0) {
-        play = digg * (40 + digg % 41);                 // 40~80 倍，随点赞数固定
+        play = digg * SLProfPlayRate();                 // 点赞 × 倍率，同一条恒等
     } else {
-        unsigned long long h = ((unsigned long long)(uintptr_t)stats >> 4) * 2654435761ULL;
-        play = 3000 + (long long)(h % 27000);
+        play = 2000 + (long long)(SLProfStableSeed(stats) % 9000);   // 2 千 ~ 1.1 万
     }
     return play > orig ? play : orig;
 }
@@ -2251,6 +2295,13 @@ static void SLProfSpoofPlayInList(id ds) {
         id stats = SLProfCallObj(item, @"statistics");
         if (!stats) stats = SLProfCallObj(item, @"stats");
         if (!stats) continue;
+        // 把「这条统计属于哪条作品」记下来：点赞为 0 时按 awemeID 散列，数字才稳定
+        {
+            id aid = SLProfCallObj(item, @"awemeID");
+            if (![aid isKindOfClass:[NSString class]]) aid = SLProfCallObj(item, @"awemeId");
+            if ([aid isKindOfClass:[NSString class]] && [(NSString *)aid length])
+                objc_setAssociatedObject(stats, &kSLStatsAwemeKey, aid, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        }
         SLProfHookStatsPlayObject(stats);
         if (!SLProfPlaySpoofOn()) continue;
         if ([stats isKindOfClass:[NSMutableDictionary class]]) {
@@ -2317,12 +2368,76 @@ static id h_acctNick(id self, SEL _cmd) {
     id v = SLProfAcctNickOrigIMP(self, _cmd);
     NSString *uid = SLProfModelUID(self);
     if (!uid.length) return v;
-    if (sSLCurAcct.length && [uid isEqualToString:sSLCurAcct]) return v;
+    // 原来这里把「当前登录号」跳过了（以为我页已经改过），可面板里它同样写着真名。
+    // 现在不分是谁，只要名下存过预设就换。
     NSString *n = SLProfStrForUID(SLProfKeyNickname, uid);
     if (!n.length) return v;
     static BOOL sLogged = NO;
     if (!sLogged) { sLogged = YES; SLLog(@"PROF| 账号面板里的号（%@）按预设显示昵称", uid); }
     return n;
+}
+
+// getter 之外再兜一层。面板的 cell 常见两种躲法：
+//   1) cell 自己缓存了文本，或者根本不调 model 的 nickname；
+//   2) model 不是我们挂钩的那些类。
+// 这里在面板出现时按 cell 上挂的 model 取 uid，读该 uid 的预设，
+// 把 cell 里正好写着真名的那个 label 换掉 —— 不碰别的文本，改错的风险最低。
+static void SLProfFixPanelTree(UIView *root) {
+    if (!root) return;
+    NSMutableArray *stack = [NSMutableArray arrayWithObject:root];
+    int guard = 0;
+    while (stack.count && guard++ < 600) {
+        UIView *v = stack.lastObject;
+        [stack removeLastObject];
+        BOOL isCell = [v isKindOfClass:[UITableViewCell class]] ||
+                      [v isKindOfClass:[UICollectionViewCell class]];
+        if (isCell) {
+            id model = SLProfCallObj(v, @"viewModel");
+            if (!model) model = SLProfCallObj(v, @"model");
+            if (!model) model = SLProfCallObj(v, @"accountModel");
+            if (!model) model = SLProfCallObj(v, @"account");
+            NSString *uid = SLProfModelUID(model);
+            NSString *want = uid.length ? SLProfStrForUID(SLProfKeyNickname, uid) : nil;
+            id realObj = SLProfCallObj(model, @"nickname");
+            NSString *real = [realObj isKindOfClass:[NSString class]] ? realObj : nil;
+            if (want.length && real.length && ![real isEqualToString:want]) {
+                NSMutableArray *ls = [NSMutableArray arrayWithObject:v];
+                int g2 = 0;
+                while (ls.count && g2++ < 240) {
+                    UIView *w = ls.lastObject;
+                    [ls removeLastObject];
+                    if ([w isKindOfClass:[UILabel class]]) {
+                        UILabel *lb = (UILabel *)w;
+                        NSString *t = lb.text;
+                        if (t.length && [t isEqualToString:real]) {
+                            lb.text = want;
+                            static int sPanelN = 0;
+                            if (sPanelN < 6) {
+                                sPanelN++;
+                                SLLog(@"PROF| 账号面板「%@」→「%@」（按 cell 上的 model 改）", t, want);
+                            }
+                        }
+                    }
+                    [ls addObjectsFromArray:w.subviews];
+                }
+            }
+        }
+        [stack addObjectsFromArray:v.subviews];
+    }
+}
+
+// 只在这个页面干活，别的页面一拍都不多花
+static void SLProfFixAccountPanelIfVisible(void) {
+    if (![NSThread isMainThread]) return;
+    static NSTimeInterval sLast = 0;
+    NSTimeInterval now = [NSProcessInfo processInfo].systemUptime;
+    if (now - sLast < 0.4) return;
+    UIViewController *top = SLProfTopVC();
+    if (!top || !top.isViewLoaded) return;
+    NSString *cn = NSStringFromClass([top class]);
+    if (![cn containsString:@"QuickSwitch"] && ![cn containsString:@"MultiAccount"]) return;
+    sLast = now;
+    @try { SLProfFixPanelTree(top.view); } @catch (__unused NSException *e) {}
 }
 
 #pragma mark - 头像
@@ -2972,6 +3087,9 @@ static void SLProfTick(void) {
 
     if (!SLProfileEnabled()) { sSLWasOnMe = NO; sInTick = NO; return; }
 
+    // 账号切换面板不在「我」页，得在下面的提前 return 之前处理
+    SLProfFixAccountPanelIfVisible();
+
     int kind = SLProfPageKind();
     // 「我页出现过」这个闩只有严格门会放下；离开后如果没人再走严格门，它会一直开着，
     // 于是在别的 tab 上也继续替换。连续三拍看不见我页就自己收掉（页面切换那 1~2 拍不算）。
@@ -3285,8 +3403,10 @@ void SLProfileStart(void) {
         }
     }
 
-    // 封面播放量：进 App 就把统计模型的 playCount 挂上（等列表回来再挂，首屏已经画完了）
-    SLProfHookStatsPlayAll();
+    // 封面播放量：全类扫描要遍历抖音二十多万个类，放在启动这一下会明显拖慢首屏。
+    // 延后 1.5s（首屏画完）再扫；列表回来时另有一条「按真对象现挂」的路，不会漏。
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{ SLProfHookStatsPlayAll(); });
 
     // 「我」页容器：挂 appear / disappear 当第二道门，并留下现场日志
     SLProfHookPageLifecycle(objc_getClass("AWEProfileTabContainerViewController"));
@@ -3340,7 +3460,7 @@ void SLProfileStart(void) {
     (void)tv;
     if (s == 0) return 2;      // 启用 / 模拟作品
     if (s == 1) return 3;      // 昵称 / 抖音号 / 简介
-    return 5;                  // 作品/关注/粉丝/获赞/互关
+    return 6;                  // 作品/关注/粉丝/获赞/互关/播放倍率
 }
 
 - (NSString *)tableView:(UITableView *)tv titleForHeaderInSection:(NSInteger)s {
@@ -3390,12 +3510,21 @@ void SLProfileStart(void) {
         return cell;
     }
 
-    NSArray *titles = @[@"作品", @"关注", @"粉丝", @"获赞", @"互关"];
+    NSArray *titles = @[@"作品", @"关注", @"粉丝", @"获赞", @"互关", @"播放倍率"];
     NSString *key = @[SLProfKeyAweme, SLProfKeyFollowing, SLProfKeyFollower,
-                      SLProfKeyLike, SLProfKeyFriend][ip.row];
+                      SLProfKeyLike, SLProfKeyFriend, SLProfKeyPlayRate][ip.row];
     cell.textLabel.text = titles[ip.row];
     NSString *v = SLProfStr(key);
-    cell.detailTextLabel.text = v.length ? v : @"未设置";
+    if (ip.row == 5) {
+        // 倍率这行写清「点赞 × 多少」，别让人以为是播放量本身
+        cell.detailTextLabel.text = v.length
+            ? [NSString stringWithFormat:@"点赞 × %@", v]
+            : @"点赞 × 20（默认）";
+        cell.detailTextLabel.font = [UIFont systemFontOfSize:15];
+        cell.detailTextLabel.textColor = [UIColor secondaryLabelColor];
+    } else {
+        cell.detailTextLabel.text = v.length ? v : @"未设置";
+    }
     cell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
     return cell;
 }
@@ -3425,7 +3554,8 @@ void SLProfileStart(void) {
         else if (ip.row == 1) { title = @"关注数"; key = SLProfKeyFollowing; kb = UIKeyboardTypeNumberPad; }
         else if (ip.row == 2) { title = @"粉丝数"; key = SLProfKeyFollower; kb = UIKeyboardTypeNumberPad; }
         else if (ip.row == 3) { title = @"获赞数"; key = SLProfKeyLike; kb = UIKeyboardTypeNumberPad; }
-        else { title = @"互关数"; key = SLProfKeyFriend; kb = UIKeyboardTypeNumberPad; }
+        else if (ip.row == 4) { title = @"互关数"; key = SLProfKeyFriend; kb = UIKeyboardTypeNumberPad; }
+        else { title = @"播放倍率（点赞 × 这个数，空=20）"; key = SLProfKeyPlayRate; kb = UIKeyboardTypeNumberPad; }
     }
     if (!key) return;
 
