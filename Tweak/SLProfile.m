@@ -111,7 +111,7 @@
 #import <objc/runtime.h>
 #import <objc/message.h>
 
-#define SLProfVersion      @"0.9.7"          // 与 control / SLSettingsPanel 同步
+#define SLProfVersion      @"0.9.8"          // 与 control / SLSettingsPanel 同步
 #define SLProfKeyEnabled   @"SLProf.enabled"
 #define SLProfKeyNickname  @"SLProf.nickname"
 #define SLProfKeyUID       @"SLProf.uid"
@@ -154,7 +154,6 @@ static void SLApplySnapExtras(NSDictionary *snap);    // 定义在「性别 / �
 static NSString *SLExtraStr(NSString *field);         // 同上，日志里要打地区
 static void SLProfCoverPrefetch(void);                // 定义在「封面」段，套用后先把原图存一份
 static int sSLWorksGen = 0;                           // 每次套用 +1（作品列表重拉用）
-static int sSLWorksReloaded = -1;                     // 已经为哪一代重拉过
 static int sSLPostsMgrLog = 0;                        // 作品管理器记录日志（限几条）
 static NSString *sSLCoverWantURL = nil;               // 当前应该显示的封面 URL
 static UIImage  *sSLCoverWantImg = nil;               // 下好之后的那张图
@@ -162,15 +161,14 @@ static NSString *sSLCoverAcctKey = nil;               // 本机原图对应的�
 static UIImage  *sSLCoverAcctImg = nil;               // 本机原图（内存里留一份，别每拍都读盘）
 static int sSLCoverMissLog = 0;                        // 「没找到封面视图」的日志上限
 static id sSLMyModel = nil;                            // 「我」页那个 model（读真实文本做比对）
-static NSTimeInterval sSLWorksKickAt = 0;              // 上次踢作品的时间（失败时限流）
-static int sSLWorksRetry = 0;                          // 这一代已经补刷过几次（换号常要补第二次）
 static NSTimeInterval sSLOnMeSince = 0;                // 这一轮停在我页的起始时刻（别和首刷撞车）
-static BOOL sSLWorksKickBlocked = NO;                  // 上次进程死在作品重拉上 → 这一轮禁止再踢
 static BOOL sSLWasOnMe = NO;                           // 上一拍是否停在「我」页
 static int  sSLTickCount = 0;                          // 巡检计数
 static int  sSLOffTicks = 0;                           // 连续几拍不在我页
 static void SLProfTick(void);                          // 定义在「驻留巡检」段
 static void SLProfCollectVCs(UIViewController *vc, NSMutableArray *out);   // 定义在「作品」段，header 扫描要用
+static void SLProfStep(NSString *name);                // 定义在「面包屑」段，换号时先留记号
+static void SLProfStepDone(NSString *name);
 
 #pragma mark - 配置（按账号分家）
 //
@@ -204,6 +202,17 @@ static void SLProfSetStr(NSString *value, NSString *key) {
     else [d removeObjectForKey:k];
     if (sSLCurAcct.length) [d removeObjectForKey:key];   // 分账号后老的全局键作废，免得串号
     [d synchronize];
+}
+
+// 按**指定账号**读预设，不切换「当前账号」。
+// 用途：抖音的账号切换面板会同时渲染好几个号的 model，原来只有当前登录的那个有伪装，
+// 其余的（没被切到的号）全还原成真名真头像 —— 用户截图里就是这个现象。
+// 这里让每个号都用自己的那份预设，判断依据是「这个 uid 名下有没有存过伪装」。
+static NSString *SLProfStrForUID(NSString *key, NSString *uid) {
+    if (!key.length || !uid.length) return nil;
+    NSString *v = [[NSUserDefaults standardUserDefaults]
+                   stringForKey:[NSString stringWithFormat:@"%@.%@", key, uid]];
+    return v.length ? v : nil;
 }
 
 static BOOL SLProfBool(NSString *key, BOOL def) {
@@ -541,9 +550,15 @@ static void SLApplySnap(NSDictionary *s) {
     SLProfSetStr(SLSnapText(s, @"coverDark"), SLProfKeyCoverDark);
     SLProfSetStr(SLSnapText(s, @"avatar"),    SLProfKeyAvatar);
     SLProfSetStr(SLSnapText(s, @"sec"),       SLProfKeySec);      // 联网拉作品要用
-    SLProfSetStr(SLSnapText(s, @"gender"),    SLProfKeyGender);
-    SLProfSetStr(SLSnapText(s, @"age"),       SLProfKeyAge);
-    SLProfSetStr(SLSnapText(s, @"genderText"), SLProfKeyGenderTxt);
+    // 0.9.8：性别 / 年龄以**设置页手填的**为准。
+    // 别人的主页现在基本不公开这几项（只有「+ 添加性别等标签」和 IP 属地），
+    // 从那边抓回来的多半是空，却把手填的值一并覆盖了 —— 所以只在本地没设过时才补。
+    if (!SLProfStr(SLProfKeyGender).length)
+        SLProfSetStr(SLSnapText(s, @"gender"), SLProfKeyGender);
+    if (!SLProfStr(SLProfKeyAge).length)
+        SLProfSetStr(SLSnapText(s, @"age"), SLProfKeyAge);
+    if (!SLProfStr(SLProfKeyGenderTxt).length)
+        SLProfSetStr(SLSnapText(s, @"genderText"), SLProfKeyGenderTxt);
     SLApplySnapExtras(s);                                       // 地区 / 认证 / 学校
     NSString *uid = SLSnapText(s, @"uid");
     if (uid.length) SLProfSetStr(uid, SLProfKeyWant);   // 作品/封面/头像都照这个人的来
@@ -552,8 +567,6 @@ static void SLApplySnap(NSDictionary *s) {
     SLProfSetBool(YES, SLProfKeyEnabled);
 
     sSLWorksGen++;
-    sSLWorksReloaded = -1;
-    sSLWorksRetry = 0;
     SLLog(@"SNAP| 套用 %@ 的整套资料（账号 %@）", SLSnapText(s, @"nickname") ?: @"?", sSLCurAcct ?: @"?");
     if (SLProfGate()) SLProfForceCover();               // 若此刻正停在「我」页，立刻换背景
     SLProfCoverPrefetch();                              // 顺手把原图存到本机（封面的 URL 会过期）
@@ -749,6 +762,7 @@ static void SLProfSetAcct(NSString *uid) {
     if (!uid.length || [uid isEqualToString:@"0"]) return;
     if ([sSLCurAcct isEqualToString:uid]) return;
     sSLCurAcct = [uid copy];
+    SLProfStep(@"acct.switch");     // 换号是目前最容易硬崩的一下，先留记号（崩了下次启动能看到）
 
     // 老版本没写过 owner（更早的安装）：第一次认到账号时把全局预设归到它名下
     NSUserDefaults *d = [NSUserDefaults standardUserDefaults];
@@ -760,10 +774,11 @@ static void SLProfSetAcct(NSString *uid) {
     // 这个账号自己要模拟谁 —— 落盘过，重启也还在（作品源仍需本次运行里看过对方主页）
     sSLWorkWant = SLProfStr(SLProfKeyWant);
     sSLWorksGen++;                 // 换号后作品列表也要按新账号重判一次
-    sSLWorksReloaded = -1;
-    sSLWorksRetry = 0;
     sSLPostsMgrLog = 0;
-    SLProfResetPainted();
+    // 换号那一刻抖音正在重建整页；这里同步去「还原被我们改过的图」很容易撞在渲染中途，
+    // 用户反馈的「切换账号刷新主页会闪退」有一半可能出在这。改成延后一拍。
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.2 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{ SLProfResetPainted(); });
     sSLProfHits = 0;
     sSLCoverWantURL = nil;
     sSLCoverWantImg = nil;
@@ -772,7 +787,6 @@ static void SLProfSetAcct(NSString *uid) {
     sSLCoverMissLog = 0;
     sSLMyModel = nil;               // 换号了，上一个号的真实资料不能拿来比对
     sSLWasOnMe = NO;                // 巡检下一拍按新号重来
-    sSLWorksKickAt = 0;
 
     SLLog(@"PROF| 已切到账号 %@（预设按账号独立，互不清空）", uid);
     SLLog(@"PROF| 本账号预设：昵称=%@ 赞=%@ 性别=%@ 年龄=%@ 地区=%@ 背景=%@ 头像=%@ 作品源=%@",
@@ -788,6 +802,9 @@ static void SLProfSetAcct(NSString *uid) {
     // 换号后马上按新号补一轮，不用等用户离开再回来
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{ SLProfTick(); });
+    // 页面重建大概 1~2 秒，过了这个窗口还没崩才算安全
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.0 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{ SLProfStepDone(@"acct.switch"); });
 }
 
 // 在「我」页记下当前登录账号的 uid
@@ -955,13 +972,33 @@ static void SLProfNoteMiss(NSString *tag) {
 
 #pragma mark - 字符串字段
 
+// 从 model 上取 uid（NSString / NSNumber 两种都接）
+static NSString *SLProfModelUID(id model) {
+    id u = SLProfCallObj(model, @"userID");
+    if ([u isKindOfClass:[NSString class]]) return [(NSString *)u length] ? u : nil;
+    if ([u isKindOfClass:[NSNumber class]]) return [(NSNumber *)u stringValue];
+    return nil;
+}
+
+// 不是当前登录号、但自己名下也存过伪装 —— 抖音的账号切换面板会同时渲染好几个号的 model，
+// 原来只有「当前这个」有伪装，没切到的号全还原成真名真头像（用户截图就是这个）。
+// 这里只对「这个 uid 名下真的存过这个字段」的 model 生效，别人的 model 一律原样放行。
+static id SLProfAltAccountStr(id model, NSString *key, id orig) {
+    NSString *uid = SLProfModelUID(model);
+    if (!uid.length) return orig;
+    if (sSLCurAcct.length && [uid isEqualToString:sSLCurAcct]) return orig;
+    NSString *v = SLProfStrForUID(key, uid);
+    return v.length ? v : orig;
+}
+
 #define SL_PROF_STR_HOOK(NAME, KEY, TAG, FIELD)                           \
     static id (*o_##NAME)(id, SEL);                                       \
     static id h_##NAME(id self, SEL _cmd) {                               \
         id v = o_##NAME ? o_##NAME(self, _cmd) : nil;                     \
         if (!SLProfGateLoose()) { SLCapNote(self, FIELD, v);              \
-                                  SLProfNoteMiss(TAG); return v; }        \
-        if (!SLProfIsMe(self)) return v;                                  \
+                                  SLProfNoteMiss(TAG);                    \
+                                  return SLProfAltAccountStr(self, KEY, v); } \
+        if (!SLProfIsMe(self)) return SLProfAltAccountStr(self, KEY, v);  \
         NSString *f = SLProfStr(KEY);                                     \
         if (!f.length) return v;                                          \
         if (sSLProfHits < 12) { sSLProfHits++;                            \
@@ -1063,15 +1100,40 @@ static id SLProfAttrCount(id v, long long n) {
     NSAttributedString *src = (NSAttributedString *)v;
     NSDictionary *a0 = [src attributesAtIndex:0 effectiveRange:NULL];
     NSDictionary *aLast = [src attributesAtIndex:src.length - 1 effectiveRange:NULL];
-    NSMutableAttributedString *m = [src mutableCopy];
-    if (!m) m = [[NSMutableAttributedString alloc] initWithString:s];
-    [m replaceCharactersInRange:NSMakeRange(0, m.length) withString:s];
-    if (a0.count) [m setAttributes:a0 range:NSMakeRange(0, s.length)];
-    if (aLast.count && s.length >= 2 &&
-        ([s hasSuffix:@"亿"] || [s hasSuffix:@"万"])) {
-        [m setAttributes:aLast range:NSMakeRange(s.length - 1, 1)];
+    @try {
+        NSMutableAttributedString *m = [src mutableCopy];
+        if (m && [m isKindOfClass:[NSMutableAttributedString class]]) {
+            [m replaceCharactersInRange:NSMakeRange(0, m.length) withString:s];
+            if (a0.count) [m setAttributes:a0 range:NSMakeRange(0, s.length)];
+            if (aLast.count && s.length >= 2 &&
+                ([s hasSuffix:@"亿"] || [s hasSuffix:@"万"])) {
+                [m setAttributes:aLast range:NSMakeRange(s.length - 1, 1)];
+            }
+            if (m.length == s.length) return m;
+        }
+    } @catch (NSException *e) {
+        static BOOL sOnce = NO;
+        if (!sOnce) { sOnce = YES;
+            SLLog(@"STAT| 富文本就地替换失败（%@），改用重建", e.reason ?: @"?"); }
     }
-    return m;
+    // 就地改不动就重建一份：样式照抄第一段，单位沿用最后一段
+    NSMutableAttributedString *m2 = [[NSMutableAttributedString alloc] initWithString:s];
+    if (a0.count) [m2 setAttributes:a0 range:NSMakeRange(0, s.length)];
+    if (aLast.count && s.length >= 2 && ([s hasSuffix:@"亿"] || [s hasSuffix:@"万"]))
+        [m2 setAttributes:aLast range:NSMakeRange(s.length - 1, 1)];
+    return m2;
+}
+
+// 计数接口返回了认不出的类型（抖音的私有富文本 / 展示模型之类）时记一笔类名。
+// 「一亿以上换不了」多半就卡在这里 —— 有这个类名，下一轮就能按类名精准处理。
+static void SLProfNoteCountType(NSString *tag, id v) {
+    static NSMutableSet *seen = nil;
+    if (!seen) seen = [NSMutableSet set];
+    NSString *cn = v ? NSStringFromClass([v class]) : @"nil";
+    NSString *k = [NSString stringWithFormat:@"%@|%@", tag, cn];
+    if ([seen containsObject:k]) return;
+    [seen addObject:k];
+    SLLog(@"STAT| %@ 返回 %@，类型没认出来 → 原样放行", tag, cn);
 }
 
 #define SL_PROF_COUNT_HOOK(NAME, KEY, TAG, FIELD)                          \
@@ -1086,7 +1148,8 @@ static id SLProfAttrCount(id v, long long n) {
         if ([v isKindOfClass:[NSAttributedString class]])                  \
             return SLProfAttrCount(v, n);                                  \
         if (v && ![v isKindOfClass:[NSString class]] &&                    \
-            ![v isKindOfClass:[NSNumber class]]) return v;                 \
+            ![v isKindOfClass:[NSNumber class]]) {                         \
+            SLProfNoteCountType(TAG, v); return v; }                       \
         if ([v isKindOfClass:[NSString class]]) return SLProfFormatCount(n); \
         return @(n);                                                       \
     }
@@ -1186,8 +1249,12 @@ static void SLProfSetExtra(NSString *field, NSString *value) {
 
 // 从快照里把这几个字段抽出来整包写进去（对方没有的就不写，避免凭空多出认证）
 static void SLApplySnapExtras(NSDictionary *snap) {
+    NSUserDefaults *ud0 = [NSUserDefaults standardUserDefaults];
+    id cur = [ud0 dictionaryForKey:SLProfScopedKey(SLProfKeyExtra)];
     NSMutableDictionary *d = [NSMutableDictionary dictionary];
+    if ([cur isKindOfClass:[NSDictionary class]]) [d addEntriesFromDictionary:cur];
     for (NSString *f in SLExtraFields()) {
+        if ([d[f] isKindOfClass:[NSString class]] && [(NSString *)d[f] length]) continue;   // 手填优先
         NSString *v = SLSnapText(snap, f);
         if (v.length) d[f] = v;
     }
@@ -1303,6 +1370,13 @@ static NSDictionary *SLProfRealTextMap(void) {
         NSInteger g = o_gender ? o_gender(sSLMyModel, @selector(gender)) : 0;
         if (g == 2) m[@"女"] = ageTxt;
         else if (g == 1) m[@"男"] = ageTxt;
+        // 真值读不到（model 还没来 / 对方没公开）也照样换：
+        // 页面上那颗 chip 只可能是「男」或「女」，两个都指向我们要显示的文本。
+        // 0.9.7 之前这里因为拿不到真值，整条 map 是空的 —— 设置里填了也一点不动。
+        if (!rt.length && !combo.length) {
+            m[@"男"] = ageTxt;
+            m[@"女"] = ageTxt;
+        }
     }
 
     NSString *loc = SLExtraStr(@"city") ?: SLExtraStr(@"location");
@@ -1490,6 +1564,62 @@ static BOOL SLProfApplyAgeLocTextDepth(UIView *root, NSDictionary *map, NSString
     return hit;
 }
 
+// 39.9.0 的「我」页里，性别 / 地区根本不是 AgeAndLocation 那个 cell（日志里永远是 0 个），
+// 而是昵称下面那一排 chips：
+//     [中国台湾]  [+ 添加性别等标签]
+//     [女]        [+ 添加所在地等标签]
+// 这些小方块是抖音按 model 现拼的，拼完就缓存成标题，所以我们挂的 getter 追不上。
+// 这里换个思路：找到「+ 添加XX等标签」那颗按钮，它和资料 chip 是同一个父视图下的兄弟，
+// 把兄弟里不是按钮的那几个按内容认出来直接改字。
+//   · 文本是「男 / 女 / NN岁 / 女 · NN岁」→ 换成设置里的性别年龄
+//   · 其余短文本 → 换成设置里的地区
+static NSString *SLProfFirstTextIn(UIView *v, int depth) {
+    NSString *t = SLProfTextOfView(v);
+    if (t.length) return t;
+    if (depth <= 0) return nil;
+    for (UIView *s in v.subviews) {
+        NSString *r = SLProfFirstTextIn(s, depth - 1);
+        if (r.length) return r;
+    }
+    return nil;
+}
+
+static BOOL SLProfSetFirstTextIn(UIView *v, NSString *text, int depth) {
+    if (!text.length) return NO;
+    if (SLProfSetTextOfView(v, text)) return YES;
+    if (depth <= 0) return NO;
+    for (UIView *s in v.subviews) if (SLProfSetFirstTextIn(s, text, depth - 1)) return YES;
+    return NO;
+}
+
+static BOOL SLProfLooksLikeGenderChip(NSString *t) {
+    return [t isEqualToString:@"男"] || [t isEqualToString:@"女"] || SLProfLooksLikeAge(t);
+}
+
+static BOOL SLProfFixHeaderChips(UIView *root, NSString *ageTxt, NSString *regionTxt, int depth) {
+    if (!root || depth > 16 || sSLTextMapBusy) return NO;
+    BOOL hit = NO;
+    for (UIView *v in [root.subviews copy]) {
+        if ([NSStringFromClass([v class]) hasPrefix:@"SL"]) continue;
+        NSString *t = SLProfTextOfView(v);
+        if (t.length && [t containsString:@"添加"] && [t containsString:@"标签"]) {
+            UIView *row = v.superview;
+            if (row) {
+                for (UIView *chip in [row.subviews copy]) {
+                    if (chip == v) continue;
+                    NSString *ct = SLProfFirstTextIn(chip, 3);
+                    if (!ct.length || [ct containsString:@"添加"]) continue;
+                    NSString *want = SLProfLooksLikeGenderChip(ct) ? ageTxt : regionTxt;
+                    if (!want.length || [want isEqualToString:ct]) continue;
+                    if (SLProfSetFirstTextIn(chip, want, 3)) hit = YES;
+                }
+            }
+        }
+        if (SLProfFixHeaderChips(v, ageTxt, regionTxt, depth + 1)) hit = YES;
+    }
+    return hit;
+}
+
 static BOOL sSLAgelocBusy = NO;
 
 static void SLProfApplyAgeLocationNow(void) {
@@ -1534,12 +1664,23 @@ static void SLProfApplyAgeLocationNow(void) {
         NSString *ipTxt = SLExtraStr(@"ipLocation");
         if (ipTxt.length && ![ipTxt hasPrefix:@"IP属地"])
             ipTxt = [@"IP属地：" stringByAppendingString:ipTxt];
+        NSString *regionTxt = SLExtraStr(@"city") ?: SLExtraStr(@"location");
         NSDictionary *map = SLProfRealTextMap();
         if (meVC && win && (map.count || ageTxt.length)) {
             if (SLProfApplyAgeLocTextDepth(meVC.view, map, ageTxt, ipTxt, win, 0)) {
                 static BOOL sWriteLogged = NO;
                 if (!sWriteLogged) { sWriteLogged = YES;
                     SLLog(@"PROF| 已在 header 按文本改写年龄 / 地区 / IP"); }
+            }
+        }
+        // chips 那一排（截图里的「中国台湾 / + 添加性别等标签」）
+        if (meVC && (ageTxt.length || regionTxt.length)) {
+            BOOL chips = SLProfFixHeaderChips(meVC.view, ageTxt, regionTxt, 0);
+            if (chips) {
+                static BOOL sChipLogged = NO;
+                if (!sChipLogged) { sChipLogged = YES;
+                    SLLog(@"PROF| 已改写资料标签（性别=%@ 地区=%@）",
+                          ageTxt ?: @"不动", regionTxt ?: @"不动"); }
             }
         }
 
@@ -2137,30 +2278,61 @@ static BOOL SLProfPostsIsMine(id mgr) {
     return [owner isEqualToString:sSLProfMyUID];
 }
 
+// 这个管理器「属于哪个账号」→ 读那一份预设。
+// 换号那一下，作品管理器可能比 sSLCurAcct 先建出来（页面比 model 先走），
+// 用全局的 sSLWorkWant 就会拿到上一个号的伪装对象，或者干脆还没切过来 → 直接拉回自己的作品。
+static NSString *SLProfPostsOwner(id mgr) {
+    return objc_getAssociatedObject(mgr, &kSLPostsUIDKey);
+}
+
+static NSString *SLProfWorkWantFor(id mgr) {
+    NSString *owner = SLProfPostsOwner(mgr);
+    if (owner.length) return SLProfStrForUID(SLProfKeyWant, owner);
+    return sSLWorkWant;
+}
+
+static NSString *SLProfWorkSecFor(id mgr) {
+    NSString *owner = SLProfPostsOwner(mgr);
+    if (owner.length) return SLProfStrForUID(SLProfKeySec, owner);
+    return SLProfStr(SLProfKeySec);
+}
+
+// 0.9.8：不再要求「此刻正站在我页」。
+// 换号后的首刷往往发生在我们认出账号之前，用页面门去卡就会永远卡在「拉回自己的作品」，
+// 只能重启才好 —— 这就是「切号作品不同步」的真正原因。
+// 改成认归属：只有「这个管理器属于我们自己某个账号、而且那个账号存过伪装对象」才换参数。
+// 别人主页的管理器 owner 里存的是对方的 uid，永远没有预设，天然不会被误换。
 static BOOL SLProfPostsSpoofOn(id mgr) {
-    if (!sSLWorkWant.length || !SLProfWorksEnabled()) return NO;
-    if (sSLProfMyUID.length && [sSLWorkWant isEqualToString:sSLProfMyUID]) return NO;
-    if (!SLProfGateLoose()) return NO;
-    return SLProfPostsIsMine(mgr);
+    if (!SLProfWorksEnabled()) return NO;
+    if (sSLProfKindVal == -1) return NO;                 // 明确站在别人主页：立刻收手
+    NSString *want = SLProfWorkWantFor(mgr);
+    if (!want.length) return NO;
+    NSString *owner = SLProfPostsOwner(mgr);
+    if (owner.length) return ![want isEqualToString:owner];
+    // 认不出归属（页面自己 copy 出来的副本）：退回老规则，但只要有伪装对象就干
+    if (!SLProfPostsIsMine(mgr)) return NO;
+    if (sSLProfMyUID.length && [want isEqualToString:sSLProfMyUID]) return NO;
+    return sSLProfMyUID.length > 0;
 }
 
 static id (*o_postsUID)(id, SEL);
 static id h_postsUID(id self, SEL _cmd) {
     id v = o_postsUID ? o_postsUID(self, _cmd) : nil;
     if (!SLProfPostsSpoofOn(self)) return v;
+    NSString *want = SLProfWorkWantFor(self) ?: sSLWorkWant;
     static BOOL sLogged = NO;
     if (!sLogged) {
         sLogged = YES;
-        SLLog(@"WORKS| 作品请求改用对方 id %@（联网拉取）", sSLWorkWant);
+        SLLog(@"WORKS| 作品请求改用对方 id %@（联网拉取）", want);
     }
-    return sSLWorkWant;
+    return want;
 }
 
 static id (*o_postsSec)(id, SEL);
 static id h_postsSec(id self, SEL _cmd) {
     id v = o_postsSec ? o_postsSec(self, _cmd) : nil;
     if (!SLProfPostsSpoofOn(self)) return v;
-    NSString *sec = SLProfStr(SLProfKeySec);
+    NSString *sec = SLProfWorkSecFor(self);
     return sec.length ? sec : v;
 }
 
@@ -2175,11 +2347,12 @@ static id h_postsParams(id self, SEL _cmd) {
         sKeysLogged = YES;
         SLLog(@"WORKS| 作品请求参数键：%@", [[d allKeys] componentsJoinedByString:@","]);
     }
-    NSString *sec = SLProfStr(SLProfKeySec);
+    NSString *want = SLProfWorkWantFor(self) ?: sSLWorkWant;
+    NSString *sec = SLProfWorkSecFor(self);
     for (NSString *k in @[@"user_id", @"uid", @"userID", @"author_id", @"to_user_id"]) {
         id old = d[k];
         if (!old) continue;
-        d[k] = [old isKindOfClass:[NSNumber class]] ? @([sSLWorkWant longLongValue]) : sSLWorkWant;
+        d[k] = [old isKindOfClass:[NSNumber class]] ? @([want longLongValue]) : want;
     }
     if (sec.length) {
         for (NSString *k in @[@"sec_user_id", @"sec_uid", @"secUid", @"sec_user_uid"]) {
@@ -2271,11 +2444,8 @@ static void SLProfCheckStepMark(void) {
     s = [s stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
     if (!s.length) return;
     SLLog(@"PROF| 上次进程死在「%@」之后（没有 ObjC 异常，属于硬崩）", s);
-    if ([s isEqualToString:@"works.refresh"]) {
-        // 就是踢作品这一脚。这一轮干脆不踢了 —— 参数替换照旧，
-        // 页面自己那次首刷本来就会按对方的 id 去拉。
-        sSLWorksKickBlocked = YES;
-        SLLog(@"PROF| 本次不再自动重拉作品（上次就死在它手上），请求参数照旧换");
+    if ([s isEqualToString:@"acct.switch"]) {
+        SLLog(@"PROF| 崩在换号那一下：这轮换号后的自动补一轮已延后，且不碰页面刷新");
     }
 }
 
@@ -2320,128 +2490,47 @@ static NSArray *SLProfWorksVCs(void) {
     return pick ? @[ pick ] : @[];
 }
 
-static void SLProfWorksKick(void);
+// 作品同步：**只靠请求参数换 id**，一次 refresh 都不主动调。
+//
+// 两次血的教训：
+//   0.9.5 进页就踢一次 refreshDataWithCompletion: —— 日志里踢完 1 秒进程消失；
+//   0.9.7 改成每代最多补 3 次 —— 用户反馈「切换账号刷新主页会闪退」。
+// 两次是同一个原因：我们那次 refresh 和页面自己的首刷 / 下拉刷新撞在同一个 dataSource 上，
+// IGListKit 前后账对不上，直接是信号级崩溃（连 ObjC 异常都来不及抛，日志一条 CRASH| 都没有）。
+//
+// 0.9.8 起彻底不碰页面。作品换不换得对，全靠 userID / secUserID / commonParams 这三个 getter，
+// 而它们现在按「这个管理器属于哪个账号」去读预设，换号那一下不用等 sSLCurAcct 先切过来。
+// 这里只做只读观察：列表对不对、首条作品的播放量是多少，打一行给下一轮定位用。
+static void SLProfWorksWatch(void) {
+    if (!sSLWorkWant.length || !SLProfWorksEnabled() || !SLProfGateLoose()) return;
+    static int sWatchedGen = -1;
+    if (sWatchedGen == sSLWorksGen) return;
 
-// 读一眼作品页现在的列表：条数 + 首条作者
-static void SLProfWorksSnapshot(UIViewController *vc, NSUInteger *outN, NSString **outWho) {
-    if (outN) *outN = 0;
-    if (outWho) *outWho = nil;
-    if (!vc) return;
-    id dm = SLProfCallObj(vc, @"dataManager");
-    id ds = dm ? SLProfCallObj(dm, @"dataSource") : nil;
-    if (![ds isKindOfClass:[NSArray class]]) return;
-    NSUInteger n = [(NSArray *)ds count];
-    if (outN) *outN = n;
-    if (!n) return;
-    id first = [(NSArray *)ds firstObject];
-    id author = SLProfCallObj(first, @"author");
-    if (!author) author = SLProfCallObj(SLProfCallObj(first, @"awemeModel"), @"author");
-    if (outWho) *outWho = SLProfObjText(author ? SLProfCallObj(author, @"userID") : nil);
-}
-
-// 只读诊断：这一次到底拉到的是谁的列表。
-static void SLProfWorksDiagnose(void) {
     NSArray *vcs = SLProfWorksVCs();
-    if (!vcs.count) return;
+    if (!vcs.count) return;                                     // 作品页还没建出来
+    NSTimeInterval now = [NSProcessInfo processInfo].systemUptime;
+    if (sSLOnMeSince <= 0 || now - sSLOnMeSince < 2.5) return;   // 让首刷先回来，别抢
+
     NSUInteger n = 0;
     NSString *who = nil;
     SLProfWorksSnapshot(vcs.firstObject, &n, &who);
-    BOOL ok = (n > 0) && [who isEqualToString:(sSLWorkWant ?: @"")];
-    SLLog(@"WORKS| 作品列表 %lu 条 · 首条作者 %@ · 想要 %@ · %@", (unsigned long)n,
-          who ?: @"?", sSLWorkWant ?: @"无", ok ? @"对上" : @"没对上");
-    // 0.9.5 这里还挂着一脚「0 条就 1.2 秒后补一枪」。
-    // 首刷没回来时补那一枪 = 两个请求同时改同一个 dataSource，闪退正出在这。已删。
-}
+    if (!n) return;                                             // 还在路上，下一拍再看
+    sWatchedGen = sSLWorksGen;
+    BOOL ok = [who isEqualToString:sSLWorkWant];
+    SLLog(@"WORKS| 列表 %lu 条 · 首条作者 %@ · 想要 %@ · %@（不主动刷新）",
+          (unsigned long)n, who ?: @"?", sSLWorkWant, ok ? @"对上" : @"没对上");
 
-// 作品同步：**只靠请求参数换 id**，不再「进页就踢一次」。
-//
-// 0.9.5 的日志把顺序摆得很清楚：
-//     WORKS| 作品请求改用对方 id 1638739731022221（联网拉取）   ← 页面自己那次首刷
-//     WORKS| 已让作品页按对方 id（…）重新拉取 · AWEPostWorkViewControllerV2
-//     下一秒进程消失
-// 也就是说：首刷本来就已经按对方的 id 在拉了，我们再补一脚纯属多余；
-// 而且那一脚正好踩在首刷还在飞的时候 —— 两个响应各改一次同一个 dataSource，
-// IGListKit 账对不上，硬崩（连 ObjC 异常都来不及抛）。
-//
-// 现在改成「先看后踢」：
-//   · 列表已经是对方那份 → 记一代，什么都不做
-//   · 列表还是空的 → 首刷在路上，等 8 秒（大号列表回得慢，2 秒不够）
-//   · 列表有内容但首条作者不是对方（换号 / 缓存没换）→ 补一次，每代最多一次
-static void SLProfWorksKick(void) {
-    if (!sSLWorkWant.length || !SLProfWorksEnabled() || !SLProfGateLoose()) return;
-    if (sSLWorksKickBlocked) return;                // 上一轮就死在它手上，这一轮不碰
-    if (sSLWorksRetry >= 3) return;                 // 这一代已经补够 3 次，别再折腾页面
-
-    NSTimeInterval now = [NSProcessInfo processInfo].systemUptime;
-    if (sSLOnMeSince <= 0 || now - sSLOnMeSince < 2.0) return;   // 页面还没站稳
-
-    NSArray *vcs = SLProfWorksVCs();
-    if (!vcs.count) return;                         // 作品页还没建出来，等下一拍
-    UIViewController *vc = vcs.firstObject;
-
-    NSUInteger n = 0;
-    NSString *who = nil;
-    SLProfWorksSnapshot(vc, &n, &who);
-
-    if (n > 0 && [who isEqualToString:sSLWorkWant]) {
-        sSLWorksReloaded = sSLWorksGen;
-        sSLWorksRetry = 3;                          // 已经是对的了，这一代收手
-        static BOOL sDoneLogged = NO;
-        if (!sDoneLogged) {
-            sDoneLogged = YES;
-            SLLog(@"WORKS| 列表已经是对方的（%lu 条），不用再拉", (unsigned long)n);
-        }
-        return;
-    }
-    if (n == 0 && now - sSLOnMeSince < 8.0) return;  // 首刷还没回来，别抢在它前面
-    // 第一次补刷隔 3 秒就够；后续每次至少 6 秒，给上一次请求留足回来的时间。
-    // 0.9.6 是「每代只补一次」，换号那一刻页面还没重建时那一次必然落空 —— 于是只能重启。
-    if (now - sSLWorksKickAt < (sSLWorksRetry == 0 ? 3.0 : 6.0)) return;
-    sSLWorksKickAt = now;
-    sSLWorksRetry++;
-    sSLWorksReloaded = sSLWorksGen;
-
-    // 回调在 ARC 下会自己搬到堆上；页面可能把它存到网络回来才用，这样也安全
-    void (^done)(id) = ^(id resp) { (void)resp; };
-    BOOL called = NO;
-    NSString *kickCls = nil;
-
-    SLProfStep(@"works.refresh");                   // 硬崩没有异常栈，先留一格面包屑
-    @try {
-        IMP im = SLProfIMP(vc, @"refreshDataWithCompletion:");
-        if (im) {
-            SLLog(@"WORKS| 调 refreshDataWithCompletion:（当前 %lu 条 · 首条作者 %@）",
-                  (unsigned long)n, who ?: @"?");
-            ((void (*)(id, SEL, id))im)(vc, NSSelectorFromString(@"refreshDataWithCompletion:"), done);
-            called = YES;
-            kickCls = NSStringFromClass([vc class]);
-        } else {
-            im = SLProfIMP(vc, @"refreshDataIsPullRefresh:completion:");
-            if (im) {
-                SLLog(@"WORKS| 调 refreshDataIsPullRefresh:（当前 %lu 条）", (unsigned long)n);
-                ((void (*)(id, SEL, BOOL, id))im)(vc,
-                    NSSelectorFromString(@"refreshDataIsPullRefresh:completion:"), NO, done);
-                called = YES;
-                kickCls = NSStringFromClass([vc class]);
-            }
-        }
-    } @catch (NSException *e) {
-        SLLog(@"WORKS| 调 refresh 抛异常：%@", e.reason ?: @"?");
-    }
-
-    if (!called) {
-        SLProfStepDone(@"works.refresh");
-        SLLog(@"WORKS| 作品页没有可用的刷新入口，这次跳过");
-        return;
-    }
-    SLLog(@"WORKS| 已让作品页按对方 id（%@）重新拉取 · %@", sSLWorkWant, kickCls ?: @"?");
-
-    // 面包屑留 4 秒：崩一般发生在网络回来的那一下（1 秒内），抹太早等于没记
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(4.0 * NSEC_PER_SEC)),
-                   dispatch_get_main_queue(), ^{ SLProfStepDone(@"works.refresh"); });
-    // 只读诊断，不再碰 section / 不再补枪
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)),
-                   dispatch_get_main_queue(), ^{ SLProfWorksDiagnose(); });
+    // 作品封面上的播放量是服务器给的。抖音对「不是本人发的作品」经常直接回 0，
+    // 这一行把服务端给的值打出来 —— 到底是它给的 0，还是被我们改成了 0，一看就知道。
+    id dm = SLProfCallObj(vcs.firstObject, @"dataManager");
+    id ds = dm ? SLProfCallObj(dm, @"dataSource") : nil;
+    id first = ([ds isKindOfClass:[NSArray class]] && [(NSArray *)ds count])
+               ? [(NSArray *)ds firstObject] : nil;
+    id stats = SLProfCallObj(first, @"statistics") ?: SLProfCallObj(first, @"stats");
+    id pc = stats ? SLProfCallObj(stats, @"playCount") : nil;
+    SLLog(@"WORKS| 首条作品 播放=%@（服务端原值）· %@",
+          SLProfObjText(pc) ?: @"nil",
+          first ? NSStringFromClass([first class]) : @"nil");
 }
 
 #pragma mark - 头像
@@ -2457,9 +2546,30 @@ static void SLProfWorksKick(void) {
 
 static BOOL sSLAvatarBusy = NO;      // 防止 getter 里再回调自己
 
+// 不是当前号、但自己也存过伪装头像（账号切换面板里的其他号）→ 按那份 URL 重建
+static id SLProfAltAvatar(id model, id orig, NSString *getter) {
+    if (sSLAvatarBusy) return orig;
+    NSString *uid = SLProfModelUID(model);
+    if (!uid.length) return orig;
+    if (sSLCurAcct.length && [uid isEqualToString:sSLCurAcct]) return orig;
+    NSString *url = SLProfStrForUID(SLProfKeyAvatar, uid);
+    if (!url.length) return orig;
+    Class uc = objc_getClass("AWEURLModel");
+    if (!uc || (orig && ![orig isKindOfClass:uc])) return orig;
+    sSLAvatarBusy = YES;
+    id rb = SLProfURLModelFrom(url);
+    sSLAvatarBusy = NO;
+    if (!rb) return orig;
+    static BOOL sAltLogged = NO;
+    if (!sAltLogged) { sAltLogged = YES;
+        SLLog(@"AVATAR| 另一个已伪装的号（%@）按预设重建头像", uid); }
+    return rb;
+}
+
 static id SLProfAvatarDo(id model, id orig, NSString *getter) {
     if (sSLAvatarBusy) return orig;
-    if (!SLProfGate() || !SLProfIsMe(model)) return orig;
+    if (!SLProfGate()) return SLProfAltAvatar(model, orig, getter);
+    if (!SLProfIsMe(model)) return SLProfAltAvatar(model, orig, getter);
 
     id other = sSLWorkWant.length ? sSLFakeUsers[sSLWorkWant] : nil;
     if (other && other != model) {
@@ -2663,7 +2773,16 @@ static void SLProfHidePrivateInDepth(UIView *root, int depth) {
         }
         UIView *hide = target ?: root.superview ?: root;
         hide.hidden = YES;
-        // 只藏不留洞：宽度压 0，并盯住父容器的每次 layout
+        hide.alpha = 0;
+        // 只藏不留洞：整行的那种连高度一起压 0（只压宽度会留下一条空白横带，很难看）；
+        // 分段控件里的 tab 只压宽度，压高度会把整条挤没。
+        CGRect hf = hide.frame;
+        if (CGRectGetWidth(hf) > 260) {
+            hide.frame = CGRectMake(hf.origin.x, hf.origin.y, 0, 0);
+        } else if (CGRectGetWidth(hf) > 0.5) {
+            hide.frame = CGRectMake(hf.origin.x, hf.origin.y, 0, hf.size.height);
+        }
+        // 小容器（「作品 / 私密」那种分段条）额外盯住父容器的每次 layout
         UIView *box = hide.superview;
         if (box && ![box isKindOfClass:[UIStackView class]] &&
             CGRectGetHeight(box.bounds) < 140 && CGRectGetWidth(box.bounds) < 500) {
@@ -2674,7 +2793,7 @@ static void SLProfHidePrivateInDepth(UIView *root, int depth) {
             SLProfCollapseVictim(box);
         }
         static BOOL sLogged = NO;
-        if (!sLogged) { sLogged = YES; SLLog(@"PROF| 已隐起「私密作品」入口（宽度归零，不留空洞）"); }
+        if (!sLogged) { sLogged = YES; SLLog(@"PROF| 已隐起「私密作品」入口（整行压平，不留空洞）"); }
         return;
     }
     for (UIView *v in [root.subviews copy]) SLProfHidePrivateInDepth(v, depth + 1);
@@ -3124,8 +3243,6 @@ static void h_profEnterPage(id self, SEL _cmd, BOOL animated) {
     sSLWasOnMe = YES;
     // 每次进来都算新的一代：作品要重新按对方 id 拉，不能因为「这个号刷过」就跳过
     sSLWorksGen++;
-    sSLWorksReloaded = -1;
-    sSLWorksRetry = 0;
     IMP o = SLProfFindOrig(self, _cmd);
     if (o) ((void (*)(id, SEL, BOOL))o)(self, _cmd, animated);
 
@@ -3216,8 +3333,6 @@ static void SLProfTick(void) {
         sSLWasOnMe = YES;
         // 每次回到「我」页都算新的一代：作品要按对方 id 重新判一次
         sSLWorksGen++;
-        sSLWorksReloaded = -1;
-        sSLWorksRetry = 0;
         // 作品那边「页面站稳了没有」从这一刻起算，别跟首刷抢
         sSLOnMeSince = [NSProcessInfo processInfo].systemUptime;
         SLLog(@"PROF| 我页在，开始驻留巡检（缺什么补什么）%@", sSLProfSafeMode ? @"· 保守模式" : @"");
@@ -3238,7 +3353,7 @@ static void SLProfTick(void) {
     SL_TICK_STEP(cover,   SLProfCoverPrefetch(); SLProfForceCover());
     if (!sSLProfSafeMode) SL_TICK_STEP(ageloc, SLProfApplyAgeLocationNow());
     if (!sSLProfSafeMode && (sSLTickCount % 2 == 0)) SL_TICK_STEP(priv, SLProfHidePrivateUI());
-    if (!sSLProfSafeMode) SL_TICK_STEP(works, SLProfWorksKick());
+    if (!sSLProfSafeMode) SL_TICK_STEP(works, SLProfWorksWatch());
     if (sSLTickCount % 4 == 0) SL_TICK_STEP(avatar, SLProfPaintAvatar());
 #undef SL_TICK_STEP
 
