@@ -2097,8 +2097,6 @@ static void SLProfWorksDiagnose(void) {
         SLLog(@"WORKS| 作品列表 %lu 条 · 首条作者 %@ · 想要 %@ · %@", (unsigned long)n,
               who, sSLWorkWant ?: @"无", ok ? @"对上" : @"没对上");
 
-        BOOL known = ![who isEqualToString:@"?"];
-        BOOL ok = (n > 0) && known && [who isEqualToString:(sSLWorkWant ?: @"")];
         // 只在「一条都没拉到」时补一枪。
         // 有数据但不是对方的，说明服务器就是按真实 id 回的，再补还是同样结果，
         // 而且多一次 refresh 就多一次和页面分页打架的机会。
@@ -3187,7 +3185,7 @@ void SLProfileStart(void) {
     SLProfHookPageLifecycle(objc_getClass("AWEProfileMergedTabContainerViewController"));
     SLProfHookPageLifecycle(objc_getClass("AWEProfileBaseContainerViewController"));
 
-    SLLog(@"PROF| ==== 主页伪装 v0.9.4 · 已挂载 · 快照 %lu 个 ====", (unsigned long)SLSnapList().count);
+    SLLog(@"PROF| ==== 主页伪装 v0.9.5 · 已挂载 · 快照 %lu 个 ====", (unsigned long)SLSnapList().count);
     SLProfStartTicker();       // 0.8s 驻留巡检：不依赖任何一次 viewDidAppear 恰好触发
     // 账号要等我页出现才认得出，晚点再打一行状态，免得开局那行永远是「账号 ?」
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.0 * NSEC_PER_SEC)),
