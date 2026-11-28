@@ -110,8 +110,10 @@
 
 #import <objc/runtime.h>
 #import <objc/message.h>
+#include <string.h>
+#include <stdlib.h>
 
-#define SLProfVersion      @"0.9.8"          // 与 control / SLSettingsPanel 同步
+#define SLProfVersion      @"0.9.9"          // 与 control / SLSettingsPanel 同步
 #define SLProfKeyEnabled   @"SLProf.enabled"
 #define SLProfKeyNickname  @"SLProf.nickname"
 #define SLProfKeyUID       @"SLProf.uid"
@@ -143,6 +145,7 @@ static int  sSLProfMissLogged = 0;  // 门未开的诊断日志，最多打几�
 
 static id SLProfCallObj(id obj, NSString *selName);   // 定义在「页面判定」段，快照要用
 static BOOL SLProfGate(void);                         // 定义在「页面判定」段，套用快照时要用
+static void SLProfSpoofPlayInList(id ds);             // 定义在「封面播放量」段，列表回来时补挂
 static void SLProfForceCover(void);                   // 定义在「封面」段，套用后用
 static NSString *sSLWorkWant = nil;                   // 要模拟谁（每个账号各自一份，落盘）
 static NSString *sSLProfMyUID = nil;                  // 当前登录账号的 uid（在「我」页读到）
@@ -2264,6 +2267,8 @@ static void h_postsSetDS(id self, SEL _cmd, id ds) {
         if (n) SLLog(@"WORKS| 记住 %@ 的作品列表（%@，%lu 条）", uid,
                      NSStringFromClass([ds class]), (unsigned long)n);
     }
+    // 列表一到先挂统计模型 / 改字典 —— 那会儿 cell 还没配置，赶得上首屏
+    if (ds) SLProfSpoofPlayInList(ds);
     if (o_postsSetDS) o_postsSetDS(self, _cmd, ds);
 }
 
@@ -2540,9 +2545,176 @@ static void SLProfWorksWatch(void) {
                ? [(NSArray *)ds firstObject] : nil;
     id stats = SLProfCallObj(first, @"statistics") ?: SLProfCallObj(first, @"stats");
     id pc = stats ? SLProfCallObj(stats, @"playCount") : nil;
-    SLLog(@"WORKS| 首条作品 播放=%@（服务端原值）· %@",
+    SLLog(@"WORKS| 首条作品 播放=%@（服务端原值，0 由 PLAY| 按点赞推算）· %@",
           SLProfObjText(pc) ?: @"nil",
           first ? NSStringFromClass([first class]) : @"nil");
+}
+
+#pragma mark - 封面播放量（按点赞推算）
+//
+// 别人的播放量**拿不到**：抖音服务端对「不是本人发的作品」把统计里的 play_count 直接回 0，
+// 客户端也没有任何接口问得到 —— 抖音自己都不给游客看别人的播放量。
+// 所以这里不装作拿到了真值，只在本地按点赞推算一个像真的：
+//
+//     播放 = 点赞 × k        k 由点赞数自身决定（40~80），同一条作品每次算出来都一样
+//
+// 点赞为 0 的作品按对象地址散列兜底（3 千 ~ 3 万），至少不会显示 0。
+// 服务端真给了非 0（本人作品就是这样）就原样放过，一个字都不改。
+//
+// 两条路一起走，谁先到算谁：
+//   1) 统计模型类上挂 -playCount：进 App 就扫一遍「类名带 Statistic」的类挂上；
+//      列表回来时再按手里那个真对象补挂一次（这时 cell 还没配置，首屏就生效）
+//   2) 统计是 NSMutableDictionary 的版本：直接把 play_count 写进去
+
+typedef struct { Class cls; IMP imp; char wide; } SLPlayOrig;
+static SLPlayOrig sPlayOrig[8];
+static int  sPlayOrigN = 0;
+static BOOL sPlayHookedLogged = NO;
+
+// 被挂过的每个类各记一份原实现；子类继承来的 IMP 顺着父类链找。
+// wide = 0 表示它原来返回的是 32 位 int —— 用 64 位签名去转，高位就是垃圾。
+static long long SLProfOrigPlay(id self, SEL _cmd) {
+    for (Class c = object_getClass(self); c; c = class_getSuperclass(c)) {
+        for (int i = 0; i < sPlayOrigN; i++) {
+            if (sPlayOrig[i].cls != c) continue;
+            if (!sPlayOrig[i].wide)
+                return (long long)((int (*)(id, SEL))sPlayOrig[i].imp)(self, _cmd);
+            return ((long long (*)(id, SEL))sPlayOrig[i].imp)(self, _cmd);
+        }
+    }
+    return 0;
+}
+
+// 只在「我页伪装别人」期间生效；别人主页（kind == -1）一条都不动
+static BOOL SLProfPlaySpoofOn(void) {
+    if (!SLProfWorksEnabled()) return NO;
+    if (!sSLWorkWant.length) return NO;
+    if (sSLProfKindVal == -1) return NO;
+    return YES;
+}
+
+// KVC 取标量：不关心它是 long long / int / NSNumber；字典的 key 也走同一条路
+static long long SLProfStatsNum(id stats, NSString *key) {
+    if (!stats || !key.length) return 0;
+    @try {
+        id v = [stats valueForKey:key];
+        if ([v isKindOfClass:[NSNumber class]]) return [(NSNumber *)v longLongValue];
+        if ([v isKindOfClass:[NSString class]]) return [(NSString *)v longLongValue];
+    } @catch (__unused NSException *e) {}
+    return 0;
+}
+
+static long long SLProfFakePlayFor(id stats, long long orig) {
+    if (!stats) return orig;
+    long long digg = SLProfStatsNum(stats, @"diggCount");
+    if (!digg) digg = SLProfStatsNum(stats, @"digg_count");
+    long long play;
+    if (digg > 0) {
+        play = digg * (40 + digg % 41);                 // 40~80 倍，随点赞数固定
+    } else {
+        unsigned long long h = ((unsigned long long)(uintptr_t)stats >> 4) * 2654435761ULL;
+        play = 3000 + (long long)(h % 27000);
+    }
+    return play > orig ? play : orig;
+}
+
+static long long h_statsPlay(id self, SEL _cmd) {
+    long long orig = SLProfOrigPlay(self, _cmd);
+    if (orig > 0) return orig;                          // 服务端给的就是真值，别动
+    if (!SLProfPlaySpoofOn()) return orig;
+    long long digg = SLProfStatsNum(self, @"diggCount");
+    if (!digg) digg = SLProfStatsNum(self, @"digg_count");
+    long long play = SLProfFakePlayFor(self, orig);
+    static int sLogN = 0;
+    if (play != orig && sLogN < 8) {
+        sLogN++;
+        SLLog(@"PLAY| 封面播放量按点赞推算：点赞 %ld → 播放 %ld", (long)digg, (long)play);
+    }
+    return play;
+}
+
+// 原方法是 32 位 int 的版本：算完截回去，签名和原方法保持一致
+static int h_statsPlay32(id self, SEL _cmd) {
+    return (int)h_statsPlay(self, _cmd);
+}
+
+static void SLProfHookStatsPlay(Class cls) {
+    if (!cls || sPlayOrigN >= 8) return;
+    SEL ps = NSSelectorFromString(@"playCount");
+    Method m = SLProfExact(cls, ps);
+    if (!m) return;
+    if (method_getImplementation(m) == (IMP)h_statsPlay) return;   // 已经挂过
+    char *ret = method_copyReturnType(m);
+    char c = ret ? ret[0] : 0;
+    if (ret) free(ret);
+    if (c != 'q' && c != 'Q' && c != 'i' && c != 'I' && c != 'l' && c != 'L') return;
+    if (method_getNumberOfArguments(m) != 2) return;
+    if (!SLProfExact(cls, NSSelectorFromString(@"diggCount"))) return;   // 没有点赞数就没法算
+    BOOL wide = (c == 'q' || c == 'Q' || c == 'l' || c == 'L');
+    sPlayOrig[sPlayOrigN].cls = cls;
+    sPlayOrig[sPlayOrigN].imp = method_getImplementation(m);
+    sPlayOrig[sPlayOrigN].wide = wide ? 1 : 0;
+    sPlayOrigN++;
+    method_setImplementation(m, wide ? (IMP)h_statsPlay : (IMP)h_statsPlay32);
+    SLLog(@"PLAY| 已挂 playCount @ %@（返回 %s）", NSStringFromClass(cls), wide ? "64 位" : "32 位");
+}
+
+// 手里就有真对象：按它的类（连同父类）现挂 —— 比扫类名准
+static void SLProfHookStatsPlayObject(id stats) {
+    if (!stats || [stats isKindOfClass:[NSDictionary class]]) return;
+    int guard = 0;
+    for (Class c = object_getClass(stats); c && guard < 4; c = class_getSuperclass(c), guard++) {
+        if (c == [NSObject class]) break;
+        SLProfHookStatsPlay(c);
+    }
+}
+
+// 进 App 先扫一遍类名带 Statistic 的（抖音的统计模型就叫 AWE...Statistic...）
+static void SLProfHookStatsPlayAll(void) {
+    int n = objc_getClassList(NULL, 0);
+    if (n <= 0) return;
+    Class *list = (Class *)calloc((size_t)n, sizeof(Class));
+    if (!list) return;
+    n = objc_getClassList(list, n);
+    for (int i = 0; i < n; i++) {
+        const char *name = class_getName(list[i]);
+        if (!name || !strstr(name, "Statistic")) continue;
+        SLProfHookStatsPlay(list[i]);
+    }
+    free(list);
+    SLLog(@"PLAY| 统计模型扫描完成，挂了 %d 个类", sPlayOrigN);
+}
+
+// 作品列表回来时：补挂 + 字典版本就地改
+static void SLProfSpoofPlayInList(id ds) {
+    if (![ds isKindOfClass:[NSArray class]]) return;
+    NSArray *arr = (NSArray *)ds;
+    if (!arr.count) return;
+    NSUInteger n = MIN(arr.count, (NSUInteger)60);
+    for (NSUInteger i = 0; i < n; i++) {
+        id item = arr[i];
+        id stats = SLProfCallObj(item, @"statistics");
+        if (!stats) stats = SLProfCallObj(item, @"stats");
+        if (!stats) continue;
+        SLProfHookStatsPlayObject(stats);
+        if (!SLProfPlaySpoofOn()) continue;
+        if ([stats isKindOfClass:[NSMutableDictionary class]]) {
+            long long cur = SLProfStatsNum(stats, @"play_count");
+            long long want = SLProfFakePlayFor(stats, cur);
+            if (want > cur) {
+                @try { [(NSMutableDictionary *)stats setObject:@(want) forKey:@"play_count"]; }
+                @catch (__unused NSException *e) {}
+            }
+        }
+    }
+    if (!sPlayHookedLogged) {
+        sPlayHookedLogged = YES;
+        id item = arr.firstObject;
+        id stats = SLProfCallObj(item, @"statistics") ?: SLProfCallObj(item, @"stats");
+        SLLog(@"PLAY| 统计对象是 %@ · 已挂 %d 个类 · 首条播放 %@",
+              stats ? NSStringFromClass([stats class]) : @"nil", sPlayOrigN,
+              SLProfObjText(SLProfCallObj(stats, @"playCount")) ?: @"nil");
+    }
 }
 
 #pragma mark - 头像
@@ -3631,6 +3803,9 @@ void SLProfileStart(void) {
             SLLog(@"PROF| 跳过作品列表：AWEUserPostsDataManager 不存在");
         }
     }
+
+    // 封面播放量：进 App 就把统计模型的 playCount 挂上（等列表回来再挂，首屏已经画完了）
+    SLProfHookStatsPlayAll();
 
     // 「我」页容器：挂 appear / disappear 当第二道门，并留下现场日志
     SLProfHookPageLifecycle(objc_getClass("AWEProfileTabContainerViewController"));
