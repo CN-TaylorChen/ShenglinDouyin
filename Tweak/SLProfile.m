@@ -146,6 +146,7 @@ static void SLProfSpoofPlayInList(id ds);             // 定义在「封面播�
 static id SLProfFilterPostsFor(id ds, id mgr);        // 定义在「作品」段，剔掉切号残留
 static void SLProfForceCover(void);                   // 定义在「封面」段，套用后用
 static NSString *sSLWorkWant = nil;                   // 要模拟谁（每个账号各自一份，落盘）
+static NSString *sSLMyRealNick = nil;                 // 当前登录号的真实昵称（面板改名要用）
 static NSString *sSLProfMyUID = nil;                  // 当前登录账号的 uid（在「我」页读到）
 static NSString *sSLCurAcct = nil;                    // 当前生效的账号 uid：所有预设键都按它分家
 static NSMutableDictionary *sSLCoverObjs = nil;       // uid -> 对方真实 coverList（模型对象）
@@ -947,7 +948,10 @@ static NSString *SLProfModelUID(id model) {
     static NSArray *keys = nil;
     static dispatch_once_t onceKeys;
     dispatch_once(&onceKeys, ^{
-        keys = @[@"userID", @"uid", @"userId", @"accountID", @"accountId", @"identifier"];
+        // 0.9.13：账号面板的 model 字段名和 AWEUserModel 不一样，
+        // 只认 userID/uid 会在面板里一个 uid 都取不到 -> 「按账号独立」那套全部落空。
+        keys = @[@"userID", @"uid", @"userId", @"accountID", @"accountId", @"identifier",
+                 @"userIDStr", @"uidStr", @"accountUid", @"accountUID", @"secUid", @"secUserID"];
     });
     for (NSString *k in keys) {
         id u = SLProfCallObj(model, k);
@@ -957,10 +961,38 @@ static NSString *SLProfModelUID(id model) {
     return nil;
 }
 
-// 不是当前登录号、但自己名下也存过伪装 —— 抖音的账号切换面板会同时渲染好几个号的 model，
-// 原来只有「当前这个」有伪装，没切到的号全还原成真名真头像（用户截图就是这个）。
-// 这里只对「这个 uid 名下真的存过这个字段」的 model 生效，别人的 model 一律原样放行。
+// 现在是不是站在账号切换面板上。
+//
+// 0.9.13 的关键修复。原来「这个 uid 名下存过预设 → 就按预设显示」这条规则没有页面限制，
+// 可 getter 是全局的：A 号伪装完之后，A 去点开互关好友 B 的主页，只要 B 名下也存过预设
+// （B 往往是我们自己的另一个号），B 的整页就被换成了 B 自己的伪装资料 ——
+// 用户报的「A 看 B 是伪装的号不是原号」就是这条。
+// 这条规则本来只服务一个场景：切换面板会把好几个号同时渲染出来，那几个 model 不是当前号。
+// 所以现在收窄到「面板页才生效」，别的页面一个字都不换。
+static BOOL SLProfInAccountPanel(void) {
+    if (![NSThread isMainThread]) return NO;
+    static NSTimeInterval sUntil = 0;
+    static BOOL sCached = NO;
+    NSTimeInterval now = [NSProcessInfo processInfo].systemUptime;
+    if (now < sUntil) return sCached;
+    BOOL hit = NO;
+    UIViewController *vc = SLProfTopVC();
+    for (int i = 0; i < 5 && vc; i++) {
+        NSString *cn = NSStringFromClass([vc class]);
+        if ([cn containsString:@"QuickSwitch"] || [cn containsString:@"MultiAccount"] ||
+            [cn containsString:@"AccountManagement"] || [cn containsString:@"AccountSwitch"]) {
+            hit = YES;
+            break;
+        }
+        vc = vc.presentingViewController;
+    }
+    sCached = hit;
+    sUntil = now + 0.2;
+    return hit;
+}
+
 static id SLProfAltAccountStr(id model, NSString *key, id orig) {
+    if (!SLProfInAccountPanel()) return orig;      // 不是面板页：别人的名字一律原样
     NSString *uid = SLProfModelUID(model);
     if (!uid.length) return orig;
     if (sSLCurAcct.length && [uid isEqualToString:sSLCurAcct]) return orig;
@@ -976,6 +1008,10 @@ static id SLProfAltAccountStr(id model, NSString *key, id orig) {
                                   SLProfNoteMiss(TAG);                    \
                                   return SLProfAltAccountStr(self, KEY, v); } \
         if (!SLProfIsMe(self)) return SLProfAltAccountStr(self, KEY, v);  \
+        /* 面板里当前号也写着真名：把它记下来（这是唯一能拿到真名的地方， */     \
+        /* 因为门一开返回值就被换成了预设名）。 */                              \
+        if ([v isKindOfClass:[NSString class]] && [(NSString *)v length] && \
+            [FIELD isEqualToString:@"nickname"]) sSLMyRealNick = [(NSString *)v copy]; \
         NSString *f = SLProfStr(KEY);                                     \
         if (!f.length) return v;                                          \
         if (sSLProfHits < 12) { sSLProfHits++;                            \
@@ -1832,6 +1868,9 @@ static NSString *SLProfWorkSecFor(id mgr) {
 // 别人主页的管理器 owner 里存的是对方的 uid，永远没有预设，天然不会被误换。
 static BOOL SLProfPostsSpoofOn(id mgr) {
     if (!SLProfWorksEnabled()) return NO;
+    // 先按当前页面刷新一次状态：作品请求经常发生在页面切换的同一拍，
+    // 只读缓存会拿到「上一个页面」的结论（在别人主页上把作品换成我们的伪装对象）。
+    if ([NSThread isMainThread]) SLProfPageKind();
     if (sSLProfKindVal == -1) return NO;                 // 明确站在别人主页：立刻收手
     NSString *want = SLProfWorkWantFor(mgr);
     if (!want.length) return NO;
@@ -2268,20 +2307,16 @@ static void SLProfHookStatsPlayObject(id stats) {
     }
 }
 
-// 进 App 先扫一遍类名带 Statistic 的（抖音的统计模型就叫 AWE...Statistic...）
+// 0.9.13：这里原来是进 App 后 1.5s 扫一遍全库（objc_getClassList）。
+//
+// 这一下比看起来贵得多：getClassList 会把**所有**类都 realize 一遍（二十多万个），
+// 全程握着 runtime 锁，主线程刚好在画首屏 —— 用户说的「每次进抖音卡死」就是这里。
+// 而它扫出来的收益只有一个类（0.9.12 日志：挂了 1 个类），
+// 真正的统计对象 AWEAwemeStatisticsModel 一直是作品列表回来时
+// 按手里的真对象现挂的（SLProfHookStatsPlayObject），而且播放量是直接写模型的，
+// 不依赖 getter 是否提前挂好。所以这一步整个删掉，只留一行日志说明。
 static void SLProfHookStatsPlayAll(void) {
-    int n = objc_getClassList(NULL, 0);
-    if (n <= 0) return;
-    Class *list = (Class *)calloc((size_t)n, sizeof(Class));
-    if (!list) return;
-    n = objc_getClassList(list, n);
-    for (int i = 0; i < n; i++) {
-        const char *name = class_getName(list[i]);
-        if (!name || !strstr(name, "Statistic")) continue;
-        SLProfHookStatsPlay(list[i]);
-    }
-    free(list);
-    SLLog(@"PLAY| 统计模型扫描完成，挂了 %d 个类", sPlayOrigN);
+    SLLog(@"PLAY| 不做启动全库扫描（改为作品列表回来时现挂，已挂 %d 个类）", sPlayOrigN);
 }
 
 // 作品列表回来时：补挂 + 字典版本就地改
@@ -2351,8 +2386,20 @@ static void SLProfSpoofPlayInList(id ds) {
 // 只在「这个 uid 不是当前登录号、而且它名下真的存过昵称预设」时才换，别人一律原样。
 
 typedef struct { Class cls; IMP imp; } SLAcctNickOrig;
-static SLAcctNickOrig sAcctNickOrig[8];
+static SLAcctNickOrig sAcctNickOrig[64];
 static int sAcctNickN = 0;
+
+// 面板上见到的「uid → 真名」。面板的 cell 有可能不走任何 getter 而是自己缓存文本，
+// 所以这里顺手把每个号的真名记下来，SLProfFixPanelTree 拿它做「真名 → 预设名」的替换表。
+static NSMutableDictionary *sSLPanelReal = nil;
+static int sSLPanelDumpN = 0;
+
+static void SLProfRememberRealName(NSString *uid, NSString *name) {
+    if (!uid.length || !name.length) return;
+    if (!sSLPanelReal) sSLPanelReal = [NSMutableDictionary dictionary];
+    if (sSLPanelReal.count > 40) [sSLPanelReal removeAllObjects];
+    sSLPanelReal[uid] = name;
+}
 
 static id SLProfAcctNickOrigIMP(id self, SEL _cmd) {
     for (Class c = object_getClass(self); c; c = class_getSuperclass(c)) {
@@ -2366,64 +2413,154 @@ static id SLProfAcctNickOrigIMP(id self, SEL _cmd) {
 
 static id h_acctNick(id self, SEL _cmd) {
     id v = SLProfAcctNickOrigIMP(self, _cmd);
+    if (![v isKindOfClass:[NSString class]] || ![(NSString *)v length]) return v;
+    // 只在账号切换面板里换。这些类平时也可能被别的界面拿去用，
+    // 少了这道闸就会出现「别处的名字也被改」。
+    if (!SLProfInAccountPanel()) return v;
     NSString *uid = SLProfModelUID(self);
     if (!uid.length) return v;
-    // 原来这里把「当前登录号」跳过了（以为我页已经改过），可面板里它同样写着真名。
-    // 现在不分是谁，只要名下存过预设就换。
+    // 记真名（哪怕这个号没有预设，后面按真名匹配也用得上）
+    SLProfRememberRealName(uid, v);
     NSString *n = SLProfStrForUID(SLProfKeyNickname, uid);
-    if (!n.length) return v;
-    static BOOL sLogged = NO;
-    if (!sLogged) { sLogged = YES; SLLog(@"PROF| 账号面板里的号（%@）按预设显示昵称", uid); }
+    if (!n.length || [n isEqualToString:v]) return v;
+    static int sLoggedN = 0;
+    if (sLoggedN < 6) {
+        sLoggedN++;
+        SLLog(@"PROF| 账号面板里的号（%@）「%@」→「%@」", uid, v, n);
+    }
     return n;
 }
 
-// getter 之外再兜一层。面板的 cell 常见两种躲法：
-//   1) cell 自己缓存了文本，或者根本不调 model 的 nickname；
-//   2) model 不是我们挂钩的那些类。
-// 这里在面板出现时按 cell 上挂的 model 取 uid，读该 uid 的预设，
-// 把 cell 里正好写着真名的那个 label 换掉 —— 不碰别的文本，改错的风险最低。
+// 一个类上所有「名字类」的无参 getter 全挂上。
+// 面板的 cell 不一定是读 -nickname：可能是 displayName / showName / accountName /
+// userName / nickName…（0.9.12 只挂了 nickname，日志里确实调到了，界面却没变）。
+// 与其猜它读哪个，不如把这个类里长得像名字的都接过来；uid 取不到时原样返回，不会误伤。
+static BOOL SLProfNameLikeSelector(const char *sn) {
+    if (!sn || !*sn) return NO;
+    char low[160];
+    size_t k = 0;
+    for (size_t i = 0; sn[i] && k < sizeof(low) - 1; i++) {
+        char c = sn[i];
+        low[k++] = (c >= 'A' && c <= 'Z') ? (char)(c + 32) : c;   // 不用 tolower，少一个头文件依赖
+    }
+    low[k] = '\0';
+    if (strchr(low, ':')) return NO;              // 带参数的不碰
+    return strstr(low, "nickname") || strstr(low, "displayname") ||
+           strstr(low, "showname")   || strstr(low, "accountname") ||
+           strstr(low, "username")   || strstr(low, "nick_name")   ||
+           strstr(low, "nicknamefor")|| strstr(low, "nametoshow");
+}
+
+static void SLProfHookAcctNameGetters(Class cls) {
+    if (!cls) return;
+    unsigned int mn = 0;
+    Method *ms = class_copyMethodList(cls, &mn);
+    if (!ms) return;
+    int added = 0;
+    for (unsigned int i = 0; i < mn && sAcctNickN < 64; i++) {
+        SEL sel = method_getName(ms[i]);
+        const char *sn = sel_getName(sel);
+        if (!SLProfNameLikeSelector(sn)) continue;
+        if (method_getNumberOfArguments(ms[i]) != 2) continue;
+        char *ret = method_copyReturnType(ms[i]);
+        char c = ret ? ret[0] : 0;
+        if (ret) free(ret);
+        if (c != '@') continue;
+        IMP imp = method_getImplementation(ms[i]);
+        if (imp == (IMP)h_acctNick) continue;
+        BOOL dup = NO;
+        for (int j = 0; j < sAcctNickN; j++)
+            if (sAcctNickOrig[j].cls == cls && sAcctNickOrig[j].imp == imp) { dup = YES; break; }
+        if (dup) continue;
+        sAcctNickOrig[sAcctNickN].cls = cls;
+        sAcctNickOrig[sAcctNickN].imp = imp;
+        sAcctNickN++;
+        method_setImplementation(ms[i], (IMP)h_acctNick);
+        added++;
+    }
+    free(ms);
+    if (added) SLLog(@"PROF| 账号面板：%@ 挂了 %d 个名字 getter", NSStringFromClass(cls), added);
+}
+
+// getter 之外再兜一层。面板的 cell 常见三种躲法：
+//   1) cell 自己缓存了文本，根本不调 model 的 getter；
+//   2) model 不是我们挂钩的那些类；
+//   3) 文本是「昵称 + 后缀」或者被截断了。
+// 这里不再要求「label 文本 == model.nickname」（那个前提在真机上就不成立），
+// 改成「label 文本正好是某个号的真名 → 换成那个号的预设名」。
+// 真名从三个地方凑：面板上抓到的、快照库里点开过的、手里留着的对方 model。
 static void SLProfFixPanelTree(UIView *root) {
     if (!root) return;
+
+    NSMutableDictionary *map = [NSMutableDictionary dictionary];   // 真名 -> 预设名
+
+    // ① 快照库（点开过的人）
+    NSDictionary *store = SLCapStore();
+    for (NSString *u in store) {
+        id d = store[u];
+        if (![d isKindOfClass:[NSDictionary class]]) continue;
+        id nv = d[@"nickname"];
+        if (![nv isKindOfClass:[NSString class]] || ![nv length]) continue;
+        NSString *w = SLProfStrForUID(SLProfKeyNickname, u);
+        if (w.length && ![(NSString *)nv isEqualToString:w]) map[(NSString *)nv] = w;
+    }
+    // ② 手里留着的对方真实 model
+    for (NSString *u in [sSLFakeUsers allKeys]) {
+        id nv = SLProfCallObj(sSLFakeUsers[u], @"nickname");
+        if (![nv isKindOfClass:[NSString class]] || ![nv length]) continue;
+        NSString *w = SLProfStrForUID(SLProfKeyNickname, u);
+        if (w.length && ![(NSString *)nv isEqualToString:w]) map[(NSString *)nv] = w;
+    }
+    // ③ 面板上刚抓到的真名（最准，最后写覆盖前面）
+    for (NSString *u in [sSLPanelReal allKeys]) {
+        NSString *r = sSLPanelReal[u];
+        NSString *w = SLProfStrForUID(SLProfKeyNickname, u);
+        if (w.length && r.length && ![r isEqualToString:w]) map[r] = w;
+    }
+    // ④ 当前登录号：门一开它的 nickname 就是预设名了，真名只能来自 h_nickname 记下的那份
+    {
+        NSString *w = SLProfStr(SLProfKeyNickname);
+        if (sSLMyRealNick.length && w.length &&
+            ![sSLMyRealNick isEqualToString:w]) map[sSLMyRealNick] = w;
+    }
+
+    if (sSLPanelDumpN < 2) {
+        sSLPanelDumpN++;
+        SLLog(@"PANEL| 改名表 %lu 条：%@", (unsigned long)map.count,
+              map.count ? [[map allKeys] componentsJoinedByString:@" / "] : @"（空）");
+    }
+    if (!map.count) return;
+
     NSMutableArray *stack = [NSMutableArray arrayWithObject:root];
-    int guard = 0;
-    while (stack.count && guard++ < 600) {
+    int guard = 0, changed = 0;
+    while (stack.count && guard++ < 900) {
         UIView *v = stack.lastObject;
         [stack removeLastObject];
-        BOOL isCell = [v isKindOfClass:[UITableViewCell class]] ||
-                      [v isKindOfClass:[UICollectionViewCell class]];
-        if (isCell) {
-            id model = SLProfCallObj(v, @"viewModel");
-            if (!model) model = SLProfCallObj(v, @"model");
-            if (!model) model = SLProfCallObj(v, @"accountModel");
-            if (!model) model = SLProfCallObj(v, @"account");
-            NSString *uid = SLProfModelUID(model);
-            NSString *want = uid.length ? SLProfStrForUID(SLProfKeyNickname, uid) : nil;
-            id realObj = SLProfCallObj(model, @"nickname");
-            NSString *real = [realObj isKindOfClass:[NSString class]] ? realObj : nil;
-            if (want.length && real.length && ![real isEqualToString:want]) {
-                NSMutableArray *ls = [NSMutableArray arrayWithObject:v];
-                int g2 = 0;
-                while (ls.count && g2++ < 240) {
-                    UIView *w = ls.lastObject;
-                    [ls removeLastObject];
-                    if ([w isKindOfClass:[UILabel class]]) {
-                        UILabel *lb = (UILabel *)w;
-                        NSString *t = lb.text;
-                        if (t.length && [t isEqualToString:real]) {
-                            lb.text = want;
-                            static int sPanelN = 0;
-                            if (sPanelN < 6) {
-                                sPanelN++;
-                                SLLog(@"PROF| 账号面板「%@」→「%@」（按 cell 上的 model 改）", t, want);
-                            }
+        if ([v isKindOfClass:[UILabel class]]) {
+            UILabel *lb = (UILabel *)v;
+            NSString *tx = lb.text;
+            if (tx.length) {
+                NSString *w = map[tx];
+                if (!w.length) {
+                    // 「昵称 + 小后缀」/ 被截断：只换前缀，后缀原样留着
+                    for (NSString *r in map) {
+                        if (tx.length > r.length && tx.length <= r.length + 6 &&
+                            [tx hasPrefix:r]) {
+                            w = [map[r] stringByAppendingString:[tx substringFromIndex:r.length]];
+                            break;
                         }
                     }
-                    [ls addObjectsFromArray:w.subviews];
+                }
+                if (w.length && ![tx isEqualToString:w]) {
+                    lb.text = w;
+                    changed++;
+                    if (changed <= 8) SLLog(@"PANEL| 账号面板「%@」→「%@」", tx, w);
                 }
             }
         }
         [stack addObjectsFromArray:v.subviews];
     }
+    if (changed) SLLog(@"PANEL| 本轮共改 %d 处", changed);
 }
 
 // 只在这个页面干活，别的页面一拍都不多花
@@ -2431,11 +2568,11 @@ static void SLProfFixAccountPanelIfVisible(void) {
     if (![NSThread isMainThread]) return;
     static NSTimeInterval sLast = 0;
     NSTimeInterval now = [NSProcessInfo processInfo].systemUptime;
-    if (now - sLast < 0.4) return;
+    if (now - sLast < 0.3) return;
+    if (!SLProfInAccountPanel()) return;
     UIViewController *top = SLProfTopVC();
+    while (top.presentedViewController) top = top.presentedViewController;
     if (!top || !top.isViewLoaded) return;
-    NSString *cn = NSStringFromClass([top class]);
-    if (![cn containsString:@"QuickSwitch"] && ![cn containsString:@"MultiAccount"]) return;
     sLast = now;
     @try { SLProfFixPanelTree(top.view); } @catch (__unused NSException *e) {}
 }
@@ -2456,6 +2593,9 @@ static BOOL sSLAvatarBusy = NO;      // 防止 getter 里再回调自己
 // 不是当前号、但自己也存过伪装头像（账号切换面板里的其他号）→ 按那份 URL 重建
 static id SLProfAltAvatar(id model, id orig, NSString *getter) {
     if (sSLAvatarBusy) return orig;
+    // 同上：只在账号切换面板里给「没切到的号」换头像。
+    // 不然别人主页（尤其是自己的另一个号）头像也会被换成预设的那张。
+    if (!SLProfInAccountPanel()) return orig;
     NSString *uid = SLProfModelUID(model);
     if (!uid.length) return orig;
     if (sSLCurAcct.length && [uid isEqualToString:sSLCurAcct]) return orig;
@@ -2945,6 +3085,13 @@ static void h_navAlpha(id self, SEL _cmd, double alpha, BOOL force) {
 static void (*o_detailAppear)(id, SEL, BOOL);
 static void h_detailAppear(id self, SEL _cmd, BOOL animated) {
     if (o_detailAppear) o_detailAppear(self, _cmd, animated);
+
+    // 这是「别人主页」这个类出现的第一刻，直接落闸，不等 0.15s 的页面缓存过期。
+    // 少了这一行，刚 push 的那几帧仍按「在我页」处理，对方的资料会被换成我们的预设。
+    sSLProfKindVal = -1;
+    sSLProfGateUntil = 0;
+    sSLProfOnMePage = NO;
+
     __weak UIViewController *wvc = self;
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.35 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
@@ -3322,28 +3469,36 @@ void SLProfileStart(void) {
     // 挂在 AWEUserModel 上的 nickname 追不上它们，框里「没切到的号」就还原成真名。
     // 这里把类名带 Account、自己又实现 nickname 的类一起挂上（只对「非当前账号 + 存过预设」生效）。
     {
-        int n = objc_getClassList(NULL, 0);
-        Class *list = n > 0 ? (Class *)calloc((size_t)n, sizeof(Class)) : NULL;
-        if (list) {
-            n = objc_getClassList(list, n);
-            for (int i = 0; i < n && sAcctNickN < 8; i++) {
-                const char *name = class_getName(list[i]);
-                if (!name || !strstr(name, "Account")) continue;
-                Method m = SLProfExact(list[i], NSSelectorFromString(@"nickname"));
-                if (!m || method_getNumberOfArguments(m) != 2) continue;
-                char *ret = method_copyReturnType(m);
-                char c = ret ? ret[0] : 0;
-                if (ret) free(ret);
-                if (c != '@') continue;
-                if (method_getImplementation(m) == (IMP)h_acctNick) continue;
-                sAcctNickOrig[sAcctNickN].cls = list[i];
-                sAcctNickOrig[sAcctNickN].imp = method_getImplementation(m);
-                sAcctNickN++;
-                method_setImplementation(m, (IMP)h_acctNick);
-                SLLog(@"PROF| 已挂 nickname @ %@（账号面板）", NSStringFromClass(list[i]));
-            }
-            free(list);
+        // 0.9.13：这里原来是 objc_getClassList 全库扫描（抖音 20 多万个类），
+        // 而且会把所有类 realize 一遍 —— 启动那一下卡死的主要就是它和下面 PLAY 那次。
+        // 实际挂上的类就是固定的这几个（0.9.12 日志里列得清清楚楚），改成白名单，零开销。
+        static const char *kAcctClasses[] = {
+            "DYVCDAccountManagementCellViewModel",
+            "DYAQuickSwitchMultiAccountCellViewModel",
+            "DYAQuickSwitchAccountCellViewModel",
+            "AWEAccountSwitchCellViewModel",
+            "AWEAccountManagementCellViewModel",
+            "DYVCDAccountManagementCell",
+            "AWEXBridgeAccountService",
+            "AWEIMMessageAccountCardProps",
+            "INPaymentAccount",
+            "AWEIMOfficialAccountCardContentComponent",
+            "BDXBridgeAccountGetUserInfoByCookieResponse",
+            "BDXBridgeAccountGetHistoryUserInfoResponse",
+            "DYAAwemeAccountModel",
+            "AWEAccountModel",
+            "DYAUserAccountModel",
+            // 注意：绝不能把 AWEUserModel 放进来 —— 它的 nickname 已经挂了 h_nickname，
+            // 再叠一层会在非面板页（别人主页）把名字也按预设改掉，等于复发刚才那个 bug。
+        };
+        int hit = 0;
+        for (size_t i = 0; i < sizeof(kAcctClasses) / sizeof(kAcctClasses[0]); i++) {
+            Class c = objc_getClass(kAcctClasses[i]);
+            if (!c) continue;
+            SLProfHookAcctNameGetters(c);
+            hit++;
         }
+        SLLog(@"PROF| 账号面板：白名单 %d 个类，共挂 %d 个名字 getter（不再全库扫描）", hit, sAcctNickN);
     }
 
     // 别人主页：挂 viewDidAppear:，把「伪装主页」胶囊挂上去
@@ -3405,7 +3560,7 @@ void SLProfileStart(void) {
 
     // 封面播放量：全类扫描要遍历抖音二十多万个类，放在启动这一下会明显拖慢首屏。
     // 延后 1.5s（首屏画完）再扫；列表回来时另有一条「按真对象现挂」的路，不会漏。
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)),
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{ SLProfHookStatsPlayAll(); });
 
     // 「我」页容器：挂 appear / disappear 当第二道门，并留下现场日志

@@ -74,53 +74,93 @@ static NSString *SLTimestamp(void) {
     return [fmt stringFromDate:[NSDate date]];
 }
 
+// 把攒好的一批行一次写进去。原来是一条日志一次 GCD + 一次 open/write/close，
+// 一屏几十条就是几十次系统调用，启停那几秒全砸在日志上 —— 这也是「进抖音很卡」的一部分。
+static void SLLogFlush(NSArray<NSString *> *lines) {
+    if (!lines.count) return;
+    NSString *path = SLLogPath();
+    if (!path.length) return;
+
+    NSMutableData *md = [NSMutableData data];
+    for (NSString *l in lines) {
+        NSData *d = [l dataUsingEncoding:NSUTF8StringEncoding];
+        if (d) [md appendData:d];
+    }
+    if (!md.length) return;
+
+    @try {
+        NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:path];
+        if (fh) {
+            [fh seekToEndOfFile];
+            [fh writeData:md];
+            unsigned long long end = [fh offsetInFile];
+            // 不再每条 fsync：批量落盘，每 32 行同步一次即可（进程被杀也不丢已写的内容）
+            static NSUInteger sPending = 0;
+            sPending += lines.count;
+            if (sPending >= 32) { sPending = 0; [fh synchronizeFile]; }
+            [fh closeFile];
+            if (end > SL_LOG_MAX_BYTES) {
+                NSData *d = [NSData dataWithContentsOfFile:path];
+                if (d.length > SL_LOG_MAX_BYTES) {
+                    NSData *tail = [d subdataWithRange:NSMakeRange(d.length - SL_LOG_KEEP_BYTES, SL_LOG_KEEP_BYTES)];
+                    // 关键：不能从中间切。切在半个中文字上，整份文件就不是合法 UTF-8，
+                    // 日志页 decode 会失败 → 返回空串 → 用户看到的是「日志是空的」。
+                    // 从第一个换行之后开始留。
+                    const uint8_t *b = (const uint8_t *)tail.bytes;
+                    NSUInteger start = 0;
+                    for (NSUInteger i = 0; i < tail.length && i < 8192; i++) {
+                        if (b[i] == '\n') { start = i + 1; break; }
+                    }
+                    if (start < tail.length) {
+                        NSData *clean = [tail subdataWithRange:NSMakeRange(start, tail.length - start)];
+                        [clean writeToFile:path atomically:YES];
+                    }
+                }
+            }
+        } else {
+            NSData *d = [NSData dataWithContentsOfFile:path];
+            NSMutableData *all = d ? [d mutableCopy] : [NSMutableData data];
+            [all appendData:md];
+            [all writeToFile:path atomically:YES];
+        }
+    } @catch (NSException *e) { }
+}
+
 void SLLogWrite(NSString *line) {
     if (!line.length) return;
     static dispatch_queue_t q = NULL;
+    static NSMutableArray<NSString *> *buf = nil;
+    static BOOL sScheduled = NO;
     static dispatch_once_t once;
-    dispatch_once(&once, ^{ q = dispatch_queue_create("com.shenglin.momo.log", DISPATCH_QUEUE_SERIAL); });
+    dispatch_once(&once, ^{
+        q = dispatch_queue_create("com.shenglin.momo.log", DISPATCH_QUEUE_SERIAL);
+        buf = [NSMutableArray array];
+    });
 
     NSString *full = [NSString stringWithFormat:@"%@ %@\n", SLTimestamp(), line];
-    dispatch_async(q, ^{
-        NSString *path = SLLogPath();
-        if (!path.length) return;
-        @try {
-            NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:path];
-            if (fh) {
-                [fh seekToEndOfFile];
-                [fh writeData:[full dataUsingEncoding:NSUTF8StringEncoding]];
-                unsigned long long end = [fh offsetInFile];
-                // 不再每条 fsync：一条一次同步会持续抢磁盘 IO，跳页面和滑动都能感觉到。
-                // writeData 已经进了内核缓冲，进程被系统杀掉也不会丢，每 8 条落一次盘足够。
-                static NSUInteger sPendingSync = 0;
-                if (++sPendingSync >= 8) { sPendingSync = 0; [fh synchronizeFile]; }
-                [fh closeFile];
-                if (end > SL_LOG_MAX_BYTES) {
-                    NSData *d = [NSData dataWithContentsOfFile:path];
-                    if (d.length > SL_LOG_MAX_BYTES) {
-                        NSData *tail = [d subdataWithRange:NSMakeRange(d.length - SL_LOG_KEEP_BYTES, SL_LOG_KEEP_BYTES)];
-                        // 关键：不能从中间切。切在半个中文字上，整份文件就不是合法 UTF-8，
-                        // 日志页 decode 会失败 → 返回空串 → 用户看到的是「日志是空的」。
-                        // 从第一个换行之后开始留。
-                        const uint8_t *b = (const uint8_t *)tail.bytes;
-                        NSUInteger start = 0;
-                        for (NSUInteger i = 0; i < tail.length && i < 8192; i++) {
-                            if (b[i] == '\n') { start = i + 1; break; }
-                        }
-                        if (start < tail.length) {
-                            NSData *clean = [tail subdataWithRange:NSMakeRange(start, tail.length - start)];
-                            [clean writeToFile:path atomically:YES];
-                        }
-                    }
+    NSArray<NSString *> *now = nil;
+
+    @synchronized (buf) {
+        [buf addObject:full];
+        if (buf.count >= 32) {
+            now = [buf copy];
+            [buf removeAllObjects];
+        } else if (!sScheduled) {
+            sScheduled = YES;
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.35 * NSEC_PER_SEC)), q, ^{
+                NSArray<NSString *> *late = nil;
+                @synchronized (buf) {
+                    sScheduled = NO;
+                    if (buf.count) { late = [buf copy]; [buf removeAllObjects]; }
                 }
-            } else {
-                NSData *d = [NSData dataWithContentsOfFile:path];
-                NSMutableData *md = d ? [d mutableCopy] : [NSMutableData data];
-                [md appendData:[full dataUsingEncoding:NSUTF8StringEncoding]];
-                [md writeToFile:path atomically:YES];
-            }
-        } @catch (NSException *e) { }
-    });
+                if (late.count) SLLogFlush(late);
+            });
+        }
+    }
+
+    if (now.count) {
+        dispatch_async(q, ^{ SLLogFlush(now); });
+    }
 }
 
 @implementation SLLog
