@@ -130,6 +130,7 @@ static NSMutableDictionary *sSLCoverObjs = nil;       // uid -> 对方真实 cov
 static NSMutableDictionary *sSLFakeUsers = nil;       // uid -> 对方真实 AWEUserModel（头像用）
 static void SLProfResetPainted(void);                 // 还原被我们直接改过图的视图
 static void SLApplySnapExtras(NSDictionary *snap);    // 定义在「性别 / 地区」段，套用快照时要用
+static NSString *SLExtraStr(NSString *field);         // 同上，日志里要打地区
 static void SLProfCoverPrefetch(void);                // 定义在「封面」段，套用后先把原图存一份
 static int sSLWorksGen = 0;                           // 每次套用 +1（作品列表重拉用）
 static int sSLWorksReloaded = -1;                     // 已经为哪一代重拉过
@@ -745,9 +746,12 @@ static void SLProfSetAcct(NSString *uid) {
     sSLWorksKickAt = 0;
 
     SLLog(@"PROF| 已切到账号 %@（预设按账号独立，互不清空）", uid);
-    SLLog(@"PROF| 本账号预设：昵称=%@ 赞=%@ 背景=%@ 头像=%@ 作品源=%@",
+    SLLog(@"PROF| 本账号预设：昵称=%@ 赞=%@ 性别=%@ 年龄=%@ 地区=%@ 背景=%@ 头像=%@ 作品源=%@",
           SLProfStr(SLProfKeyNickname) ?: @"无",
           SLProfStr(SLProfKeyLike) ?: @"无",
+          SLProfStr(SLProfKeyGender) ?: @"无",
+          SLProfStr(SLProfKeyAge) ?: @"无",
+          SLExtraStr(@"city") ?: SLExtraStr(@"location") ?: @"无",
           SLProfStr(SLProfKeyCover) ?: @"无",
           SLProfStr(SLProfKeyAvatar) ?: @"无",
           sSLWorkWant ?: @"无");
@@ -765,9 +769,13 @@ static void SLProfNoteMyUID(UIViewController *vc) {
     if ([uid isKindOfClass:[NSString class]]) s = uid;
     else if ([uid isKindOfClass:[NSNumber class]]) s = [uid stringValue];
     if (s.length && ![s isEqualToString:@"0"]) {
-        if (um && sSLMyModel != um) sSLMyModel = um;   // 真实资料留一份（年龄/地区按文本比对要用）
         sSLProfMyUID = s;
         SLProfSetAcct(s);
+        // 注意顺序：SLProfSetAcct 内部会清 sSLMyModel（换号了，旧 model 不能拿来比对），
+        // 所以必须在它之后再把这一次的 model 存下来。
+        // 原来写在前面，首次进「我」页时刚存就被清掉 —— 于是「按真实文本比对」永远
+        // 拿不到真实值，年龄 / 地区 / 学校一条都改不动。
+        if (um && sSLMyModel != um) sSLMyModel = um;
     }
 }
 
@@ -1343,8 +1351,11 @@ static void SLProfApplyAgeLocation(id cell) {
     }
 }
 
+static int sSLAgeLocHooks = 0;      // configWithHeaderContext: 被调了几次（诊断用）
+
 static void (*o_ageLocConfig)(id, SEL, id);
 static void h_ageLocConfig(id self, SEL _cmd, id ctx) {
+    sSLAgeLocHooks++;
     if (o_ageLocConfig) o_ageLocConfig(self, _cmd, ctx);
     SLProfApplyAgeLocation(self);
 }
@@ -1370,11 +1381,14 @@ static void SLProfApplyAgeLocationNow(void) {
     }
     for (id c in [cells copy]) SLProfApplyAgeLocation(c);
 
+    // 无条件打一次：cells=0 说明窗口里压根没有这一排（自己账号没填性别年龄时抖音就不显示），
+    // hooks=0 说明 configWithHeaderContext: 从没被调过（类名不对 / 换成了别的实现）。
+    // 有这行才能判断「年龄没同步」到底卡在哪一步。
     static BOOL sLogged = NO;
-    if (!sLogged && cells.count) {
+    if (!sLogged) {
         sLogged = YES;
-        SLLog(@"PROF| 年龄地区 cell %lu 个 · 性别=%@ 年龄=%@ 地区=%@ IP=%@ 学校=%@",
-              (unsigned long)cells.count,
+        SLLog(@"PROF| 年龄地区 cell %lu 个 · 配置回调 %d 次 · 性别=%@ 年龄=%@ 地区=%@ IP=%@ 学校=%@",
+              (unsigned long)cells.count, sSLAgeLocHooks,
               SLProfStr(SLProfKeyGender) ?: @"无", SLProfStr(SLProfKeyAge) ?: @"无",
               SLExtraStr(@"city") ?: @"无", SLExtraStr(@"ipLocation") ?: @"无",
               SLExtraStr(@"schoolName") ?: @"无");
@@ -2025,7 +2039,16 @@ static void SLProfCallVoid(id obj, NSString *selName) {
     @try { ((void (*)(id, SEL))im)(obj, sel); } @catch (__unused NSException *e) { }
 }
 
-// 找到「我」页里的作品页
+// 找到「我」页里的作品页 —— 只返回**一个**，而且必须是已经显示出来的那个。
+//
+// 0.9.3 的闪退就是这里：抖音「我」页把「作品 / 私密 / 喜欢」各挂了一个
+// AWEPostWorkViewControllerV2，全都躺在 nav 栈里。一把踢到 4 个 = 4 个并发请求，
+// 1.1 秒后又对 4 个页面各调一次 reloadDataWithDataSourceChanged 重建 section，
+// IGListKit 发现 section 数和 collectionView 对不上，直接抛
+// 「Invalid update: invalid number of items」把进程带走。
+// 日志就停在「已让作品页按对方 id（…）重新拉取 · 4 处」那一行。
+//
+// 现在只刷当前真正显示的那一个；别的 tab 被选中时抖音自己会加载。
 static NSArray *SLProfWorksVCs(void) {
     NSMutableArray *vcs = [NSMutableArray array];
     for (UIScene *sce in [[UIApplication sharedApplication].connectedScenes copy]) {
@@ -2033,31 +2056,28 @@ static NSArray *SLProfWorksVCs(void) {
         for (UIWindow *w in [((UIWindowScene *)sce).windows copy])
             SLProfCollectVCs(w.rootViewController, vcs);
     }
-    NSMutableArray *out = [NSMutableArray array];
-    for (UIViewController *vc in vcs) {
-        if ([NSStringFromClass([vc class]) containsString:@"PostWork"]) [out addObject:vc];
-    }
-    if (out.count) return out;
 
+    UIViewController *pick = nil;
+    for (UIViewController *vc in vcs) {
+        if (![NSStringFromClass([vc class]) containsString:@"PostWork"]) continue;
+        // 没加载 view / 不在窗口上的页面，调 refresh 等于替它硬开水，最容易出问题
+        if (!vc.isViewLoaded || !vc.view.window) continue;
+        pick = vc;
+        break;
+    }
     // 类名换了也不至于瞎：认「在我页里、能被要求重刷」的那个页面
-    for (UIViewController *vc in vcs) {
-        if (SLProfKindFromVC(vc) != 1) continue;
-        if ([vc respondsToSelector:NSSelectorFromString(@"refreshDataWithCompletion:")] ||
-            [vc respondsToSelector:NSSelectorFromString(@"refreshDataIsPullRefresh:completion:")])
-            [out addObject:vc];
+    if (!pick) {
+        for (UIViewController *vc in vcs) {
+            if (SLProfKindFromVC(vc) != 1) continue;
+            if (!vc.isViewLoaded || !vc.view.window) continue;
+            if ([vc respondsToSelector:NSSelectorFromString(@"refreshDataWithCompletion:")] ||
+                [vc respondsToSelector:NSSelectorFromString(@"refreshDataIsPullRefresh:completion:")]) {
+                pick = vc;
+                break;
+            }
+        }
     }
-    return out;
-}
-
-// 作品页是 IGListKit：换了数据必须让页面自己重建 section，只对 collectionView
-// 调 reloadData 是不会重建的（0.8.8 就栽在这）。
-static void SLProfReloadWorks(void) {
-    BOOL did = NO;
-    for (UIViewController *vc in SLProfWorksVCs()) {
-        SLProfCallVoid(vc, @"reloadDataWithDataSourceChanged");
-        did = YES;
-    }
-    if (did) SLLog(@"WORKS| 已让作品页按新数据重建");
+    return pick ? @[ pick ] : @[];
 }
 
 static void SLProfWorksKick(void);
@@ -2073,17 +2093,20 @@ static void SLProfWorksDiagnose(void) {
         id author = SLProfCallObj(first, @"author");
         if (!author) author = SLProfCallObj(SLProfCallObj(first, @"awemeModel"), @"author");
         NSString *who = SLProfObjText(author ? SLProfCallObj(author, @"userID") : nil) ?: @"?";
-        SLLog(@"WORKS| 作品列表 %lu 条 · 首条作者 %@ · 想要 %@", (unsigned long)n,
-              who, sSLWorkWant ?: @"无");
+        BOOL ok = (n > 0) && [who isEqualToString:(sSLWorkWant ?: @"")];
+        SLLog(@"WORKS| 作品列表 %lu 条 · 首条作者 %@ · 想要 %@ · %@", (unsigned long)n,
+              who, sSLWorkWant ?: @"无", ok ? @"对上" : @"没对上");
 
         BOOL known = ![who isEqualToString:@"?"];
         BOOL ok = (n > 0) && known && [who isEqualToString:(sSLWorkWant ?: @"")];
-        if ((n == 0 || (known && !ok)) && sSLWorksRetry < 2) {
-            // 接口偶尔抽风（或者这次赶在换 id 之前就发出去了），补一枪
+        // 只在「一条都没拉到」时补一枪。
+        // 有数据但不是对方的，说明服务器就是按真实 id 回的，再补还是同样结果，
+        // 而且多一次 refresh 就多一次和页面分页打架的机会。
+        if (n == 0 && sSLWorksRetry < 1) {
             sSLWorksRetry++;
             sSLWorksReloaded = -1;
-            sSLWorksKickAt = 0;              // 别被巡检的 1.5s 限流挡住
-            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.8 * NSEC_PER_SEC)),
+            sSLWorksKickAt = 0;              // 别被巡检的 3s 限流挡住
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.2 * NSEC_PER_SEC)),
                            dispatch_get_main_queue(), ^{ SLProfWorksKick(); });
         }
     }
@@ -2098,18 +2121,22 @@ static void SLProfWorksDiagnose(void) {
 static void SLProfWorksKick(void) {
     if (sSLWorksGen == sSLWorksReloaded) return;
     if (!sSLWorkWant.length || !SLProfWorksEnabled() || !SLProfGateLoose()) return;
-    // 巡检每 0.8s 调一次；没成功（页面还没建出来）也至少隔 1.5s 再试，别刷屏
+    // 巡检每 0.8s 调一次；没成功（页面还没建出来）也至少隔 3s 再试，别刷屏。
+    // 更要紧的是别让两次 refresh 叠在一起 —— 页面的 completion 回来时自己会 reload，
+    // 我们插一脚就可能撞在它更新到一半的时候。
     NSTimeInterval now = [NSProcessInfo processInfo].systemUptime;
-    if (now - sSLWorksKickAt < 1.5) return;
+    if (now - sSLWorksKickAt < 3.0) return;
     sSLWorksKickAt = now;
 
     NSUInteger n = 0;
+    NSString *kickCls = nil;
     void (^done)(id) = ^(id resp) { (void)resp; };
     for (UIViewController *vc in SLProfWorksVCs()) {
         IMP im = SLProfIMP(vc, @"refreshDataWithCompletion:");
         @try {
             if (im) {
                 ((void (*)(id, SEL, id))im)(vc, NSSelectorFromString(@"refreshDataWithCompletion:"), done);
+                kickCls = NSStringFromClass([vc class]);
                 n++;
                 continue;
             }
@@ -2117,6 +2144,7 @@ static void SLProfWorksKick(void) {
             if (im) {
                 ((void (*)(id, SEL, BOOL, id))im)(vc,
                     NSSelectorFromString(@"refreshDataIsPullRefresh:completion:"), NO, done);
+                kickCls = NSStringFromClass([vc class]);
                 n++;
             }
         } @catch (__unused NSException *e) { }
@@ -2141,11 +2169,13 @@ static void SLProfWorksKick(void) {
         return;
     }
     sSLWorksReloaded = sSLWorksGen;
-    SLLog(@"WORKS| 已让作品页按对方 id（%@）重新拉取 · %lu 处", sSLWorkWant, (unsigned long)n);
+    SLLog(@"WORKS| 已让作品页按对方 id（%@）重新拉取 · %@", sSLWorkWant, kickCls ?: @"?");
 
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.1 * NSEC_PER_SEC)),
+    // 只读诊断，不再碰 section。
+    // 0.9.3 在这里调了 reloadDataWithDataSourceChanged —— 页面自己刚 reload 完，
+    // 我们又让它重建一次，就是那一下闪退的。
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.2 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
-        SLProfReloadWorks();
         SLProfWorksDiagnose();
     });
 }
@@ -2270,15 +2300,24 @@ static void SLProfPaintAvatar(void) {
 
 // 「隐藏私密作品」除了过滤 dataSource，页面上那个「私密作品」入口也要收起，
 // 否则点进去还是自己真实的私密列表。
+static int sSLPrivHits = 0;         // 这一轮扫到几个含「私密」的控件（诊断用）
 static void SLProfHidePrivateIn(UIView *root);
 static void SLProfHidePrivateUI(void) {
     if (!SLProfHidePrivateOn()) return;
     // 面板拨开关时页面正被我们自己的浮窗盖着（kind 会被算成 0），
     // 所以这里用「我页出现过」的松门，别只认 kind==1
     if (!sSLProfOnMePage && sSLProfKindVal != 1) return;
+    sSLPrivHits = 0;
     for (UIScene *sce in [[UIApplication sharedApplication].connectedScenes copy]) {
         if (![sce isKindOfClass:[UIWindowScene class]]) continue;
         for (UIWindow *w in [((UIWindowScene *)sce).windows copy]) SLProfHidePrivateIn(w);
+    }
+    // 开关开着却一条都没命中，说明界面上那排根本没有「私密」这两个字
+    // （账号没有私密作品时抖音就不显示这个 tab）—— 不是我们没干活。
+    static BOOL sScanLogged = NO;
+    if (!sScanLogged && sSLPrivHits == 0) {
+        sScanLogged = YES;
+        SLLog(@"PROF| 私密扫描：界面上没有带「私密」的控件（可能这个账号没有私密作品）");
     }
 }
 
@@ -2301,6 +2340,7 @@ static void SLProfHidePrivateInDepth(UIView *root, int depth) {
     else if ([root isKindOfClass:[UIButton class]])
         t = [((UIButton *)root) titleForState:UIControlStateNormal];
     if (t.length && [t containsString:@"私密"]) {
+        sSLPrivHits++;
         UIView *anc = root, *target = nil;
         for (int i = 0; i < 6 && anc.superview; i++) {
             anc = anc.superview;
@@ -3147,7 +3187,7 @@ void SLProfileStart(void) {
     SLProfHookPageLifecycle(objc_getClass("AWEProfileMergedTabContainerViewController"));
     SLProfHookPageLifecycle(objc_getClass("AWEProfileBaseContainerViewController"));
 
-    SLLog(@"PROF| ==== 主页伪装 v0.9.3 · 已挂载 · 快照 %lu 个 ====", (unsigned long)SLSnapList().count);
+    SLLog(@"PROF| ==== 主页伪装 v0.9.4 · 已挂载 · 快照 %lu 个 ====", (unsigned long)SLSnapList().count);
     SLProfStartTicker();       // 0.8s 驻留巡检：不依赖任何一次 viewDidAppear 恰好触发
     // 账号要等我页出现才认得出，晚点再打一行状态，免得开局那行永远是「账号 ?」
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.0 * NSEC_PER_SEC)),
