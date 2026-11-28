@@ -190,24 +190,24 @@ static void h_sendAssets(id self, SEL _cmd, id assets, BOOL once) {
 // 这里只做一件事：把用户真正打开的相册类抓出来（类名 + 方法名 + ivar 名 + 子视图类），
 // 不钩发送、不读对象内存、不扫全库，打开一次相册就出结果。
 
-// 0.9.12：下面这套 dump 是查相册钩子时用的调试输出，正式版关掉。
-// 每次 present 都会打一堆方法名 + 子视图（一次几十条，每条还要落盘），
-// 切号面板、分享面板这种一秒跳好几次的场景会明显卡。要排查相册时改成 1。
-#define SL_PICK_DEBUG 0
+// 0.9.12：这套 dump 是查相册钩子时用的调试输出，正式版关掉（要排查时改成 YES）。
+// 每次 present 都会打一堆方法名 + 子视图，一次几十条、每条还要落盘，
+// 切号面板、分享面板这种一秒跳好几次的场景会明显卡。
+// 注意：不能用 #if 把函数整段裁掉 —— 文件后面还有几处直接调 SLDumpMethods / SLDumpIvars。
+static BOOL sSLPickDebug = NO;
 
-// SLNameHas 在 h_vcAppear / h_vcLoad 里还要用（判断类名像不像相册），必须在 #if 外面
 static BOOL SLNameHas(NSString *s, NSArray *keys) {
     if (!s.length) return NO;
     for (NSString *k in keys) if ([s containsString:k]) return YES;
     return NO;
 }
 
-#if SL_PICK_DEBUG
 static NSInteger sSLPickDumps = 0;
 static NSMutableSet *sSLPickSeen = nil;
 static NSMutableSet *sSLViewSeen = nil;
 
 static void SLDumpMethods(Class cls, NSString *tag, NSArray *keys, NSInteger cap) {
+    if (!sSLPickDebug) return;
     if (!cls) { SLLog(@"PICK| %@ 类不存在", tag); return; }
     unsigned int n = 0;
     Method *list = class_copyMethodList(cls, &n);
@@ -224,6 +224,7 @@ static void SLDumpMethods(Class cls, NSString *tag, NSArray *keys, NSInteger cap
 
 // 只打名字，不碰内存：类链上每层的 ivar 名里带 watch/once/send/disable 的
 static void SLDumpIvars(Class cls, NSString *tag) {
+    if (!sSLPickDebug) return;
     int depth = 0;
     for (Class c = cls; c && c != [NSObject class] && depth < 4; c = class_getSuperclass(c), depth++) {
         unsigned int n = 0;
@@ -239,6 +240,7 @@ static void SLDumpIvars(Class cls, NSString *tag) {
 }
 
 static void SLDumpViews(UIView *v, NSString *tag, NSInteger depth, NSInteger *budget) {
+    if (!sSLPickDebug) return;
     if (!v || depth > 3 || *budget <= 0) return;
     for (UIView *sub in v.subviews) {
         if (*budget <= 0) return;
@@ -252,6 +254,7 @@ static void SLDumpViews(UIView *v, NSString *tag, NSInteger depth, NSInteger *bu
 }
 
 static void SLDumpViewController(UIViewController *vc) {
+    if (!sSLPickDebug) return;
     NSString *cn = NSStringFromClass([vc class]);
     if (!sSLPickSeen) sSLPickSeen = [NSMutableSet set];
     if (!sSLViewSeen) sSLViewSeen = [NSMutableSet set];
@@ -275,10 +278,6 @@ static void SLDumpViewController(UIViewController *vc) {
         if (budget == 24) SLLog(@"PICK| -- %@ 子视图里没有 Button/Bar/Watch 命名的 --", cn);
     }
 }
-
-#else
-static void SLDumpViewController(UIViewController *vc) { (void)vc; }
-#endif
 
 // 打开哪些页会进这里：只要类名像相册 / 选图 / 预览就 dump 一次
 static void SLInstallOnceButton(UIViewController *vc);   // v0.7.0：相册页那颗闪图按钮
