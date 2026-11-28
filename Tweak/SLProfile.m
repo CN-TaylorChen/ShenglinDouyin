@@ -83,6 +83,25 @@
 //    · 换号：清掉上个号缓存的我 model / 封面图 / 已应用标记，
 //      巡检下一拍就按新号的预设重来；作品那边也不再因为「已刷过」而跳过
 //
+//  v0.9.6：别再主动去踢作品刷新了
+//
+//    0.9.5 的日志：11:32:38 进「我」页，同一个 tick 里打完
+//    `已让作品页按对方 id（…）重新拉取`，下一秒进程就没了（11:32:40 是新进程）。
+//    同一份日志里还有一条更关键的：
+//        WORKS| 作品请求改用对方 id 1638739731022221（联网拉取）
+//    它出现在「重新拉取」**之前** —— 说明页面自己那次首刷已经把 id 换成对方的了，
+//    我们再补一脚纯属多余，而且是「首刷还在飞的时候再来一次」：
+//    两个请求回来各改一次同一个 dataSource，IGListKit / collectionView 对不上账，
+//    直接硬崩（不是 ObjC 异常，所以连 CRASH| 都没留下）。
+//
+//    这一版：
+//    · 不再「进页就踢」。先看列表：已经是对方的那份 → 什么都不做；
+//      还是空的 → 说明首刷在路上，等 8 秒；只有「已经拉回来、但首条作者不是对方」
+//      才补一次，且每代只补一次
+//    · 补的时候先落一个面包屑文件（.prof_step）。硬崩没有异常栈，
+//      下次启动读到它就知道「上一轮死在作品重拉之后」——这一轮干脆不再踢（参数替换照旧）
+//    · 0.9.5 里「列表 0 条就 1.2 秒后再补一枪」已删：首刷没回来时那是最容易并发改表的一脚
+//
 
 #import "SLProfile.h"
 #import "SLLog.h"
@@ -134,13 +153,14 @@ static NSString *SLExtraStr(NSString *field);         // 同上，日志里要�
 static void SLProfCoverPrefetch(void);                // 定义在「封面」段，套用后先把原图存一份
 static int sSLWorksGen = 0;                           // 每次套用 +1（作品列表重拉用）
 static int sSLWorksReloaded = -1;                     // 已经为哪一代重拉过
-static int sSLWorksRetry = 0;                         // 作品一次没拉对，允许再补两次
 static int sSLPostsMgrLog = 0;                        // 作品管理器记录日志（限几条）
 static NSString *sSLCoverWantURL = nil;               // 当前应该显示的封面 URL
 static UIImage  *sSLCoverWantImg = nil;               // 下好之后的那张图
 static int sSLCoverMissLog = 0;                        // 「没找到封面视图」的日志上限
 static id sSLMyModel = nil;                            // 「我」页那个 model（读真实文本做比对）
 static NSTimeInterval sSLWorksKickAt = 0;              // 上次踢作品的时间（失败时限流）
+static NSTimeInterval sSLOnMeSince = 0;                // 这一轮停在我页的起始时刻（别和首刷撞车）
+static BOOL sSLWorksKickBlocked = NO;                  // 上次进程死在作品重拉上 → 这一轮禁止再踢
 static BOOL sSLWasOnMe = NO;                           // 上一拍是否停在「我」页
 static int  sSLTickCount = 0;                          // 巡检计数
 static int  sSLOffTicks = 0;                           // 连续几拍不在我页
@@ -526,7 +546,6 @@ static void SLApplySnap(NSDictionary *s) {
 
     sSLWorksGen++;
     sSLWorksReloaded = -1;
-    sSLWorksRetry = 0;
     SLLog(@"SNAP| 套用 %@ 的整套资料（账号 %@）", SLSnapText(s, @"nickname") ?: @"?", sSLCurAcct ?: @"?");
     if (SLProfGate()) SLProfForceCover();               // 若此刻正停在「我」页，立刻换背景
     SLProfCoverPrefetch();                              // 顺手把原图存到本机（封面的 URL 会过期）
@@ -734,7 +753,6 @@ static void SLProfSetAcct(NSString *uid) {
     sSLWorkWant = SLProfStr(SLProfKeyWant);
     sSLWorksGen++;                 // 换号后作品列表也要按新账号重判一次
     sSLWorksReloaded = -1;
-    sSLWorksRetry = 0;
     sSLPostsMgrLog = 0;
     SLProfResetPainted();
     sSLProfHits = 0;
@@ -1381,11 +1399,12 @@ static void SLProfApplyAgeLocationNow(void) {
     }
     for (id c in [cells copy]) SLProfApplyAgeLocation(c);
 
-    // 无条件打一次：cells=0 说明窗口里压根没有这一排（自己账号没填性别年龄时抖音就不显示），
-    // hooks=0 说明 configWithHeaderContext: 从没被调过（类名不对 / 换成了别的实现）。
-    // 有这行才能判断「年龄没同步」到底卡在哪一步。
+    // 打一次就够：cells=0 说明窗口里压根没有这一排（自己账号没填性别年龄时抖音就不显示，
+    // 或者这一拍页面还没渲染完）；hooks=0 说明 configWithHeaderContext: 从没被调过。
+    // 0.9.6：不再「第一拍就定论」—— 进页 0.1 秒时 header 往往还没铺出来，
+    // 那样打出来的 0 个一点信息量都没有。等 cell 出现，或者等巡检跑过 10 拍再落笔。
     static BOOL sLogged = NO;
-    if (!sLogged) {
+    if (!sLogged && (cells.count > 0 || sSLTickCount > 10)) {
         sLogged = YES;
         SLLog(@"PROF| 年龄地区 cell %lu 个 · 配置回调 %d 次 · 性别=%@ 年龄=%@ 地区=%@ IP=%@ 学校=%@",
               (unsigned long)cells.count, sSLAgeLocHooks,
@@ -2032,11 +2051,51 @@ static IMP SLProfIMP(id obj, NSString *selName) {
     return m ? method_getImplementation(m) : NULL;
 }
 
-static void SLProfCallVoid(id obj, NSString *selName) {
-    IMP im = SLProfIMP(obj, selName);
-    if (!im) return;
-    SEL sel = NSSelectorFromString(selName);
-    @try { ((void (*)(id, SEL))im)(obj, sel); } @catch (__unused NSException *e) { }
+#pragma mark - 面包屑（硬崩没有异常栈，只能留个记号）
+//
+// 0.9.3 挂的 NSSetUncaughtExceptionHandler 只能抓到 ObjC 异常。
+// 真机上这几次闪退一条 CRASH| 都没有 —— 属于信号级硬崩（野指针 / 栈溢出 / 库内部 assert），
+// 那种死法什么都不留，日志就停在最后一行，只能靠猜。
+// 所以做危险动作之前先把「我正在干嘛」写进文件，正常走完再抹掉。
+// 下次启动读到它还躺在那儿，就知道上一轮死在这一步了。
+
+static NSString *sSLStep = nil;
+
+static NSString *SLProfStepPath(void) {
+    NSString *dir = SLProfCacheDir();
+    if (!dir.length) return nil;
+    return [dir stringByAppendingPathComponent:@".prof_step"];
+}
+
+static void SLProfStep(NSString *name) {
+    sSLStep = [name copy];
+    NSString *p = SLProfStepPath();
+    if (!p.length || !name.length) return;
+    [name writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:NULL];
+}
+
+static void SLProfStepDone(NSString *name) {
+    if (name.length && ![sSLStep isEqualToString:name]) return;   // 已经是另一件事了，别误抹
+    sSLStep = nil;
+    NSString *p = SLProfStepPath();
+    if (p.length) [[NSFileManager defaultManager] removeItemAtPath:p error:NULL];
+}
+
+// 启动时看一眼：上一轮是不是死在某个我们知道的危险动作上
+static void SLProfCheckStepMark(void) {
+    NSString *p = SLProfStepPath();
+    if (!p.length) return;
+    NSString *s = [NSString stringWithContentsOfFile:p encoding:NSUTF8StringEncoding error:NULL];
+    [[NSFileManager defaultManager] removeItemAtPath:p error:NULL];
+    s = [s stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    if (!s.length) return;
+    SLLog(@"PROF| 上次进程死在「%@」之后（没有 ObjC 异常，属于硬崩）", s);
+    if ([s isEqualToString:@"works.refresh"]) {
+        // 就是踢作品这一脚。这一轮干脆不踢了 —— 参数替换照旧，
+        // 页面自己那次首刷本来就会按对方的 id 去拉。
+        sSLWorksKickBlocked = YES;
+        SLLog(@"PROF| 本次不再自动重拉作品（上次就死在它手上），请求参数照旧换");
+    }
 }
 
 // 找到「我」页里的作品页 —— 只返回**一个**，而且必须是已经显示出来的那个。
@@ -2082,100 +2141,122 @@ static NSArray *SLProfWorksVCs(void) {
 
 static void SLProfWorksKick(void);
 
-// 打印当前作品列表里第一条的作者，用来判断这次到底拉没拉到对方的
-static void SLProfWorksDiagnose(void) {
-    for (UIViewController *vc in SLProfWorksVCs()) {
-        id dm = SLProfCallObj(vc, @"dataManager");
-        id ds = dm ? SLProfCallObj(dm, @"dataSource") : nil;
-        NSUInteger n = [ds respondsToSelector:@selector(count)] ? [(NSArray *)ds count] : 0;
-        id first = ([ds isKindOfClass:[NSArray class]] && [(NSArray *)ds count])
-                   ? [(NSArray *)ds firstObject] : nil;
-        id author = SLProfCallObj(first, @"author");
-        if (!author) author = SLProfCallObj(SLProfCallObj(first, @"awemeModel"), @"author");
-        NSString *who = SLProfObjText(author ? SLProfCallObj(author, @"userID") : nil) ?: @"?";
-        BOOL ok = (n > 0) && [who isEqualToString:(sSLWorkWant ?: @"")];
-        SLLog(@"WORKS| 作品列表 %lu 条 · 首条作者 %@ · 想要 %@ · %@", (unsigned long)n,
-              who, sSLWorkWant ?: @"无", ok ? @"对上" : @"没对上");
-
-        // 只在「一条都没拉到」时补一枪。
-        // 有数据但不是对方的，说明服务器就是按真实 id 回的，再补还是同样结果，
-        // 而且多一次 refresh 就多一次和页面分页打架的机会。
-        if (n == 0 && sSLWorksRetry < 1) {
-            sSLWorksRetry++;
-            sSLWorksReloaded = -1;
-            sSLWorksKickAt = 0;              // 别被巡检的 3s 限流挡住
-            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.2 * NSEC_PER_SEC)),
-                           dispatch_get_main_queue(), ^{ SLProfWorksKick(); });
-        }
-    }
+// 读一眼作品页现在的列表：条数 + 首条作者
+static void SLProfWorksSnapshot(UIViewController *vc, NSUInteger *outN, NSString **outWho) {
+    if (outN) *outN = 0;
+    if (outWho) *outWho = nil;
+    if (!vc) return;
+    id dm = SLProfCallObj(vc, @"dataManager");
+    id ds = dm ? SLProfCallObj(dm, @"dataSource") : nil;
+    if (![ds isKindOfClass:[NSArray class]]) return;
+    NSUInteger n = [(NSArray *)ds count];
+    if (outN) *outN = n;
+    if (!n) return;
+    id first = [(NSArray *)ds firstObject];
+    id author = SLProfCallObj(first, @"author");
+    if (!author) author = SLProfCallObj(SLProfCallObj(first, @"awemeModel"), @"author");
+    if (outWho) *outWho = SLProfObjText(author ? SLProfCallObj(author, @"userID") : nil);
 }
 
-// 进「我」页时踢一次：请求参数换成对方的 → 服务器返回对方的作品。
+// 只读诊断：这一次到底拉到的是谁的列表。
+static void SLProfWorksDiagnose(void) {
+    NSArray *vcs = SLProfWorksVCs();
+    if (!vcs.count) return;
+    NSUInteger n = 0;
+    NSString *who = nil;
+    SLProfWorksSnapshot(vcs.firstObject, &n, &who);
+    BOOL ok = (n > 0) && [who isEqualToString:(sSLWorkWant ?: @"")];
+    SLLog(@"WORKS| 作品列表 %lu 条 · 首条作者 %@ · 想要 %@ · %@", (unsigned long)n,
+          who ?: @"?", sSLWorkWant ?: @"无", ok ? @"对上" : @"没对上");
+    // 0.9.5 这里还挂着一脚「0 条就 1.2 秒后补一枪」。
+    // 首刷没回来时补那一枪 = 两个请求同时改同一个 dataSource，闪退正出在这。已删。
+}
+
+// 作品同步：**只靠请求参数换 id**，不再「进页就踢一次」。
 //
-// v0.9.0 踢不动的原因：只从自己记的 manager 里挑，而页面用的 manager 往往是
-// copy 出来的副本（身上没有 uid 标记），一个都挑不到，日志里连「重新拉取」都不打。
-// 现在直接找页面：AWEPostWorkViewControllerV2 -refreshDataWithCompletion:
-// 它内部会走 commonParams，我们的替换在那一层生效。
+// 0.9.5 的日志把顺序摆得很清楚：
+//     WORKS| 作品请求改用对方 id 1638739731022221（联网拉取）   ← 页面自己那次首刷
+//     WORKS| 已让作品页按对方 id（…）重新拉取 · AWEPostWorkViewControllerV2
+//     下一秒进程消失
+// 也就是说：首刷本来就已经按对方的 id 在拉了，我们再补一脚纯属多余；
+// 而且那一脚正好踩在首刷还在飞的时候 —— 两个响应各改一次同一个 dataSource，
+// IGListKit 账对不上，硬崩（连 ObjC 异常都来不及抛）。
+//
+// 现在改成「先看后踢」：
+//   · 列表已经是对方那份 → 记一代，什么都不做
+//   · 列表还是空的 → 首刷在路上，等 8 秒（大号列表回得慢，2 秒不够）
+//   · 列表有内容但首条作者不是对方（换号 / 缓存没换）→ 补一次，每代最多一次
 static void SLProfWorksKick(void) {
-    if (sSLWorksGen == sSLWorksReloaded) return;
+    if (sSLWorksReloaded == sSLWorksGen) return;    // 这一代已经处理过了
     if (!sSLWorkWant.length || !SLProfWorksEnabled() || !SLProfGateLoose()) return;
-    // 巡检每 0.8s 调一次；没成功（页面还没建出来）也至少隔 3s 再试，别刷屏。
-    // 更要紧的是别让两次 refresh 叠在一起 —— 页面的 completion 回来时自己会 reload，
-    // 我们插一脚就可能撞在它更新到一半的时候。
+    if (sSLWorksKickBlocked) return;                // 上一轮就死在它手上，这一轮不碰
+
     NSTimeInterval now = [NSProcessInfo processInfo].systemUptime;
-    if (now - sSLWorksKickAt < 3.0) return;
-    sSLWorksKickAt = now;
+    if (sSLOnMeSince <= 0 || now - sSLOnMeSince < 2.0) return;   // 页面还没站稳
+
+    NSArray *vcs = SLProfWorksVCs();
+    if (!vcs.count) return;                         // 作品页还没建出来，等下一拍
+    UIViewController *vc = vcs.firstObject;
 
     NSUInteger n = 0;
-    NSString *kickCls = nil;
-    void (^done)(id) = ^(id resp) { (void)resp; };
-    for (UIViewController *vc in SLProfWorksVCs()) {
-        IMP im = SLProfIMP(vc, @"refreshDataWithCompletion:");
-        @try {
-            if (im) {
-                ((void (*)(id, SEL, id))im)(vc, NSSelectorFromString(@"refreshDataWithCompletion:"), done);
-                kickCls = NSStringFromClass([vc class]);
-                n++;
-                continue;
-            }
-            im = SLProfIMP(vc, @"refreshDataIsPullRefresh:completion:");
-            if (im) {
-                ((void (*)(id, SEL, BOOL, id))im)(vc,
-                    NSSelectorFromString(@"refreshDataIsPullRefresh:completion:"), NO, done);
-                kickCls = NSStringFromClass([vc class]);
-                n++;
-            }
-        } @catch (__unused NSException *e) { }
-    }
+    NSString *who = nil;
+    SLProfWorksSnapshot(vc, &n, &who);
 
-    // 页面还没建出来时，退回自己的 manager
-    if (!n) {
-        for (id mgr in [[sSLMyMgrs allObjects] copy]) {
-            if (!SLProfPostsIsMine(mgr)) continue;
-            IMP im = SLProfIMP(mgr, @"refreshWithCompletion:");
-            if (!im) continue;
-            @try {
-                SLProfCallVoid(mgr, @"cancelRefreshTask");
-                ((void (*)(id, SEL, id))im)(mgr, NSSelectorFromString(@"refreshWithCompletion:"), done);
-                n++;
-            } @catch (__unused NSException *e) { }
+    if (n > 0 && [who isEqualToString:sSLWorkWant]) {
+        sSLWorksReloaded = sSLWorksGen;
+        static BOOL sDoneLogged = NO;
+        if (!sDoneLogged) {
+            sDoneLogged = YES;
+            SLLog(@"WORKS| 列表已经是对方的（%lu 条），不用再拉", (unsigned long)n);
         }
-    }
-
-    if (!n) {
-        SLLog(@"WORKS| 没找到作品页（也不是我的 manager），稍后再试");
         return;
     }
+    if (n == 0 && now - sSLOnMeSince < 8.0) return;  // 首刷还没回来，别抢在它前面
+    if (now - sSLWorksKickAt < 3.0) return;
+    sSLWorksKickAt = now;
     sSLWorksReloaded = sSLWorksGen;
+
+    // 回调在 ARC 下会自己搬到堆上；页面可能把它存到网络回来才用，这样也安全
+    void (^done)(id) = ^(id resp) { (void)resp; };
+    BOOL called = NO;
+    NSString *kickCls = nil;
+
+    SLProfStep(@"works.refresh");                   // 硬崩没有异常栈，先留一格面包屑
+    @try {
+        IMP im = SLProfIMP(vc, @"refreshDataWithCompletion:");
+        if (im) {
+            SLLog(@"WORKS| 调 refreshDataWithCompletion:（当前 %lu 条 · 首条作者 %@）",
+                  (unsigned long)n, who ?: @"?");
+            ((void (*)(id, SEL, id))im)(vc, NSSelectorFromString(@"refreshDataWithCompletion:"), done);
+            called = YES;
+            kickCls = NSStringFromClass([vc class]);
+        } else {
+            im = SLProfIMP(vc, @"refreshDataIsPullRefresh:completion:");
+            if (im) {
+                SLLog(@"WORKS| 调 refreshDataIsPullRefresh:（当前 %lu 条）", (unsigned long)n);
+                ((void (*)(id, SEL, BOOL, id))im)(vc,
+                    NSSelectorFromString(@"refreshDataIsPullRefresh:completion:"), NO, done);
+                called = YES;
+                kickCls = NSStringFromClass([vc class]);
+            }
+        }
+    } @catch (NSException *e) {
+        SLLog(@"WORKS| 调 refresh 抛异常：%@", e.reason ?: @"?");
+    }
+
+    if (!called) {
+        SLProfStepDone(@"works.refresh");
+        SLLog(@"WORKS| 作品页没有可用的刷新入口，这次跳过");
+        return;
+    }
     SLLog(@"WORKS| 已让作品页按对方 id（%@）重新拉取 · %@", sSLWorkWant, kickCls ?: @"?");
 
-    // 只读诊断，不再碰 section。
-    // 0.9.3 在这里调了 reloadDataWithDataSourceChanged —— 页面自己刚 reload 完，
-    // 我们又让它重建一次，就是那一下闪退的。
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.2 * NSEC_PER_SEC)),
-                   dispatch_get_main_queue(), ^{
-        SLProfWorksDiagnose();
-    });
+    // 面包屑留 4 秒：崩一般发生在网络回来的那一下（1 秒内），抹太早等于没记
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(4.0 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{ SLProfStepDone(@"works.refresh"); });
+    // 只读诊断，不再碰 section / 不再补枪
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{ SLProfWorksDiagnose(); });
 }
 
 #pragma mark - 头像
@@ -2802,7 +2883,6 @@ static void h_profEnterPage(id self, SEL _cmd, BOOL animated) {
     // 每次进来都算新的一代：作品要重新按对方 id 拉，不能因为「这个号刷过」就跳过
     sSLWorksGen++;
     sSLWorksReloaded = -1;
-    sSLWorksRetry = 0;
     IMP o = SLProfFindOrig(self, _cmd);
     if (o) ((void (*)(id, SEL, BOOL))o)(self, _cmd, animated);
 
@@ -2891,11 +2971,11 @@ static void SLProfTick(void) {
     }
     if (!sSLWasOnMe) {
         sSLWasOnMe = YES;
-        // 每次回到「我」页都算新的一代：作品要按对方 id 重新拉一次
-        // （不然重进就刷回自己的 —— 页面重建 dataSource 时用的是真实 id）
+        // 每次回到「我」页都算新的一代：作品要按对方 id 重新判一次
         sSLWorksGen++;
         sSLWorksReloaded = -1;
-        sSLWorksRetry = 0;
+        // 作品那边「页面站稳了没有」从这一刻起算，别跟首刷抢
+        sSLOnMeSince = [NSProcessInfo processInfo].systemUptime;
         SLLog(@"PROF| 我页在，开始驻留巡检（缺什么补什么）%@", sSLProfSafeMode ? @"· 保守模式" : @"");
     }
 
@@ -2968,6 +3048,7 @@ void SLProfileStart(void) {
     sSLProfStarted = YES;
     NSSetUncaughtExceptionHandler(&SLProfUncaught);
     SLProfCheckCrashMark();    // 上次挂在我们的异常里？这轮先保守
+    SLProfCheckStepMark();     // 上次是硬崩？看看死在哪个危险动作上
 
     SLProfMigrateLegacy();     // 老版本的单账号预设搬到 owner 名下，只做一次
 
