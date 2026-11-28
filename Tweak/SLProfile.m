@@ -2490,6 +2490,23 @@ static NSArray *SLProfWorksVCs(void) {
     return pick ? @[ pick ] : @[];
 }
 
+// 读一眼作品页现在的列表：条数 + 首条作者
+static void SLProfWorksSnapshot(UIViewController *vc, NSUInteger *outN, NSString **outWho) {
+    if (outN) *outN = 0;
+    if (outWho) *outWho = nil;
+    if (!vc) return;
+    id dm = SLProfCallObj(vc, @"dataManager");
+    id ds = dm ? SLProfCallObj(dm, @"dataSource") : nil;
+    if (![ds isKindOfClass:[NSArray class]]) return;
+    NSUInteger n = [(NSArray *)ds count];
+    if (outN) *outN = n;
+    if (!n) return;
+    id first = [(NSArray *)ds firstObject];
+    id author = SLProfCallObj(first, @"author");
+    if (!author) author = SLProfCallObj(SLProfCallObj(first, @"awemeModel"), @"author");
+    if (outWho) *outWho = SLProfObjText(author ? SLProfCallObj(author, @"userID") : nil);
+}
+
 // 作品同步：**只靠请求参数换 id**，一次 refresh 都不主动调。
 //
 // 两次血的教训：
